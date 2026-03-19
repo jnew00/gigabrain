@@ -899,10 +899,12 @@ export default function Home() {
       setLastDrops([]);
 
       let lastRoomNum = 0;
+      // Track state locally so we don't depend on async React re-renders
+      let currentState: DungeonActionResponse | null = gigaRef.current.dungeonState;
 
       while (autoPlayRef.current && !cancelled) {
         const g = gigaRef.current;
-        const state = g.dungeonState;
+        const state = currentState ?? g.dungeonState;
         const run = state?.data?.run;
         const entity = state?.data?.entity;
 
@@ -912,7 +914,7 @@ export default function Home() {
 
         if (entity) lastRoomNum = entity.ROOM_NUM_CID;
 
-        const action = pickBestAction(state!, gigaRef.current.enemyMoveRecords, gigaRef.current.enemyNames);
+        const action = pickBestAction(state!, g.enemyMoveRecords, g.enemyNames);
         if (!action) {
           addLog("auto: no valid action");
           await delay(1000);
@@ -929,12 +931,13 @@ export default function Home() {
           }
         }
 
-        const explanation = explainAction(state!, action, gigaRef.current.enemyMoveRecords, gigaRef.current.enemyNames);
+        const explanation = explainAction(state!, action, g.enemyMoveRecords, g.enemyNames);
         addLog(`auto: ${explanation}`);
 
         const result = await g.performAction(action as DungeonAction);
 
         if (result) {
+          currentState = result;
           trackEnemyMove(result);
           trackItemDrops(result);
 
@@ -958,6 +961,7 @@ export default function Home() {
           addLog("auto: action failed, resyncing...");
           await g.refreshAll();
           await delay(500);
+          currentState = gigaRef.current.dungeonState;
         }
 
         await delay(150);
