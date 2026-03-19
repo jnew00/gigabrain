@@ -260,10 +260,10 @@ export function useGigaverse() {
         try {
           const lsRecords = loadLocalStorageRecords();
           if (lsRecords.length > 0) {
-            await migrateEnemyMoves(lsRecords);
+            await migrateEnemyMoves(lsRecords, me.address);
             clearLocalStorageRecords();
           }
-          const dbRecords = await getAllEnemyMoves();
+          const dbRecords = await getAllEnemyMoves(me.address);
           setEnemyMoveRecords(
             dbRecords.map((r) => ({
               enemyId: r.enemy_id,
@@ -298,9 +298,9 @@ export function useGigaverse() {
       const record: EnemyMoveRecord = { enemyId, roomNum, dungeonId, level, move, round, timestamp: Date.now() };
       setEnemyMoveRecords((prev) => [...prev, record]);
       // Fire-and-forget write to SQLite
-      recordEnemyMoveAction(enemyId, roomNum, dungeonId, level, move, round).catch(() => {});
+      recordEnemyMoveAction(enemyId, roomNum, dungeonId, level, move, round, address).catch(() => {});
     },
-    []
+    [address]
   );
 
   const disconnect = useCallback(() => {

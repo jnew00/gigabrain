@@ -810,8 +810,9 @@ export default function Home() {
 
   // Load run stats on connect
   const refreshRunStats = useCallback(() => {
-    getRunStatsAction().then(setRunStats).catch(() => {});
-  }, []);
+    if (!giga.address) return;
+    getRunStatsAction(giga.address).then(setRunStats).catch(() => {});
+  }, [giga.address]);
   useEffect(() => {
     if (connected) refreshRunStats();
   }, [connected, refreshRunStats]);
@@ -845,7 +846,7 @@ export default function Home() {
   }, []);
 
   // Helper: finish a single run and record stats for chaining
-  const finishRun = useCallback((roomsCleared: number, won: boolean, finalHp: number, maxHp: number) => {
+  const finishRun = useCallback((roomsCleared: number, won: boolean, finalHp: number, maxHp: number, dungeonName: string) => {
     const items = buildItemSummary();
     const boons = [...runBoonsRef.current];
     const summary = { roomsCleared, boons, items, finalHp, maxHp, won };
@@ -860,13 +861,13 @@ export default function Home() {
     }
 
     // Persist to SQLite
-    const dungeonName = getDungeonName();
-    recordRunAction(dungeonName, won, roomsCleared, finalHp, maxHp, items, boons)
+    const addr = gigaRef.current.address;
+    recordRunAction(dungeonName, won, roomsCleared, finalHp, maxHp, items, boons, addr)
       .then(() => refreshRunStats())
       .catch(() => {});
 
     return summary;
-  }, [buildItemSummary, refreshRunStats, getDungeonName]);
+  }, [buildItemSummary, refreshRunStats]);
 
   const buildChainSummary = useCallback(() => {
     const cs = chainStatsRef.current;
@@ -892,13 +893,15 @@ export default function Home() {
 
     const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-    const runSingleDungeon = async (): Promise<{ roomsCleared: number; won: boolean; finalHp: number; maxHp: number } | null> => {
+    const runSingleDungeon = async (): Promise<{ roomsCleared: number; won: boolean; finalHp: number; maxHp: number; dungeonName: string } | null> => {
       runBoonsRef.current = [];
       runItemsRef.current = new Map();
       setRunSummary(null);
       setLastDrops([]);
 
       let lastRoomNum = 0;
+      // Capture dungeon name early before state is cleared at run end
+      let capturedDungeonName = getDungeonName();
       // Track state locally so we don't depend on async React re-renders
       let currentState: DungeonActionResponse | null = gigaRef.current.dungeonState;
 
@@ -909,10 +912,15 @@ export default function Home() {
         const entity = state?.data?.entity;
 
         if (!run) {
-          return { roomsCleared: lastRoomNum, won: false, finalHp: 0, maxHp: 0 };
+          return { roomsCleared: lastRoomNum, won: false, finalHp: 0, maxHp: 0, dungeonName: capturedDungeonName };
         }
 
-        if (entity) lastRoomNum = entity.ROOM_NUM_CID;
+        // Re-capture dungeon name while entity is still available
+        if (entity) {
+          lastRoomNum = entity.ROOM_NUM_CID;
+          const freshName = getDungeonName();
+          if (freshName !== "Unknown") capturedDungeonName = freshName;
+        }
 
         const action = pickBestAction(state!, g.enemyMoveRecords, g.enemyNames);
         if (!action) {
@@ -949,6 +957,7 @@ export default function Home() {
               won: (p?.health.current ?? 0) > 0,
               finalHp: p?.health.current ?? 0,
               maxHp: p?.health.currentMax ?? 0,
+              dungeonName: capturedDungeonName,
             };
           }
 
@@ -990,7 +999,7 @@ export default function Home() {
 
         if (!result) break; // cancelled
 
-        const summary = finishRun(result.roomsCleared, result.won, result.finalHp, result.maxHp);
+        const summary = finishRun(result.roomsCleared, result.won, result.finalHp, result.maxHp, result.dungeonName);
         addLog(`auto: ${result.won ? "victory" : "defeated"} — ${result.roomsCleared} rooms`);
 
         if (!chaining) {
@@ -1050,6 +1059,15 @@ export default function Home() {
   const stateScore = giga.dungeonState ? evaluateState(giga.dungeonState) : 0;
   const recommended = giga.dungeonState ? pickBestAction(giga.dungeonState, giga.enemyMoveRecords, giga.enemyNames) : null;
 
+  // Track dungeon name while in a run so it's available after the run ends
+  const lastDungeonNameRef = useRef("Unknown");
+  useEffect(() => {
+    if (inRun) {
+      const name = getDungeonName();
+      if (name !== "Unknown") lastDungeonNameRef.current = name;
+    }
+  }, [inRun, entity, getDungeonName]);
+
   // Detect run ending (inRun goes false) and auto-generate summary if missing
   const wasInRunRef = useRef(false);
   useEffect(() => {
@@ -1063,12 +1081,12 @@ export default function Home() {
       const items = buildItemSummary();
       const boons = [...runBoonsRef.current];
       setRunSummary({ roomsCleared: rooms, boons, items, finalHp: player?.health.current ?? 0, maxHp: player?.health.currentMax ?? 0, won });
-      recordRunAction(getDungeonName(), won, rooms, player?.health.current ?? 0, player?.health.currentMax ?? 0, items, boons)
+      recordRunAction(lastDungeonNameRef.current, won, rooms, player?.health.current ?? 0, player?.health.currentMax ?? 0, items, boons, giga.address)
         .then(() => refreshRunStats()).catch(() => {});
       addLog("run ended");
       giga.refreshAll();
     }
-  }, [inRun, runSummary, entity, player, addLog, giga, buildItemSummary, getDungeonName, refreshRunStats]);
+  }, [inRun, runSummary, entity, player, addLog, giga, buildItemSummary, refreshRunStats]);
 
   /* ─── Restoring session ──────────────────────────────── */
   if (giga.restoringSession) {
@@ -2288,7 +2306,7 @@ export default function Home() {
                               const boons = [...runBoonsRef.current];
                               addLog(won ? "victory" : "defeated");
                               setRunSummary({ roomsCleared: rooms, boons, items, finalHp: fp?.health.current ?? 0, maxHp: fp?.health.currentMax ?? 0, won });
-                              recordRunAction(getDungeonName(), won, rooms, fp?.health.current ?? 0, fp?.health.currentMax ?? 0, items, boons)
+                              recordRunAction(lastDungeonNameRef.current, won, rooms, fp?.health.current ?? 0, fp?.health.currentMax ?? 0, items, boons, giga.address)
                                 .then(() => refreshRunStats()).catch(() => {});
                               giga.refreshAll();
                             }

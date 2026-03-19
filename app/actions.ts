@@ -27,7 +27,8 @@ export async function recordEnemyMoveAction(
   dungeonId: number,
   level: number,
   move: string,
-  round: number
+  round: number,
+  userAddress: string
 ) {
   if (!isPositiveInt(enemyId) || !isPositiveInt(roomNum) || !isPositiveInt(dungeonId) || !isPositiveInt(level) || !isPositiveInt(round)) {
     throw new Error("Invalid numeric parameter");
@@ -35,24 +36,37 @@ export async function recordEnemyMoveAction(
   if (!VALID_MOVES.has(move)) {
     throw new Error("Invalid move");
   }
-  await insertMove(enemyId, roomNum, dungeonId, level, move, round, Date.now());
+  if (typeof userAddress !== "string") {
+    throw new Error("Invalid user address");
+  }
+  await insertMove(enemyId, roomNum, dungeonId, level, move, round, Date.now(), userAddress);
 }
 
-export async function getAllEnemyMoves(): Promise<EnemyMoveRow[]> {
-  return getAllMoves();
+export async function getAllEnemyMoves(userAddress: string): Promise<EnemyMoveRow[]> {
+  if (typeof userAddress !== "string") {
+    throw new Error("Invalid user address");
+  }
+  return getAllMoves(userAddress);
 }
 
-export async function getEnemyStats(): Promise<{ totalRecords: number; uniqueEnemies: number }> {
-  return dbGetStats();
+export async function getEnemyStats(userAddress: string): Promise<{ totalRecords: number; uniqueEnemies: number }> {
+  if (typeof userAddress !== "string") {
+    throw new Error("Invalid user address");
+  }
+  return dbGetStats(userAddress);
 }
 
 /** Migrate localStorage records to SQLite (one-time) */
 export async function migrateEnemyMoves(
-  records: { enemyId: number; roomNum: number; dungeonId: number; level: number; move: string; round: number; timestamp: number }[]
+  records: { enemyId: number; roomNum: number; dungeonId: number; level: number; move: string; round: number; timestamp: number }[],
+  userAddress: string
 ): Promise<{ imported: number }> {
   if (!Array.isArray(records) || records.length === 0) return { imported: 0 };
   if (records.length > MAX_BULK_IMPORT) {
     throw new Error(`Bulk import limited to ${MAX_BULK_IMPORT} records`);
+  }
+  if (typeof userAddress !== "string") {
+    throw new Error("Invalid user address");
   }
   for (const r of records) {
     if (!isPositiveInt(r.enemyId) || !isPositiveInt(r.roomNum) || !isPositiveInt(r.dungeonId) || !isPositiveInt(r.level) || !isPositiveInt(r.round) || !isPositiveInt(r.timestamp)) {
@@ -62,7 +76,7 @@ export async function migrateEnemyMoves(
       throw new Error("Invalid move in bulk import");
     }
   }
-  await importBulk(records);
+  await importBulk(records, userAddress);
   return { imported: records.length };
 }
 
@@ -75,7 +89,8 @@ export async function recordRunAction(
   finalHp: number,
   maxHp: number,
   items: { id: number; amount: number; name: string }[],
-  boons: string[]
+  boons: string[],
+  userAddress: string
 ) {
   if (typeof dungeonName !== "string" || dungeonName.length === 0 || dungeonName.length > 200) {
     throw new Error("Invalid dungeon name");
@@ -86,11 +101,17 @@ export async function recordRunAction(
   if (!Array.isArray(items) || !Array.isArray(boons)) {
     throw new Error("Invalid items or boons");
   }
-  await insertRun(dungeonName, won, roomsCleared, finalHp, maxHp, items, boons);
+  if (typeof userAddress !== "string") {
+    throw new Error("Invalid user address");
+  }
+  await insertRun(dungeonName, won, roomsCleared, finalHp, maxHp, items, boons, userAddress);
 }
 
-export async function getRunStatsAction() {
-  return dbGetRunStats();
+export async function getRunStatsAction(userAddress: string) {
+  if (typeof userAddress !== "string") {
+    throw new Error("Invalid user address");
+  }
+  return dbGetRunStats(userAddress);
 }
 
 /* ─── Auth ────────────────────────────────────────────── */
