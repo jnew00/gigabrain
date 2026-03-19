@@ -407,12 +407,30 @@ export function useGigaverse() {
         }
         return result;
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Action failed");
+        const msg = e instanceof Error ? e.message : "Action failed";
+        console.warn(`[performAction] ${action} failed:`, msg);
+        setError(msg);
         return null;
       }
     },
     [token]
   );
+
+  /** Fetch fresh dungeon state directly (bypasses async React state) */
+  const fetchDungeonState = useCallback(async () => {
+    if (!token) return null;
+    try {
+      const ds = await proxy<DungeonActionResponse>("/api/game/dungeon/state", token);
+      setDungeonState(ds);
+      if (ds.actionToken) {
+        setActionToken(ds.actionToken);
+        actionTokenRef.current = ds.actionToken;
+      }
+      return ds;
+    } catch {
+      return null;
+    }
+  }, [token]);
 
   const startRun = useCallback(
     (dungeonId: number = 0, isJuiced = false, gearInstanceIds: string[] = []) => {
@@ -605,6 +623,7 @@ export function useGigaverse() {
     recordEnemyMove,
     refreshAll,
     performAction,
+    fetchDungeonState,
     startRun,
     claimRom,
     convertEnergyToDust,

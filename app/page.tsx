@@ -958,10 +958,15 @@ export default function Home() {
             addLog(`  ${p.health.current}hp vs ${e.health.current}hp`);
           }
         } else {
-          addLog("auto: action failed, resyncing...");
-          await g.refreshAll();
-          await delay(500);
-          currentState = gigaRef.current.dungeonState;
+          addLog(`auto: action failed (${g.error || "unknown"}), resyncing...`);
+          const freshState = await g.fetchDungeonState();
+          if (freshState) {
+            currentState = freshState;
+          } else {
+            await g.refreshAll();
+            await delay(500);
+            currentState = null; // will fall back to gigaRef on next iteration
+          }
         }
 
         await delay(150);
