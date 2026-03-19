@@ -35,7 +35,7 @@ export async function recordEnemyMoveAction(
   if (!VALID_MOVES.has(move)) {
     throw new Error("Invalid move");
   }
-  insertMove(enemyId, roomNum, dungeonId, level, move, round, Date.now());
+  await insertMove(enemyId, roomNum, dungeonId, level, move, round, Date.now());
 }
 
 export async function getAllEnemyMoves(): Promise<EnemyMoveRow[]> {
@@ -62,7 +62,7 @@ export async function migrateEnemyMoves(
       throw new Error("Invalid move in bulk import");
     }
   }
-  importBulk(records);
+  await importBulk(records);
   return { imported: records.length };
 }
 
@@ -86,7 +86,7 @@ export async function recordRunAction(
   if (!Array.isArray(items) || !Array.isArray(boons)) {
     throw new Error("Invalid items or boons");
   }
-  insertRun(dungeonName, won, roomsCleared, finalHp, maxHp, items, boons);
+  await insertRun(dungeonName, won, roomsCleared, finalHp, maxHp, items, boons);
 }
 
 export async function getRunStatsAction() {

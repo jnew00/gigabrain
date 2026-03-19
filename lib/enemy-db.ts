@@ -1,46 +1,58 @@
-import Database from "better-sqlite3";
-import path from "path";
+import { Pool } from "@neondatabase/serverless";
 
-const DB_PATH = path.join(process.cwd(), "data", "enemy-intel.db");
+let pool: Pool | null = null;
 
-let db: Database.Database | null = null;
+function hasDatabase(): boolean {
+  return !!process.env.DATABASE_URL;
+}
 
-function getDb(): Database.Database {
-  if (!db) {
-    db = new Database(DB_PATH);
-    db.pragma("journal_mode = WAL");
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS enemy_moves (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        enemy_id INTEGER NOT NULL,
-        room_num INTEGER NOT NULL,
-        dungeon_id INTEGER NOT NULL,
-        level INTEGER NOT NULL,
-        move TEXT NOT NULL,
-        round INTEGER NOT NULL,
-        timestamp INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_enemy_id ON enemy_moves(enemy_id);
-      CREATE INDEX IF NOT EXISTS idx_enemy_room ON enemy_moves(enemy_id, room_num);
-
-      CREATE TABLE IF NOT EXISTS run_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        dungeon_name TEXT NOT NULL,
-        won INTEGER NOT NULL,
-        rooms_cleared INTEGER NOT NULL,
-        final_hp INTEGER NOT NULL,
-        max_hp INTEGER NOT NULL,
-        items_json TEXT NOT NULL DEFAULT '[]',
-        boons_json TEXT NOT NULL DEFAULT '[]',
-        timestamp INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_run_timestamp ON run_history(timestamp);
-    `);
-
-    // Clean up bad data (enemy_id -1 = no enemy)
-    db.exec("DELETE FROM enemy_moves WHERE enemy_id < 0");
+function getPool(): Pool {
+  if (!pool) {
+    if (!process.env.DATABASE_URL) {
+      throw new Error("DATABASE_URL environment variable is not set");
+    }
+    pool = new Pool({ connectionString: process.env.DATABASE_URL });
   }
-  return db;
+  return pool;
+}
+
+let initialized = false;
+
+async function ensureTables() {
+  if (initialized) return;
+  const p = getPool();
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS enemy_moves (
+      id SERIAL PRIMARY KEY,
+      enemy_id INTEGER NOT NULL,
+      room_num INTEGER NOT NULL,
+      dungeon_id INTEGER NOT NULL,
+      level INTEGER NOT NULL,
+      move TEXT NOT NULL,
+      round INTEGER NOT NULL,
+      timestamp BIGINT NOT NULL
+    )
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_enemy_id ON enemy_moves(enemy_id)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_enemy_room ON enemy_moves(enemy_id, room_num)`);
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS run_history (
+      id SERIAL PRIMARY KEY,
+      dungeon_name TEXT NOT NULL,
+      won INTEGER NOT NULL,
+      rooms_cleared INTEGER NOT NULL,
+      final_hp INTEGER NOT NULL,
+      max_hp INTEGER NOT NULL,
+      items_json TEXT NOT NULL DEFAULT '[]',
+      boons_json TEXT NOT NULL DEFAULT '[]',
+      timestamp BIGINT NOT NULL
+    )
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_run_timestamp ON run_history(timestamp)`);
+
+  // Clean up bad data (enemy_id -1 = no enemy)
+  await p.query(`DELETE FROM enemy_moves WHERE enemy_id < 0`);
+  initialized = true;
 }
 
 export interface EnemyMoveRow {
@@ -54,7 +66,7 @@ export interface EnemyMoveRow {
   timestamp: number;
 }
 
-export function insertMove(
+export async function insertMove(
   enemyId: number,
   roomNum: number,
   dungeonId: number,
@@ -63,39 +75,51 @@ export function insertMove(
   round: number,
   timestamp: number
 ) {
-  const d = getDb();
-  d.prepare(
+  if (!hasDatabase()) return;
+  await ensureTables();
+  await getPool().query(
     `INSERT INTO enemy_moves (enemy_id, room_num, dungeon_id, level, move, round, timestamp)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(enemyId, roomNum, dungeonId, level, move, round, timestamp);
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [enemyId, roomNum, dungeonId, level, move, round, timestamp]
+  );
 }
 
-export function getAllMoves(): EnemyMoveRow[] {
-  const d = getDb();
-  return d.prepare("SELECT * FROM enemy_moves ORDER BY timestamp ASC").all() as EnemyMoveRow[];
+export async function getAllMoves(): Promise<EnemyMoveRow[]> {
+  if (!hasDatabase()) return [];
+  await ensureTables();
+  const { rows } = await getPool().query(`SELECT * FROM enemy_moves ORDER BY timestamp ASC`);
+  return rows as EnemyMoveRow[];
 }
 
-export function getStats(): { totalRecords: number; uniqueEnemies: number } {
-  const d = getDb();
-  const total = (d.prepare("SELECT COUNT(*) as c FROM enemy_moves").get() as { c: number }).c;
-  const unique = (d.prepare("SELECT COUNT(DISTINCT enemy_id) as c FROM enemy_moves").get() as { c: number }).c;
-  return { totalRecords: total, uniqueEnemies: unique };
+export async function getStats(): Promise<{ totalRecords: number; uniqueEnemies: number }> {
+  if (!hasDatabase()) return { totalRecords: 0, uniqueEnemies: 0 };
+  await ensureTables();
+  const p = getPool();
+  const { rows: [{ c: total }] } = await p.query(`SELECT COUNT(*) as c FROM enemy_moves`);
+  const { rows: [{ c: unique }] } = await p.query(`SELECT COUNT(DISTINCT enemy_id) as c FROM enemy_moves`);
+  return { totalRecords: Number(total), uniqueEnemies: Number(unique) };
 }
 
-export function importBulk(
+export async function importBulk(
   records: { enemyId: number; roomNum: number; dungeonId: number; level: number; move: string; round: number; timestamp: number }[]
 ) {
-  const d = getDb();
-  const insert = d.prepare(
+  if (!hasDatabase()) return;
+  await ensureTables();
+  const p = getPool();
+  // Build a multi-row INSERT for efficiency
+  const values: unknown[] = [];
+  const placeholders: string[] = [];
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    const offset = i * 7;
+    placeholders.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7})`);
+    values.push(r.enemyId, r.roomNum, r.dungeonId, r.level, r.move, r.round, r.timestamp);
+  }
+  await p.query(
     `INSERT INTO enemy_moves (enemy_id, room_num, dungeon_id, level, move, round, timestamp)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+     VALUES ${placeholders.join(", ")}`,
+    values
   );
-  const tx = d.transaction((recs: typeof records) => {
-    for (const r of recs) {
-      insert.run(r.enemyId, r.roomNum, r.dungeonId, r.level, r.move, r.round, r.timestamp);
-    }
-  });
-  tx(records);
 }
 
 /* ─── Run History ─────────────────────────────────────── */
@@ -112,7 +136,7 @@ export interface RunHistoryRow {
   timestamp: number;
 }
 
-export function insertRun(
+export async function insertRun(
   dungeonName: string,
   won: boolean,
   roomsCleared: number,
@@ -121,31 +145,34 @@ export function insertRun(
   items: { id: number; amount: number; name: string }[],
   boons: string[]
 ) {
-  const d = getDb();
-  d.prepare(
+  if (!hasDatabase()) return;
+  await ensureTables();
+  await getPool().query(
     `INSERT INTO run_history (dungeon_name, won, rooms_cleared, final_hp, max_hp, items_json, boons_json, timestamp)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(dungeonName, won ? 1 : 0, roomsCleared, finalHp, maxHp, JSON.stringify(items), JSON.stringify(boons), Date.now());
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [dungeonName, won ? 1 : 0, roomsCleared, finalHp, maxHp, JSON.stringify(items), JSON.stringify(boons), Date.now()]
+  );
 }
 
-export function getRunStats(): {
+export async function getRunStats(): Promise<{
   totalRuns: number;
   wins: number;
   losses: number;
   avgRooms: number;
   totalItems: Record<string, { name: string; amount: number }>;
   recentRuns: RunHistoryRow[];
-} {
-  const d = getDb();
-  const total = (d.prepare("SELECT COUNT(*) as c FROM run_history").get() as { c: number }).c;
-  const wins = (d.prepare("SELECT COUNT(*) as c FROM run_history WHERE won = 1").get() as { c: number }).c;
-  const avgRooms = total > 0
-    ? (d.prepare("SELECT AVG(rooms_cleared) as a FROM run_history").get() as { a: number }).a
-    : 0;
-  const recent = d.prepare("SELECT * FROM run_history ORDER BY timestamp DESC LIMIT 20").all() as RunHistoryRow[];
+}> {
+  if (!hasDatabase()) return { totalRuns: 0, wins: 0, losses: 0, avgRooms: 0, totalItems: {}, recentRuns: [] };
+  await ensureTables();
+  const p = getPool();
+  const { rows: [{ c: total }] } = await p.query(`SELECT COUNT(*) as c FROM run_history`);
+  const { rows: [{ c: wins }] } = await p.query(`SELECT COUNT(*) as c FROM run_history WHERE won = 1`);
+  const { rows: avgResult } = await p.query(`SELECT AVG(rooms_cleared) as a FROM run_history`);
+  const avgRooms = Number(total) > 0 ? Number(avgResult[0].a) : 0;
+  const { rows: recent } = await p.query(`SELECT * FROM run_history ORDER BY timestamp DESC LIMIT 20`);
 
   // Aggregate all items across all runs
-  const allRuns = d.prepare("SELECT items_json FROM run_history").all() as { items_json: string }[];
+  const { rows: allRuns } = await p.query(`SELECT items_json FROM run_history`);
   const totalItems: Record<string, { name: string; amount: number }> = {};
   for (const row of allRuns) {
     try {
@@ -158,5 +185,12 @@ export function getRunStats(): {
     } catch { /* skip bad json */ }
   }
 
-  return { totalRuns: total, wins, losses: total - wins, avgRooms, totalItems, recentRuns: recent };
+  return {
+    totalRuns: Number(total),
+    wins: Number(wins),
+    losses: Number(total) - Number(wins),
+    avgRooms,
+    totalItems,
+    recentRuns: recent as RunHistoryRow[],
+  };
 }
