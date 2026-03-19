@@ -11,8 +11,8 @@ import { ABSTRACT_VOTING_ADDRESS, ABSTRACT_VOTING_ABI, GIGAVERSE_APP_ID } from "
 import { Sword, Shield, Sparkles, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote, Waves, Rocket } from "lucide-react";
 import { MissionControlPage } from "./mission-control";
 import { useState, useEffect, useRef, useCallback } from "react";
-import type { Player, DungeonAction, DungeonActionResponse, RomEntity, FishingCard, FishingGameState } from "@/lib/types";
-import { pickBestCard, shouldRedraw, handCoverage } from "@/lib/fishing-ai";
+import type { Player, DungeonAction, DungeonActionResponse, RomEntity, FishingCard } from "@/lib/types";
+import { pickBestCard, shouldRedraw } from "@/lib/fishing-ai";
 
 const MOVE_ICONS: Record<string, typeof Sword> = {
   rock: Sword,
@@ -1198,21 +1198,6 @@ export default function Home() {
     ? (giga.enemyNames[String(entity.ENEMY_CID)]
       || giga.enemyNames[`idx:${entity.ENEMY_CID}`])?.name
     : undefined;
-
-  // Helper: runs today compact string
-  const runsTodayCompact = (() => {
-    const progress = giga.dungeonToday?.dayProgressEntities;
-    const dungeons = giga.dungeonToday?.dungeonDataEntities;
-    if (!dungeons) return null;
-    return dungeons.map((d) => {
-      const progressEntry = progress?.find((p) => p.ID_CID === `Dungeon#${d.ID_CID}`);
-      const runsForDungeon = progressEntry?.UINT256_CID ?? 0;
-      const maxRuns = d.juicedMaxRunsPerDay || 10;
-      // Abbreviate dungeon name to first letters
-      const abbr = d.NAME_CID.split(" ").map((w: string) => w[0]).join("").toUpperCase();
-      return { abbr, name: d.NAME_CID, runs: runsForDungeon, max: maxRuns };
-    });
-  })();
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -2977,7 +2962,6 @@ function FishingPage({ giga, addLog }: {
               </div>
               {(() => {
                 const rates = fs?.exchangeRates || [];
-                const fishIds = new Set(rates.map((r: { id: number }) => String(r.id)));
                 const balMap = giga.itemBalances;
                 const fish = rates
                   .map((r: { id: number; baseVal: number; value: number }) => {

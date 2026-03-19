@@ -159,7 +159,7 @@ function statusColor(status: StepStatus): string {
 
 /* ─── Component ────────────────────────────────────────────── */
 
-export function MissionControlPage({ giga, addLog, handleVote, hasVoted, voting }: MissionControlProps) {
+export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: MissionControlProps) {
   const gigaRef = useRef(giga);
   gigaRef.current = giga;
 
@@ -610,7 +610,6 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, voting 
               addLog(`[MC] ${reason}`);
 
               // Track enemy move
-              const preState = currentState;
               const result = await g().performAction(action, alloc.dungeonId);
               if (!result) {
                 addLog(`[MC] action failed`);

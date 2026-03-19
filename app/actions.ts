@@ -10,6 +10,15 @@ import {
 } from "@/lib/enemy-db";
 import type { EnemyMoveRow } from "@/lib/enemy-db";
 
+/* ─── Validation helpers ─────────────────────────────── */
+
+const VALID_MOVES = new Set(["rock", "paper", "scissor"]);
+const MAX_BULK_IMPORT = 10_000;
+
+function isPositiveInt(n: unknown): n is number {
+  return typeof n === "number" && Number.isInteger(n) && n >= 0;
+}
+
 /* ─── Enemy Intel ─────────────────────────────────────── */
 
 export async function recordEnemyMoveAction(
@@ -20,6 +29,12 @@ export async function recordEnemyMoveAction(
   move: string,
   round: number
 ) {
+  if (!isPositiveInt(enemyId) || !isPositiveInt(roomNum) || !isPositiveInt(dungeonId) || !isPositiveInt(level) || !isPositiveInt(round)) {
+    throw new Error("Invalid numeric parameter");
+  }
+  if (!VALID_MOVES.has(move)) {
+    throw new Error("Invalid move");
+  }
   insertMove(enemyId, roomNum, dungeonId, level, move, round, Date.now());
 }
 
@@ -35,7 +50,18 @@ export async function getEnemyStats(): Promise<{ totalRecords: number; uniqueEne
 export async function migrateEnemyMoves(
   records: { enemyId: number; roomNum: number; dungeonId: number; level: number; move: string; round: number; timestamp: number }[]
 ): Promise<{ imported: number }> {
-  if (records.length === 0) return { imported: 0 };
+  if (!Array.isArray(records) || records.length === 0) return { imported: 0 };
+  if (records.length > MAX_BULK_IMPORT) {
+    throw new Error(`Bulk import limited to ${MAX_BULK_IMPORT} records`);
+  }
+  for (const r of records) {
+    if (!isPositiveInt(r.enemyId) || !isPositiveInt(r.roomNum) || !isPositiveInt(r.dungeonId) || !isPositiveInt(r.level) || !isPositiveInt(r.round) || !isPositiveInt(r.timestamp)) {
+      throw new Error("Invalid record in bulk import");
+    }
+    if (!VALID_MOVES.has(r.move)) {
+      throw new Error("Invalid move in bulk import");
+    }
+  }
   importBulk(records);
   return { imported: records.length };
 }
@@ -51,6 +77,15 @@ export async function recordRunAction(
   items: { id: number; amount: number; name: string }[],
   boons: string[]
 ) {
+  if (typeof dungeonName !== "string" || dungeonName.length === 0 || dungeonName.length > 200) {
+    throw new Error("Invalid dungeon name");
+  }
+  if (!isPositiveInt(roomsCleared) || !isPositiveInt(maxHp)) {
+    throw new Error("Invalid numeric parameter");
+  }
+  if (!Array.isArray(items) || !Array.isArray(boons)) {
+    throw new Error("Invalid items or boons");
+  }
   insertRun(dungeonName, won, roomsCleared, finalHp, maxHp, items, boons);
 }
 
