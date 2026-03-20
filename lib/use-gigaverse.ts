@@ -352,7 +352,9 @@ export function useGigaverse() {
         proxy<FishingGameState>(`/api/fishing/state/${address}`, token).catch(() => null),
       ] as const);
       setEnergy(eng);
-      if (ds) {
+      // Re-check autoBattleRef AFTER awaiting — auto-battle may have started
+      // while fetches were in-flight. Never touch dungeon state/token if active.
+      if (ds && !autoBattleRef.current) {
         setDungeonState(ds);
         if (ds.actionToken) {
           setActionToken(ds.actionToken);
