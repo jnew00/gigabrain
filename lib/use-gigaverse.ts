@@ -455,7 +455,10 @@ export function useGigaverse() {
           }
         );
         setDungeonState(result);
-        if (result.actionToken) setActionToken(result.actionToken);
+        if (result.actionToken) {
+          setActionToken(result.actionToken);
+          actionTokenRef.current = result.actionToken;
+        }
         return result;
       });
     },
