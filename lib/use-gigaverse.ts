@@ -613,7 +613,15 @@ export function useGigaverse() {
         }
         return result;
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Fishing action failed");
+        const msg = e instanceof Error ? e.message : "Fishing action failed";
+        lastErrorRef.current = msg;
+        // Recover token from error response
+        const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
+        if (respData?.actionToken) {
+          fishingActionTokenRef.current = respData.actionToken;
+          actionTokenRef.current = respData.actionToken;
+        }
+        setError(msg);
         return null;
       }
     },

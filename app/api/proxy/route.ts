@@ -78,6 +78,9 @@ export async function POST(req: NextRequest) {
     const res = await fetch(`${BASE_URL}${endpoint}`, fetchOpts);
     const text = await res.text();
 
+    if (res.status >= 400) {
+      console.error(`[PROXY ${res.status}] ${method} ${endpoint}`, { body, response: text.slice(0, 300) });
+    }
 
     // Try to parse as JSON, fall back to generic error
     let data;

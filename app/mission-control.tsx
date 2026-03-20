@@ -809,6 +809,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
         const stepId = "fishing";
         if (cancelRef.current) { updateStep(stepId, { status: "skipped" }); }
         else {
+          // Refresh token before fishing — use fetchDungeonState which returns the
+          // authoritative server token. Do NOT call fetchFishingState here — its
+          // GET endpoint returns a stale token that would clobber the fresh one.
+          await g().fetchDungeonState();
           updateStep(stepId, { status: "running", detail: "starting..." });
           let caught = 0;
           let escaped = 0;
@@ -823,7 +827,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               // shared actionToken with a stale fishing-specific value
               const startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId });
               if (!startResult) {
-                log(`[MC] fishing cast failed to start`);
+                log(`[MC] fishing cast failed to start: ${g().lastErrorRef.current || "unknown"}`);
                 escaped++;
                 continue;
               }
