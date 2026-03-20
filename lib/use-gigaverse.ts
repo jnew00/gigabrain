@@ -82,7 +82,10 @@ async function proxy<T>(
 
   if (!res.ok) {
     console.error(`[proxy] ${method} ${endpoint} → ${res.status}:`, data?.message || data?.error, body ? JSON.stringify(body).substring(0, 200) : "");
-    throw new Error(data?.message || data?.error || `API error ${res.status}`);
+    const err = new Error(data?.message || data?.error || `API error ${res.status}`);
+    // Attach response data so callers can extract actionToken from error responses
+    (err as Error & { responseData?: unknown }).responseData = data;
+    throw err;
   }
 
   return data as T;
@@ -418,7 +421,15 @@ export function useGigaverse() {
         return result;
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Action failed";
-        console.warn(`[performAction] ${action} FAILED: ${msg} (sent token=${sentToken}, ref now=${actionTokenRef.current})`);
+        // Recover actionToken from error response — server rotates even on failure
+        const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
+        if (respData?.actionToken) {
+          console.warn(`[performAction] ${action} FAILED but got new token=${respData.actionToken}`);
+          actionTokenRef.current = respData.actionToken;
+          fishingActionTokenRef.current = respData.actionToken;
+        } else {
+          console.warn(`[performAction] ${action} FAILED: ${msg} (token=${sentToken}, no new token in error)`);
+        }
         setError(msg);
         return null;
       }

@@ -553,8 +553,13 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
         }
       }
 
-      // Refresh before energy-consuming steps (skip dungeon state to avoid token rotation)
+      // Refresh before energy-consuming steps
       await g().refreshAll();
+
+      // Fetch fresh actionToken — free actions above (ROM claims, recipes)
+      // rotated the server token without updating our ref.
+      // This is a one-time read right before we need the token.
+      await g().fetchDungeonState();
 
       // 6. Dungeon runs
       for (const alloc of dungeonAllocs) {
