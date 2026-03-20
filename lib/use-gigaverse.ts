@@ -372,9 +372,10 @@ export function useGigaverse() {
     }
   }, [token, address]);
 
-  // Use a ref for actionToken so performAction always has the latest
+  // Ref is the sole source of truth for actionToken — only updated imperatively
+  // in performAction/startRun/fetchDungeonState/refreshAll. Do NOT sync from
+  // React state on re-render as it can overwrite with a stale value.
   const actionTokenRef = useRef(actionToken);
-  actionTokenRef.current = actionToken;
 
   const performAction = useCallback(
     async (action: DungeonAction, dungeonId: number = 0) => {
