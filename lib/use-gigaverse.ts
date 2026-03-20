@@ -367,9 +367,12 @@ export function useGigaverse() {
       }
       if (fs) {
         setFishingState(fs);
-        if (fs.actionToken) {
+        // Only update fishing token ref if not in auto-battle — the fishing
+        // state endpoint returns a stale token that clobbers the current one
+        if (fs.actionToken && !autoBattleRef.current) {
           setFishingActionToken(fs.actionToken);
           fishingActionTokenRef.current = fs.actionToken;
+          actionTokenRef.current = fs.actionToken;
         }
       }
     } catch {

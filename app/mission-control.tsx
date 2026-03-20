@@ -559,6 +559,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
       // Fetch fresh dungeon state + actionToken before dungeon runs.
       // Free actions above (ROM claims, recipes) rotated the server token.
       const preState = await g().fetchDungeonState();
+      addLog(`[MC] pre-state: run=${!!preState?.data?.run} msg="${preState?.message || "none"}"`);
 
       // If there's a stuck/active run, finish it first
       if (preState?.data?.run && preState.message !== "Run Complete") {
