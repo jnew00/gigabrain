@@ -556,10 +556,29 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
       // Refresh before energy-consuming steps
       await g().refreshAll();
 
-      // Fetch fresh actionToken — free actions above (ROM claims, recipes)
-      // rotated the server token without updating our ref.
-      // This is a one-time read right before we need the token.
-      await g().fetchDungeonState();
+      // Fetch fresh dungeon state + actionToken before dungeon runs.
+      // Free actions above (ROM claims, recipes) rotated the server token.
+      const preState = await g().fetchDungeonState();
+
+      // If there's a stuck/active run, finish it first
+      if (preState?.data?.run && preState.message !== "Run Complete") {
+        addLog(`[MC] found active run, finishing it first...`);
+        let stuckState = preState;
+        let stuckIter = 0;
+        while (stuckState?.data?.run && stuckState.message !== "Run Complete" && stuckIter < 100) {
+          if (cancelRef.current) break;
+          stuckIter++;
+          const action = pickBestAction(stuckState, g().enemyMoveRecords, g().enemyNames);
+          if (!action) { await delay(500); break; }
+          const result = await g().performAction(action);
+          if (!result) break;
+          stuckState = result;
+          await delay(150);
+        }
+        addLog(`[MC] active run cleared`);
+        // Refresh token after clearing
+        await g().fetchDungeonState();
+      }
 
       // 6. Dungeon runs
       for (const alloc of dungeonAllocs) {
@@ -579,7 +598,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           try {
             const startResult = await g().startRun(alloc.dungeonId);
             if (!startResult || startResult.success === false) {
-              addLog(`[MC] failed to start: ${startResult?.message || "unknown"}`);
+              addLog(`[MC] failed to start: ${startResult?.message || g().error || "unknown"}`);
               losses++;
               continue;
             }
