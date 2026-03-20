@@ -489,10 +489,21 @@ export function useGigaverse() {
         const msg = e instanceof Error ? e.message : "Start run failed";
         // Recover token from error response — server rotates even on failure
         const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
+        console.warn(`[startRun] FAILED: ${msg}`, "responseData:", JSON.stringify(respData));
         if (respData?.actionToken) {
-          console.warn(`[startRun] FAILED but got new token=${respData.actionToken}`);
+          console.warn(`[startRun] recovered token=${respData.actionToken} from error response`);
           actionTokenRef.current = respData.actionToken;
           fishingActionTokenRef.current = respData.actionToken;
+        } else {
+          // No token in error response — re-fetch to get current token
+          console.warn(`[startRun] no token in error, fetching fresh state`);
+          try {
+            const fresh = await proxy<DungeonActionResponse>("/api/game/dungeon/state", token);
+            if (fresh?.actionToken) {
+              actionTokenRef.current = fresh.actionToken;
+              fishingActionTokenRef.current = fresh.actionToken;
+            }
+          } catch { /* ignore */ }
         }
         setError(msg);
         return null;
