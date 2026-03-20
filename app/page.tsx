@@ -1026,7 +1026,6 @@ export default function Home() {
         }
 
         addLog(`chain: ${chain.dungeonName} started`);
-        await gigaRef.current.refreshAll();
         await delay(500);
       }
 
@@ -2063,7 +2062,6 @@ export default function Home() {
                             } else {
                               addLog(`failed: ${result?.message || giga.error || "unknown error"}`);
                             }
-                            await giga.refreshAll();
                           }}
                           disabled={giga.loading || notEnough}
                           className="btn-press text-[14px] font-bold px-5 py-3 rounded-lg cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
@@ -2107,7 +2105,6 @@ export default function Home() {
                             const result = await giga.startRun(d.ID_CID);
                             if (result && result.success !== false) {
                               addLog("started");
-                              await giga.refreshAll();
                               setAutoPlay(true);
                             } else {
                               addLog(`failed: ${result?.message || giga.error || "unknown error"}`);
