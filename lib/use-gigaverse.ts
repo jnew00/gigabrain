@@ -601,7 +601,7 @@ export function useGigaverse() {
           "POST",
           {
             action,
-            actionToken: fishingActionTokenRef.current,
+            actionToken: actionTokenRef.current,
             data,
           }
         );
