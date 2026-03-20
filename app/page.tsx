@@ -817,12 +817,12 @@ export default function Home() {
     if (connected) refreshRunStats();
   }, [connected, refreshRunStats]);
 
-  // Periodic refresh
+  // Periodic refresh (paused during auto-battle to avoid actionToken races)
   useEffect(() => {
-    if (!connected) return;
+    if (!connected || autoPlay) return;
     const id = setInterval(() => gigaRef.current.refreshAll(), 30000);
     return () => clearInterval(id);
-  }, [connected]);
+  }, [connected, autoPlay]);
 
   // Keep refs in sync
   useEffect(() => {
