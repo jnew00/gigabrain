@@ -338,13 +338,14 @@ export function useGigaverse() {
   // state fetch to avoid rotating the actionToken on the server
   const autoBattleRef = useRef(false);
 
-  const refreshAll = useCallback(async (opts?: { skipDungeonState?: boolean }) => {
+  const refreshAll = useCallback(async () => {
     if (!token || !address) return;
-    const skipDS = opts?.skipDungeonState || autoBattleRef.current;
     try {
-      const [eng, ds, dt, rm, pr, bal, fs] = await Promise.all([
+      // NEVER fetch /api/game/dungeon/state here — it rotates the actionToken
+      // on the Gigaverse server. Dungeon state is only fetched explicitly via
+      // fetchDungeonState() or from connect/performAction/startRun responses.
+      const [eng, dt, rm, pr, bal, fs] = await Promise.all([
         proxy<EnergyResponse>(`/api/offchain/player/energy/${address}`, token),
-        skipDS ? Promise.resolve(null) : proxy<DungeonActionResponse>("/api/game/dungeon/state", token),
         proxy<DungeonTodayResponse>("/api/game/dungeon/today", token),
         proxy<RomsResponse>(`/api/roms/player?id=${address.toLowerCase()}`, token),
         proxy<PlayerRecipesResponse>(`/api/offchain/recipes/player/${address}`, token),
@@ -352,15 +353,6 @@ export function useGigaverse() {
         proxy<FishingGameState>(`/api/fishing/state/${address}`, token).catch(() => null),
       ] as const);
       setEnergy(eng);
-      // Re-check autoBattleRef AFTER awaiting — auto-battle may have started
-      // while fetches were in-flight. Never touch dungeon state/token if active.
-      if (ds && !autoBattleRef.current) {
-        setDungeonState(ds);
-        if (ds.actionToken) {
-          setActionToken(ds.actionToken);
-          actionTokenRef.current = ds.actionToken;
-        }
-      }
       setDungeonToday(dt);
       setRoms(rm);
       setPlayerRecipes(pr);

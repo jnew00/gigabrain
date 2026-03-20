@@ -554,7 +554,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
       }
 
       // Refresh before energy-consuming steps (skip dungeon state to avoid token rotation)
-      await g().refreshAll({ skipDungeonState: true });
+      await g().refreshAll();
 
       // 6. Dungeon runs
       for (const alloc of dungeonAllocs) {
@@ -652,7 +652,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           summaryStats.dungeonRuns++;
           if (run < alloc.runs - 1) {
             // Skip dungeon state fetch between runs to avoid token rotation
-            await g().refreshAll({ skipDungeonState: true });
+            await g().refreshAll();
             await delay(300);
           }
         }
