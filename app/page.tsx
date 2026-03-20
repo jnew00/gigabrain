@@ -827,7 +827,8 @@ export default function Home() {
   // Keep refs in sync
   useEffect(() => {
     autoPlayRef.current = autoPlay;
-  }, [autoPlay]);
+    giga.autoBattleRef.current = autoPlay;
+  }, [autoPlay, giga.autoBattleRef]);
   useEffect(() => {
     chainModeRef.current = chainMode;
   }, [chainMode]);
@@ -2101,6 +2102,7 @@ export default function Home() {
                             runBoonsRef.current = [];
                             runItemsRef.current = new Map();
                             setChainMode({ dungeonId: d.ID_CID, dungeonName: d.NAME_CID });
+                            giga.autoBattleRef.current = true; // prevent refreshAll from touching dungeon state
                             addLog(`chain: starting ${d.NAME_CID}`);
                             const result = await giga.startRun(d.ID_CID);
                             if (result && result.success !== false) {

@@ -334,12 +334,17 @@ export function useGigaverse() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const refreshAll = useCallback(async () => {
+  // Track whether auto-battle is active — when true, refreshAll skips dungeon
+  // state fetch to avoid rotating the actionToken on the server
+  const autoBattleRef = useRef(false);
+
+  const refreshAll = useCallback(async (opts?: { skipDungeonState?: boolean }) => {
     if (!token || !address) return;
+    const skipDS = opts?.skipDungeonState || autoBattleRef.current;
     try {
       const [eng, ds, dt, rm, pr, bal, fs] = await Promise.all([
         proxy<EnergyResponse>(`/api/offchain/player/energy/${address}`, token),
-        proxy<DungeonActionResponse>("/api/game/dungeon/state", token),
+        skipDS ? Promise.resolve(null) : proxy<DungeonActionResponse>("/api/game/dungeon/state", token),
         proxy<DungeonTodayResponse>("/api/game/dungeon/today", token),
         proxy<RomsResponse>(`/api/roms/player?id=${address.toLowerCase()}`, token),
         proxy<PlayerRecipesResponse>(`/api/offchain/recipes/player/${address}`, token),
@@ -347,7 +352,13 @@ export function useGigaverse() {
         proxy<FishingGameState>(`/api/fishing/state/${address}`, token).catch(() => null),
       ] as const);
       setEnergy(eng);
-      setDungeonState(ds);
+      if (ds) {
+        setDungeonState(ds);
+        if (ds.actionToken) {
+          setActionToken(ds.actionToken);
+          actionTokenRef.current = ds.actionToken;
+        }
+      }
       setDungeonToday(dt);
       setRoms(rm);
       setPlayerRecipes(pr);
@@ -355,10 +366,6 @@ export function useGigaverse() {
         const bals: Record<string, number> = {};
         for (const b of bal.entities) bals[b.ID_CID] = b.BALANCE_CID;
         setItemBalances(bals);
-      }
-      if (ds.actionToken) {
-        setActionToken(ds.actionToken);
-        actionTokenRef.current = ds.actionToken;
       }
       if (fs) {
         setFishingState(fs);
@@ -626,6 +633,7 @@ export function useGigaverse() {
     disconnect,
     recordEnemyMove,
     refreshAll,
+    autoBattleRef,
     performAction,
     fetchDungeonState,
     startRun,
