@@ -635,7 +635,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               const reason = explainAction(battleState, action, g().enemyMoveRecords, g().enemyNames);
               addLog(`[MC] ${reason}`);
 
-              const result = await g().performAction(action, alloc.dungeonId);
+              const result = await g().performAction(action);
               if (!result) {
                 addLog(`[MC] action failed, retrying...`);
                 await delay(1000);
