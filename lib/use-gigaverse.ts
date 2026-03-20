@@ -381,6 +381,8 @@ export function useGigaverse() {
   const performAction = useCallback(
     async (action: DungeonAction, dungeonId: number = 0) => {
       if (!token) return null;
+      const sentToken = actionTokenRef.current;
+      console.log(`[performAction] ${action} sending token=${sentToken} dungeonId=${dungeonId}`);
       try {
         const result = await proxy<DungeonActionResponse>(
           "/api/game/dungeon/action",
@@ -388,7 +390,7 @@ export function useGigaverse() {
           "POST",
           {
             action,
-            actionToken: actionTokenRef.current,
+            actionToken: sentToken,
             dungeonId,
             data: {
               consumables: [],
@@ -403,14 +405,17 @@ export function useGigaverse() {
         if (result) {
           setDungeonState(result);
           if (result.actionToken) {
+            console.log(`[performAction] ${action} OK, new token=${result.actionToken} (was ${sentToken})`);
             setActionToken(result.actionToken);
             actionTokenRef.current = result.actionToken;
+          } else {
+            console.warn(`[performAction] ${action} OK but NO actionToken in response!`);
           }
         }
         return result;
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Action failed";
-        console.warn(`[performAction] ${action} failed:`, msg);
+        console.warn(`[performAction] ${action} FAILED: ${msg} (sent token=${sentToken}, ref now=${actionTokenRef.current})`);
         setError(msg);
         return null;
       }
@@ -458,8 +463,11 @@ export function useGigaverse() {
         );
         setDungeonState(result);
         if (result.actionToken) {
+          console.log(`[startRun] got token=${result.actionToken}, setting ref`);
           setActionToken(result.actionToken);
           actionTokenRef.current = result.actionToken;
+        } else {
+          console.warn(`[startRun] NO actionToken in response! ref stays=${actionTokenRef.current}`);
         }
         return result;
       });
