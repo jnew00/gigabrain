@@ -399,6 +399,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
     cancelRef.current = false;
     setExecuting(true);
     setSummary(null);
+    gigaRef.current.autoBattleRef.current = true;
 
     const g = () => gigaRef.current;
 
@@ -552,8 +553,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
         }
       }
 
-      // Refresh before energy-consuming steps
-      await g().refreshAll();
+      // Refresh before energy-consuming steps (skip dungeon state to avoid token rotation)
+      await g().refreshAll({ skipDungeonState: true });
 
       // 6. Dungeon runs
       for (const alloc of dungeonAllocs) {
@@ -578,7 +579,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               continue;
             }
 
-            // Battle loop
+            // Battle loop — track state locally from performAction responses
+            // NEVER fetch /api/game/dungeon/state during the loop (rotates actionToken)
+            let battleState = startResult;
             let complete = false;
             let iterations = 0;
             const MAX_ITERATIONS = 100;
@@ -587,12 +590,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               if (cancelRef.current) break;
               iterations++;
 
-              const currentState = g().dungeonState;
-              if (!currentState) break;
+              if (!battleState) break;
 
-              if (currentState.message === "Run Complete") {
+              if (battleState.message === "Run Complete") {
                 complete = true;
-                const entity = currentState.data?.entity;
+                const entity = battleState.data?.entity;
                 const won = (entity?.ROOM_NUM_CID ?? 0) >= 16;
                 if (won) wins++;
                 else losses++;
@@ -600,21 +602,24 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                 break;
               }
 
-              const action = pickBestAction(currentState, g().enemyMoveRecords, g().enemyNames);
+              const action = pickBestAction(battleState, g().enemyMoveRecords, g().enemyNames);
               if (!action) {
                 addLog(`[MC] no action available`);
                 break;
               }
 
-              const reason = explainAction(currentState, action, g().enemyMoveRecords, g().enemyNames);
+              const reason = explainAction(battleState, action, g().enemyMoveRecords, g().enemyNames);
               addLog(`[MC] ${reason}`);
 
-              // Track enemy move
               const result = await g().performAction(action, alloc.dungeonId);
               if (!result) {
-                addLog(`[MC] action failed`);
-                break;
+                addLog(`[MC] action failed, retrying...`);
+                await delay(1000);
+                continue;
               }
+
+              // Update local state from response
+              battleState = result;
 
               // Record enemy move if in combat
               const enemy = result.data?.run?.players?.[1];
@@ -646,7 +651,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
           summaryStats.dungeonRuns++;
           if (run < alloc.runs - 1) {
-            await g().refreshAll();
+            // Skip dungeon state fetch between runs to avoid token rotation
+            await g().refreshAll({ skipDungeonState: true });
             await delay(300);
           }
         }
@@ -833,6 +839,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
       setSteps((prev) => prev.map((s) => (s.status === "pending" ? { ...s, status: "skipped" as const } : s)));
       setSummary("Execution cancelled.");
     } finally {
+      gigaRef.current.autoBattleRef.current = false;
       setExecuting(false);
       await gigaRef.current.refreshAll();
     }
