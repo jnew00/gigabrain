@@ -78,6 +78,7 @@ export async function POST(req: NextRequest) {
     const res = await fetch(`${BASE_URL}${endpoint}`, fetchOpts);
     const text = await res.text();
 
+
     // Try to parse as JSON, fall back to generic error
     let data;
     try {

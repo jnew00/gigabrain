@@ -167,6 +167,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
   const [executing, setExecuting] = useState(false);
   const [steps, setSteps] = useState<ExecutionStep[]>([]);
   const [summary, setSummary] = useState<string | null>(null);
+  const [mcLog, setMcLog] = useState<string[]>([]);
+  const [showLog, setShowLog] = useState(false);
+  const mcLogRef = useRef<HTMLDivElement>(null);
 
   // Presets
   const [presets, setPresets] = useState<Preset[]>([]);
@@ -413,9 +416,17 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
     cancelRef.current = false;
     setExecuting(true);
     setSummary(null);
+    setMcLog([]);
+    setShowLog(true);
     gigaRef.current.autoBattleRef.current = true;
 
     const g = () => gigaRef.current;
+
+    // Log to both parent log and local MC log panel
+    const log = (msg: string) => {
+      addLog(msg);
+      setMcLog((prev) => [...prev, `${new Date().toLocaleTimeString("en", { hour12: false })} ${msg}`]);
+    };
 
     // Build step list
     const stepList: ExecutionStep[] = [];
@@ -465,7 +476,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             if (cancelRef.current) break;
             try {
               const r = await g().claimRom(rom.docId, t);
-              if (r?.success) { count++; addLog(`claimed ${t} #${fStats.serialNumber}`); }
+              if (r?.success) { count++; log(`claimed ${t} #${fStats.serialNumber}`); }
             } catch { /* skip */ }
             await delay(200);
           }
@@ -484,7 +495,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           if (amt <= 0) continue;
           try {
             const r = await g().claimRom(rom.docId, "energy");
-            if (r?.success) { count++; addLog(`claimed energy #${rom.factoryStats.serialNumber}`); }
+            if (r?.success) { count++; log(`claimed energy #${rom.factoryStats.serialNumber}`); }
           } catch { /* skip */ }
           await delay(200);
         }
@@ -502,7 +513,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           if (amt <= 0) continue;
           try {
             const r = await g().convertEnergyToDust(rom.docId, amt);
-            if (r?.success) { total += amt; addLog(`converted ${amt}E #${rom.factoryStats.serialNumber}`); }
+            if (r?.success) { total += amt; log(`converted ${amt}E #${rom.factoryStats.serialNumber}`); }
           } catch { /* skip */ }
           await delay(200);
         }
@@ -518,7 +529,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           try {
             const r = await g().useRecipe(RECIPE_ITEMS.chest);
             results.push(r?.success !== false ? "Chest opened" : `Chest: ${(r as { message?: string })?.message || "failed"}`);
-            addLog(results[results.length - 1]);
+            log(results[results.length - 1]);
           } catch (e) { results.push(`Chest: ${e instanceof Error ? e.message : "error"}`); }
           await delay(200);
         }
@@ -526,7 +537,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           try {
             const r = await g().useRecipe(RECIPE_ITEMS.juiceChest);
             results.push(r?.success !== false ? "Juice Chest opened" : `Juice Chest: ${(r as { message?: string })?.message || "failed"}`);
-            addLog(results[results.length - 1]);
+            log(results[results.length - 1]);
           } catch (e) { results.push(`Juice Chest: ${e instanceof Error ? e.message : "error"}`); }
         }
         updateStep("open-chests", { status: "done", detail: results.join(", ") });
@@ -541,7 +552,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           try {
             const r = await g().useRecipe(RECIPE_ITEMS.bluePot, paperHandsId);
             results.push(r?.success !== false ? "Blue Pot broken" : `Blue Pot: ${(r as { message?: string })?.message || "failed"}`);
-            addLog(results[results.length - 1]);
+            log(results[results.length - 1]);
           } catch (e) { results.push(`Blue Pot: ${e instanceof Error ? e.message : "error"}`); }
           await delay(200);
         }
@@ -549,7 +560,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           try {
             const r = await g().useRecipe(RECIPE_ITEMS.tanPot, rockHandsId);
             results.push(r?.success !== false ? "Tan Pot broken" : `Tan Pot: ${(r as { message?: string })?.message || "failed"}`);
-            addLog(results[results.length - 1]);
+            log(results[results.length - 1]);
           } catch (e) { results.push(`Tan Pot: ${e instanceof Error ? e.message : "error"}`); }
         }
         updateStep("break-pots", { status: results.length > 0 ? "done" : "skipped", detail: results.join(", ") || "No pots available" });
@@ -574,24 +585,37 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
       // Free actions above (ROM claims, recipes) rotated the server token.
       const preState = await g().fetchDungeonState();
 
-      // If there's a stuck/active run, finish it first
-      if (preState?.data?.run && preState.message !== "Run Complete") {
-        addLog(`[MC] found active run, finishing it first...`);
-        let stuckState = preState;
-        let stuckIter = 0;
-        while (stuckState?.data?.run && stuckState.message !== "Run Complete" && stuckIter < 100) {
+      // If there's a stuck/active run, play through it (combat + loot)
+      if (preState?.data?.run) {
+        log(`[MC] found active run (${preState.message}, loot=${preState.data.run.lootPhase}), finishing it...`);
+        let s = preState;
+        for (let i = 0; i < 150 && s?.data?.run; i++) {
           if (cancelRef.current) break;
-          stuckIter++;
-          const action = pickBestAction(stuckState, g().enemyMoveRecords, g().enemyNames);
-          if (!action) { await delay(500); break; }
+          // Run fully complete and no loot pending — done
+          if (s.message === "Run Complete" && !s.data.run.lootPhase) break;
+
+          let action = pickBestAction(s, g().enemyMoveRecords, g().enemyNames);
+          // If in loot phase but pickBestAction can't see options, default to loot_one
+          if (!action && s.data.run.lootPhase) {
+            log(`[MC] loot phase with no visible options, picking loot_one`);
+            action = "loot_one";
+          }
+          if (!action) {
+            log(`[MC] no action available for stuck run, cannot advance`);
+            break;
+          }
+
           const result = await g().performAction(action);
-          if (!result) break;
-          stuckState = result;
+          if (!result) {
+            log(`[MC] action failed during stuck run clearing`);
+            break;
+          }
+          s = result;
           await delay(150);
         }
-        addLog(`[MC] active run cleared`);
-        // Refresh token after clearing
+        log(`[MC] active run finished (${s?.message})`);
         await g().fetchDungeonState();
+        await delay(500);
       }
 
       // 6. Dungeon runs
@@ -601,40 +625,53 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
         if (cancelRef.current) { updateStep(stepId, { status: "skipped" }); continue; }
         updateStep(stepId, { status: "running", detail: "starting..." });
 
-        let wins = 0;
-        let losses = 0;
+        const runResults: string[] = [];
+        const lootTotals = new Map<number, number>();
 
         for (let run = 0; run < alloc.runs; run++) {
           if (cancelRef.current) break;
           updateStep(stepId, { detail: `run ${run + 1}/${alloc.runs}...` });
-          addLog(`[MC] starting ${alloc.name} run ${run + 1}/${alloc.runs}`);
+          log(`[MC] starting ${alloc.name} run ${run + 1}/${alloc.runs}`);
 
           try {
-            let startResult = await g().startRun(alloc.dungeonId);
+            const juiced = g().energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false;
+            log(`[MC] isJuiced=${juiced}`);
+            let startResult = await g().startRun(alloc.dungeonId, juiced);
 
             // If start fails (possibly stuck run), try to clear it and retry
             if (!startResult || startResult.success === false) {
-              addLog(`[MC] start failed, checking for stuck run...`);
+              const errMsg = startResult?.message || g().lastErrorRef.current || "null response";
+              log(`[MC] start failed (${errMsg}), checking for stuck run...`);
               const stuckState = await g().fetchDungeonState();
-              if (stuckState?.data?.run && stuckState.message !== "Run Complete") {
-                addLog(`[MC] clearing stuck run...`);
+              log(`[MC] dungeon state: run=${!!stuckState?.data?.run}, msg=${stuckState?.message}`);
+
+              if (stuckState?.data?.run) {
+                log(`[MC] finishing stuck run (loot=${stuckState.data.run.lootPhase})...`);
                 let s = stuckState;
-                for (let i = 0; i < 100 && s?.data?.run && s.message !== "Run Complete"; i++) {
+                for (let i = 0; i < 150 && s?.data?.run; i++) {
                   if (cancelRef.current) break;
-                  const act = pickBestAction(s, g().enemyMoveRecords, g().enemyNames);
-                  if (!act) break;
+                  if (s.message === "Run Complete" && !s.data.run.lootPhase) break;
+                  let act = pickBestAction(s, g().enemyMoveRecords, g().enemyNames);
+                  if (!act && s.data.run.lootPhase) {
+                    log(`[MC] loot phase, no visible options — picking loot_one`);
+                    act = "loot_one";
+                  }
+                  if (!act) { log(`[MC] no action for stuck run`); break; }
                   const r = await g().performAction(act);
                   if (!r) break;
                   s = r;
                   await delay(150);
                 }
-                addLog(`[MC] stuck run cleared, retrying start...`);
+                log(`[MC] stuck run finished (${s?.message})`);
+                await g().fetchDungeonState();
+                await delay(500);
               }
+
               // Retry start after clearing
-              startResult = await g().startRun(alloc.dungeonId);
+              startResult = await g().startRun(alloc.dungeonId, juiced);
               if (!startResult || startResult.success === false) {
-                addLog(`[MC] still can't start: ${startResult?.message || g().error || "unknown"} — skipping dungeon`);
-                losses += alloc.runs - run;
+                log(`[MC] still can't start: ${startResult?.message || g().lastErrorRef.current || "unknown"} — skipping dungeon`);
+                runResults.push(...Array(alloc.runs - run).fill("err"));
                 break; // skip remaining runs for this dungeon
               }
             }
@@ -645,6 +682,19 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             let iterations = 0;
             const MAX_ITERATIONS = 100;
 
+            // Track loot from this run
+            const trackLoot = (resp: typeof battleState) => {
+              if (resp?.gameItemBalanceChanges) {
+                for (const c of resp.gameItemBalanceChanges) {
+                  lootTotals.set(c.id, (lootTotals.get(c.id) ?? 0) + c.amount);
+                }
+              }
+            };
+            trackLoot(battleState);
+
+            let consecutiveFailures = 0;
+            const MAX_CONSECUTIVE_FAILURES = 3;
+
             while (!complete && iterations < MAX_ITERATIONS) {
               if (cancelRef.current) break;
               iterations++;
@@ -654,31 +704,50 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               if (battleState.message === "Run Complete") {
                 complete = true;
                 const entity = battleState.data?.entity;
-                const won = (entity?.ROOM_NUM_CID ?? 0) >= 16;
-                if (won) wins++;
-                else losses++;
-                addLog(`[MC] ${alloc.name} run ${run + 1}: ${won ? "WIN" : "LOSS"} (room ${entity?.ROOM_NUM_CID ?? "?"})`);
+                const room = entity?.ROOM_NUM_CID ?? 0;
+                runResults.push(String(room));
+                log(`[MC] ${alloc.name} run ${run + 1}: room ${room}`);
                 break;
               }
 
               const action = pickBestAction(battleState, g().enemyMoveRecords, g().enemyNames);
               if (!action) {
-                addLog(`[MC] no action available`);
+                log(`[MC] no action available`);
                 break;
               }
 
               const reason = explainAction(battleState, action, g().enemyMoveRecords, g().enemyNames);
-              addLog(`[MC] ${reason}`);
+              log(`[MC] ${reason}`);
 
               const result = await g().performAction(action);
               if (!result) {
-                addLog(`[MC] action failed, retrying...`);
-                await delay(1000);
+                // Action failed — check if the run is actually over (player died, etc.)
+                const fresh = await g().fetchDungeonState();
+                if (!fresh?.data?.run || fresh.message === "Run Complete") {
+                  // Run ended — record result
+                  const room = fresh?.data?.entity?.ROOM_NUM_CID ?? 0;
+                  runResults.push(String(room));
+                  log(`[MC] ${alloc.name} run ${run + 1}: room ${room} (run ended)`);
+                  trackLoot(fresh!);
+                  complete = true;
+                  break;
+                }
+                // Run still active — retry with fresh state
+                consecutiveFailures++;
+                if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                  log(`[MC] ${MAX_CONSECUTIVE_FAILURES} consecutive failures, giving up`);
+                  break;
+                }
+                log(`[MC] action failed but run still active, retrying (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})...`);
+                battleState = fresh;
+                await delay(500);
                 continue;
               }
+              consecutiveFailures = 0;
 
               // Update local state from response
               battleState = result;
+              trackLoot(result);
 
               // Record enemy move if in combat
               const enemy = result.data?.run?.players?.[1];
@@ -695,17 +764,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               if (result.message === "Run Complete") {
                 complete = true;
                 const ent = result.data?.entity;
-                const won = (ent?.ROOM_NUM_CID ?? 0) >= 16;
-                if (won) wins++;
-                else losses++;
-                addLog(`[MC] ${alloc.name} run ${run + 1}: ${won ? "WIN" : "LOSS"} (room ${ent?.ROOM_NUM_CID ?? "?"})`);
+                const room = ent?.ROOM_NUM_CID ?? 0;
+                runResults.push(String(room));
+                log(`[MC] ${alloc.name} run ${run + 1}: room ${room}`);
               }
 
               await delay(150);
             }
           } catch (e) {
-            addLog(`[MC] error: ${e instanceof Error ? e.message : "unknown"}`);
-            losses++;
+            log(`[MC] error: ${e instanceof Error ? e.message : "unknown"}`);
+            runResults.push("err");
           }
 
           summaryStats.dungeonRuns++;
@@ -716,10 +784,21 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           }
         }
 
-        summaryStats.dungeonWins += wins;
+        // Build detail string: rooms reached + loot summary
+        const roomsStr = `rooms: ${runResults.join(", ")}`;
+        const lootParts: string[] = [];
+        for (const [id, amt] of lootTotals) {
+          const name = g().itemInfo[String(id)]?.name || g().itemNames[String(id)] || `#${id}`;
+          lootParts.push(`${amt}x ${name}`);
+        }
+        const detail = lootParts.length > 0
+          ? `${roomsStr} | ${lootParts.join(", ")}`
+          : roomsStr;
+
+        summaryStats.dungeonWins += runResults.filter((r) => Number(r) >= 16).length;
         updateStep(stepId, {
           status: cancelRef.current ? "skipped" : "done",
-          detail: `${wins}W / ${losses}L`,
+          detail,
         });
         // Fetch fresh state + token for next dungeon alloc or fishing
         await g().fetchDungeonState();
@@ -737,14 +816,14 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           for (let cast = 0; cast < fishingAlloc.casts; cast++) {
             if (cancelRef.current) break;
             updateStep(stepId, { detail: `cast ${cast + 1}/${fishingAlloc.casts}...` });
-            addLog(`[MC] fishing cast ${cast + 1}/${fishingAlloc.casts} (${fishingAlloc.castLabel})`);
+            log(`[MC] fishing cast ${cast + 1}/${fishingAlloc.casts} (${fishingAlloc.castLabel})`);
 
             try {
               // Start cast — don't fetchFishingState here as it overwrites the
               // shared actionToken with a stale fishing-specific value
               const startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId });
               if (!startResult) {
-                addLog(`[MC] fishing cast failed to start`);
+                log(`[MC] fishing cast failed to start`);
                 escaped++;
                 continue;
               }
@@ -773,10 +852,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                     const fish = gameData?.caughtFish;
                     const seaweed = fish?.seaweedEarned ?? 0;
                     summaryStats.seaweedEarned += seaweed;
-                    addLog(`[MC] caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
+                    log(`[MC] caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
                   } else {
                     escaped++;
-                    addLog(`[MC] fish escaped`);
+                    log(`[MC] fish escaped`);
                   }
                   break;
                 }
@@ -796,7 +875,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
                 const cardResult = await g().fishingAction("play_cards", { cards: [best.handIndex], nodeId: "" });
                 if (!cardResult) {
-                  addLog(`[MC] card play failed`);
+                  log(`[MC] card play failed`);
                   break;
                 }
 
@@ -809,17 +888,17 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                     const fish = doc.data?.caughtFish;
                     const seaweed = fish?.seaweedEarned ?? 0;
                     summaryStats.seaweedEarned += seaweed;
-                    addLog(`[MC] caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
+                    log(`[MC] caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
                   } else {
                     escaped++;
-                    addLog(`[MC] fish escaped`);
+                    log(`[MC] fish escaped`);
                   }
                 }
 
                 await delay(300);
               }
             } catch (e) {
-              addLog(`[MC] fishing error: ${e instanceof Error ? e.message : "unknown"}`);
+              log(`[MC] fishing error: ${e instanceof Error ? e.message : "unknown"}`);
               escaped++;
             }
 
@@ -869,7 +948,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                   totalSold++;
                   totalEarned += r.data?.value ?? f.value;
                 } else {
-                  addLog(`[MC] sell failed: ${r?.message || "error"}`);
+                  log(`[MC] sell failed: ${r?.message || "error"}`);
                   break;
                 }
               } catch { break; }
@@ -878,7 +957,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           }
           summaryStats.seaweedEarned += totalEarned;
           updateStep("sell-fish", { status: "done", detail: `${totalSold} sold, ${totalEarned} seaweed` });
-          addLog(`[MC] sold ${totalSold} fish for ${totalEarned} seaweed`);
+          log(`[MC] sold ${totalSold} fish for ${totalEarned} seaweed`);
         }
       }
 
@@ -891,7 +970,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
     } catch (e) {
       if ((e as Error).message !== "cancelled") {
-        addLog(`[MC] execution error: ${e instanceof Error ? e.message : "unknown"}`);
+        log(`[MC] execution error: ${e instanceof Error ? e.message : "unknown"}`);
       }
       // Mark remaining steps as skipped
       setSteps((prev) => prev.map((s) => (s.status === "pending" ? { ...s, status: "skipped" as const } : s)));
@@ -1186,6 +1265,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             onClick={execute}
             disabled={
               executing ||
+              allocatedEnergy > currentEnergy ||
               (allocatedEnergy === 0 &&
                 !freeActions.claimRomResources &&
                 freeActions.romEnergyMode === "skip" &&
@@ -1257,6 +1337,38 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* Activity Log */}
+        {mcLog.length > 0 && (
+          <div className="mt-3">
+            <button
+              onClick={() => setShowLog((v) => !v)}
+              className="text-[11px] font-bold uppercase tracking-[0.1em] mb-2 cursor-pointer"
+              style={{ color: "var(--text-faint)", background: "none", border: "none", padding: 0 }}
+            >
+              {showLog ? "Hide" : "Show"} Log ({mcLog.length})
+            </button>
+            {showLog && (
+              <div
+                ref={mcLogRef}
+                className="rounded-lg overflow-y-auto"
+                style={{
+                  maxHeight: 200,
+                  background: "var(--bg-inset)",
+                  border: "1px solid var(--border)",
+                  padding: "8px 12px",
+                  fontSize: 11,
+                  fontFamily: "monospace",
+                  lineHeight: 1.6,
+                }}
+              >
+                {mcLog.map((entry, i) => (
+                  <div key={i} style={{ color: "var(--text-faint)" }}>{entry}</div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

@@ -384,9 +384,13 @@ export function useGigaverse() {
   // React state on re-render as it can overwrite with a stale value.
   const actionTokenRef = useRef(actionToken);
 
+  // Synchronous error ref — readable immediately after startRun/performAction returns null
+  const lastErrorRef = useRef<string | null>(null);
+
   const performAction = useCallback(
     async (action: DungeonAction, dungeonId: number = 0) => {
       if (!token) return null;
+      const juiced = energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false;
       try {
         const result = await proxy<DungeonActionResponse>(
           "/api/game/dungeon/action",
@@ -401,7 +405,7 @@ export function useGigaverse() {
               itemId: 0,
               expectedAmount: 0,
               index: 0,
-              isJuiced: false,
+              isJuiced: juiced,
               gearInstanceIds: [],
             },
           }
@@ -427,7 +431,7 @@ export function useGigaverse() {
         return null;
       }
     },
-    [token]
+    [token, energy]
   );
 
   /** Fetch fresh dungeon state directly (bypasses async React state) */
@@ -480,6 +484,7 @@ export function useGigaverse() {
         return result;
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Start run failed";
+        lastErrorRef.current = msg;
         // Recover token from error response — server rotates even on failure
         const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
         if (respData?.actionToken) {
@@ -667,6 +672,7 @@ export function useGigaverse() {
     recordEnemyMove,
     refreshAll,
     autoBattleRef,
+    lastErrorRef,
     performAction,
     fetchDungeonState,
     startRun,
