@@ -455,9 +455,11 @@ export function useGigaverse() {
   }, [token]);
 
   const startRun = useCallback(
-    (dungeonId: number = 0, isJuiced = false, gearInstanceIds: string[] = []) => {
+    async (dungeonId: number = 0, isJuiced = false, gearInstanceIds: string[] = []) => {
       if (!token) return null;
-      return withLoading(async () => {
+      setLoading(true);
+      setError(null);
+      try {
         const result = await proxy<DungeonActionResponse>(
           "/api/game/dungeon/action",
           token,
@@ -478,17 +480,27 @@ export function useGigaverse() {
         );
         setDungeonState(result);
         if (result.actionToken) {
-          console.log(`[startRun] got token=${result.actionToken}, setting ref`);
           setActionToken(result.actionToken);
           actionTokenRef.current = result.actionToken;
           fishingActionTokenRef.current = result.actionToken;
-        } else {
-          console.warn(`[startRun] NO actionToken in response! ref stays=${actionTokenRef.current}`);
         }
         return result;
-      });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Start run failed";
+        // Recover token from error response — server rotates even on failure
+        const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
+        if (respData?.actionToken) {
+          console.warn(`[startRun] FAILED but got new token=${respData.actionToken}`);
+          actionTokenRef.current = respData.actionToken;
+          fishingActionTokenRef.current = respData.actionToken;
+        }
+        setError(msg);
+        return null;
+      } finally {
+        setLoading(false);
+      }
     },
-    [token, withLoading]
+    [token]
   );
 
   const claimRom = useCallback(
