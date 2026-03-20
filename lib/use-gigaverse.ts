@@ -81,7 +81,6 @@ async function proxy<T>(
   const data = await res.json();
 
   if (!res.ok) {
-    console.error(`[proxy] ${method} ${endpoint} → ${res.status}:`, data?.message || data?.error, body ? JSON.stringify(body).substring(0, 200) : "");
     const err = new Error(data?.message || data?.error || `API error ${res.status}`);
     // Attach response data so callers can extract actionToken from error responses
     (err as Error & { responseData?: unknown }).responseData = data;
@@ -388,8 +387,6 @@ export function useGigaverse() {
   const performAction = useCallback(
     async (action: DungeonAction, dungeonId: number = 0) => {
       if (!token) return null;
-      const sentToken = actionTokenRef.current;
-      console.log(`[performAction] ${action} sending token=${sentToken} dungeonId=${dungeonId}`);
       try {
         const result = await proxy<DungeonActionResponse>(
           "/api/game/dungeon/action",
@@ -397,7 +394,7 @@ export function useGigaverse() {
           "POST",
           {
             action,
-            actionToken: sentToken,
+            actionToken: actionTokenRef.current,
             dungeonId,
             data: {
               consumables: [],
@@ -412,13 +409,9 @@ export function useGigaverse() {
         if (result) {
           setDungeonState(result);
           if (result.actionToken) {
-            console.log(`[performAction] ${action} OK, new token=${result.actionToken} (was ${sentToken})`);
             setActionToken(result.actionToken);
             actionTokenRef.current = result.actionToken;
-            // Sync fishing token — server uses one shared token
             fishingActionTokenRef.current = result.actionToken;
-          } else {
-            console.warn(`[performAction] ${action} OK but NO actionToken in response!`);
           }
         }
         return result;
@@ -427,11 +420,8 @@ export function useGigaverse() {
         // Recover actionToken from error response — server rotates even on failure
         const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
         if (respData?.actionToken) {
-          console.warn(`[performAction] ${action} FAILED but got new token=${respData.actionToken}`);
           actionTokenRef.current = respData.actionToken;
           fishingActionTokenRef.current = respData.actionToken;
-        } else {
-          console.warn(`[performAction] ${action} FAILED: ${msg} (token=${sentToken}, no new token in error)`);
         }
         setError(msg);
         return null;
@@ -492,14 +482,10 @@ export function useGigaverse() {
         const msg = e instanceof Error ? e.message : "Start run failed";
         // Recover token from error response — server rotates even on failure
         const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
-        console.warn(`[startRun] FAILED: ${msg}`, "responseData:", JSON.stringify(respData));
         if (respData?.actionToken) {
-          console.warn(`[startRun] recovered token=${respData.actionToken} from error response`);
           actionTokenRef.current = respData.actionToken;
           fishingActionTokenRef.current = respData.actionToken;
         } else {
-          // No token in error response — re-fetch to get current token
-          console.warn(`[startRun] no token in error, fetching fresh state`);
           try {
             const fresh = await proxy<DungeonActionResponse>("/api/game/dungeon/state", token);
             if (fresh?.actionToken) {

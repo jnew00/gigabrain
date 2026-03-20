@@ -559,7 +559,6 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
       // Fetch fresh dungeon state + actionToken before dungeon runs.
       // Free actions above (ROM claims, recipes) rotated the server token.
       const preState = await g().fetchDungeonState();
-      addLog(`[MC] pre-state: run=${!!preState?.data?.run} msg="${preState?.message || "none"}"`);
 
       // If there's a stuck/active run, finish it first
       if (preState?.data?.run && preState.message !== "Run Complete") {
@@ -597,15 +596,36 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           addLog(`[MC] starting ${alloc.name} run ${run + 1}/${alloc.runs}`);
 
           try {
-            const startResult = await g().startRun(alloc.dungeonId);
+            let startResult = await g().startRun(alloc.dungeonId);
+
+            // If start fails (possibly stuck run), try to clear it and retry
             if (!startResult || startResult.success === false) {
-              addLog(`[MC] failed to start: ${startResult?.message || g().error || "unknown"}`);
-              losses++;
-              continue;
+              addLog(`[MC] start failed, checking for stuck run...`);
+              const stuckState = await g().fetchDungeonState();
+              if (stuckState?.data?.run && stuckState.message !== "Run Complete") {
+                addLog(`[MC] clearing stuck run...`);
+                let s = stuckState;
+                for (let i = 0; i < 100 && s?.data?.run && s.message !== "Run Complete"; i++) {
+                  if (cancelRef.current) break;
+                  const act = pickBestAction(s, g().enemyMoveRecords, g().enemyNames);
+                  if (!act) break;
+                  const r = await g().performAction(act);
+                  if (!r) break;
+                  s = r;
+                  await delay(150);
+                }
+                addLog(`[MC] stuck run cleared, retrying start...`);
+              }
+              // Retry start after clearing
+              startResult = await g().startRun(alloc.dungeonId);
+              if (!startResult || startResult.success === false) {
+                addLog(`[MC] still can't start: ${startResult?.message || g().error || "unknown"} — skipping dungeon`);
+                losses += alloc.runs - run;
+                break; // skip remaining runs for this dungeon
+              }
             }
 
             // Battle loop — track state locally from performAction responses
-            // NEVER fetch /api/game/dungeon/state during the loop (rotates actionToken)
             let battleState = startResult;
             let complete = false;
             let iterations = 0;
