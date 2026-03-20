@@ -207,23 +207,37 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
     const last = loadLastAlloc();
 
     // Filter out item-cost dungeons (like Temporal Void) that don't use energy
+    const currentEnergy = Math.floor(eng?.energy ?? 0);
+    let energyBudget = currentEnergy;
+
     const allocs = dungeons.filter((d) => d.ENERGY_CID > 0).map((d) => {
       const progressEntry = dayProgress.find((p) => p.ID_CID === `Dungeon#${d.ID_CID}`);
       const runsToday = progressEntry?.UINT256_CID ?? 0;
       const maxRuns = (d.juicedMaxRunsPerDay || 10) - runsToday;
       const saved = last?.dungeonAllocs?.find((a) => a.dungeonId === d.ID_CID);
+      // Clamp saved runs by both max runs remaining AND available energy
+      let runs = saved ? Math.min(saved.runs, maxRuns) : 0;
+      if (d.ENERGY_CID > 0) {
+        const maxByEnergy = Math.floor(energyBudget / d.ENERGY_CID);
+        runs = Math.min(runs, maxByEnergy);
+        energyBudget -= runs * d.ENERGY_CID;
+      }
       return {
         dungeonId: d.ID_CID,
         name: d.NAME_CID,
         energyCost: d.ENERGY_CID,
-        runs: saved ? Math.min(saved.runs, maxRuns) : 0,
+        runs,
         maxRuns: Math.max(0, maxRuns),
       };
     });
     setDungeonAllocs(allocs);
 
     if (last?.fishingAlloc) {
-      setFishingAlloc(last.fishingAlloc);
+      // Clamp saved fishing casts by remaining energy
+      const maxCasts = last.fishingAlloc.castCost > 0
+        ? Math.floor(energyBudget / last.fishingAlloc.castCost)
+        : 0;
+      setFishingAlloc({ ...last.fishingAlloc, casts: Math.min(last.fishingAlloc.casts, maxCasts) });
     } else {
       // Auto-determine best cast type
       const fs = giga.fishingState;
