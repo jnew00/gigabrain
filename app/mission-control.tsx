@@ -675,9 +675,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
           summaryStats.dungeonRuns++;
           if (run < alloc.runs - 1) {
-            // Skip dungeon state fetch between runs to avoid token rotation
-            await g().refreshAll();
-            await delay(300);
+            // Fetch fresh dungeon state to confirm run finalized + get current token
+            await g().fetchDungeonState();
+            await delay(500);
           }
         }
 
@@ -686,7 +686,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           status: cancelRef.current ? "skipped" : "done",
           detail: `${wins}W / ${losses}L`,
         });
-        await g().refreshAll();
+        // Fetch fresh state + token for next dungeon alloc or fishing
+        await g().fetchDungeonState();
       }
 
       // 7. Fishing casts
@@ -704,10 +705,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             addLog(`[MC] fishing cast ${cast + 1}/${fishingAlloc.casts} (${fishingAlloc.castLabel})`);
 
             try {
-              // Fetch fresh state
-              await g().fetchFishingState();
-
-              // Start cast
+              // Start cast — don't fetchFishingState here as it overwrites the
+              // shared actionToken with a stale fishing-specific value
               const startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId });
               if (!startResult) {
                 addLog(`[MC] fishing cast failed to start`);
