@@ -968,15 +968,10 @@ export default function Home() {
             addLog(`  ${p.health.current}hp vs ${e.health.current}hp`);
           }
         } else {
-          addLog(`auto: action failed (${g.error || "unknown"}), resyncing...`);
-          const freshState = await g.fetchDungeonState();
-          if (freshState) {
-            currentState = freshState;
-          } else {
-            await g.refreshAll();
-            await delay(500);
-            currentState = null; // will fall back to gigaRef on next iteration
-          }
+          addLog(`auto: action failed (${g.error || "unknown"}), retrying...`);
+          // Do NOT fetch dungeon state here — it rotates the actionToken on the
+          // server, making the current token stale. Just retry with current state.
+          await delay(1000);
         }
 
         await delay(150);

@@ -69,9 +69,6 @@ async function proxy<T>(
   method: "GET" | "POST" = "GET",
   body?: unknown
 ): Promise<T> {
-  if (endpoint === "/api/game/dungeon/state") {
-    console.trace("[PROXY] fetching /api/game/dungeon/state — this rotates the actionToken!");
-  }
   const res = await fetch("/api/proxy", {
     method: "POST",
     headers: {
