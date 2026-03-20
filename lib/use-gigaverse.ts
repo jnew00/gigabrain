@@ -81,6 +81,7 @@ async function proxy<T>(
   const data = await res.json();
 
   if (!res.ok) {
+    console.error(`[proxy] ${method} ${endpoint} → ${res.status}:`, data?.message || data?.error, body ? JSON.stringify(body).substring(0, 200) : "");
     throw new Error(data?.message || data?.error || `API error ${res.status}`);
   }
 
