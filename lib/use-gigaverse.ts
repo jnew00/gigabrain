@@ -409,6 +409,8 @@ export function useGigaverse() {
             console.log(`[performAction] ${action} OK, new token=${result.actionToken} (was ${sentToken})`);
             setActionToken(result.actionToken);
             actionTokenRef.current = result.actionToken;
+            // Sync fishing token — server uses one shared token
+            fishingActionTokenRef.current = result.actionToken;
           } else {
             console.warn(`[performAction] ${action} OK but NO actionToken in response!`);
           }
@@ -433,6 +435,7 @@ export function useGigaverse() {
       if (ds.actionToken) {
         setActionToken(ds.actionToken);
         actionTokenRef.current = ds.actionToken;
+        fishingActionTokenRef.current = ds.actionToken;
       }
       return ds;
     } catch {
@@ -450,7 +453,7 @@ export function useGigaverse() {
           "POST",
           {
             action: "start_run",
-            actionToken: Date.now(),
+            actionToken: actionTokenRef.current,
             dungeonId,
             data: {
               consumables: [],
@@ -467,6 +470,7 @@ export function useGigaverse() {
           console.log(`[startRun] got token=${result.actionToken}, setting ref`);
           setActionToken(result.actionToken);
           actionTokenRef.current = result.actionToken;
+          fishingActionTokenRef.current = result.actionToken;
         } else {
           console.warn(`[startRun] NO actionToken in response! ref stays=${actionTokenRef.current}`);
         }
@@ -540,6 +544,7 @@ export function useGigaverse() {
       if (state.actionToken) {
         setFishingActionToken(state.actionToken);
         fishingActionTokenRef.current = state.actionToken;
+        actionTokenRef.current = state.actionToken;
       }
       return state;
     } catch (e) {
@@ -574,6 +579,8 @@ export function useGigaverse() {
           if (result.actionToken) {
             setFishingActionToken(result.actionToken);
             fishingActionTokenRef.current = result.actionToken;
+            // Sync dungeon token — server uses one shared token
+            actionTokenRef.current = result.actionToken;
           }
         }
         return result;
