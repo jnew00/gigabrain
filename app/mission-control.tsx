@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { useGigaverse } from "@/lib/use-gigaverse";
-import { pickBestAction, explainAction } from "@/lib/auto-battle";
+import { pickBestAction } from "@/lib/auto-battle";
 import { pickBestCard } from "@/lib/fishing-ai";
 
 
@@ -589,7 +589,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
       // If there's a stuck/active run, play through it (combat + loot)
       if (preState?.data?.run) {
-        log(`[MC] found active run (${preState.message}, loot=${preState.data.run.lootPhase}), finishing it...`);
+        log(`Active dungeon run found (${preState.message}, loot=${preState.data.run.lootPhase}), finishing it...`);
         let s = preState;
         for (let i = 0; i < 150 && s?.data?.run; i++) {
           if (cancelRef.current) break;
@@ -599,23 +599,23 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           let action = pickBestAction(s, g().enemyMoveRecords, g().enemyNames);
           // If in loot phase but pickBestAction can't see options, default to loot_one
           if (!action && s.data.run.lootPhase) {
-            log(`[MC] loot phase with no visible options, picking loot_one`);
+            log(`Collecting loot...`);
             action = "loot_one";
           }
           if (!action) {
-            log(`[MC] no action available for stuck run, cannot advance`);
+            log(`Cannot advance stuck run`);
             break;
           }
 
           const result = await g().performAction(action);
           if (!result) {
-            log(`[MC] action failed during stuck run clearing`);
+            log(`Action failed during stuck run`);
             break;
           }
           s = result;
           await delay(150);
         }
-        log(`[MC] active run finished (${s?.message})`);
+        log(`Stuck run finished (${s?.message})`);
         await g().fetchDungeonState();
         await delay(500);
       }
@@ -632,104 +632,96 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
         for (let run = 0; run < alloc.runs; run++) {
           if (cancelRef.current) break;
-          updateStep(stepId, { detail: `run ${run + 1}/${alloc.runs}...` });
-          log(`[MC] starting ${alloc.name} run ${run + 1}/${alloc.runs}`);
+          updateStep(stepId, { detail: `Run ${run + 1}/${alloc.runs} starting...` });
+          log(`Starting ${alloc.name} run ${run + 1}/${alloc.runs}`);
 
           try {
-            const juiced = g().energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false;
-            log(`[MC] isJuiced=${juiced}`);
-            let startResult = await g().startRun(alloc.dungeonId, juiced);
+            let startResult = await g().startRun(alloc.dungeonId);
 
-            // If start fails, the error response contains the correct actionToken
-            // (server rotates it even on failure). The startRun catch block already
-            // recovers it. Just retry directly — do NOT call fetchDungeonState as it
-            // returns actionToken=0 which clobbers the recovered token.
             if (!startResult || startResult.success === false) {
-              const errMsg = startResult?.message || g().lastErrorRef.current || "null response";
-              log(`[MC] start failed (${errMsg}), retrying with recovered token...`);
               await delay(500);
-              startResult = await g().startRun(alloc.dungeonId, juiced);
+              startResult = await g().startRun(alloc.dungeonId);
               if (!startResult || startResult.success === false) {
-                log(`[MC] still can't start: ${startResult?.message || g().lastErrorRef.current || "unknown"} — skipping dungeon`);
+                log(`Could not start ${alloc.name}: ${g().lastErrorRef.current || "unknown"}`);
                 runResults.push(...Array(alloc.runs - run).fill("err"));
                 break;
               }
             }
 
-            // Battle loop — track state locally from performAction responses
             let battleState = startResult;
             let complete = false;
             let iterations = 0;
+            let lastRoom = 0;
             const MAX_ITERATIONS = 100;
 
-            // Track loot from this run
             const trackLoot = (resp: typeof battleState) => {
               if (resp?.gameItemBalanceChanges) {
                 for (const c of resp.gameItemBalanceChanges) {
                   lootTotals.set(c.id, (lootTotals.get(c.id) ?? 0) + c.amount);
+                  const name = g().itemInfo[String(c.id)]?.name || g().itemNames[String(c.id)] || `#${c.id}`;
+                  log(`Loot: ${c.amount}x ${name}`);
                 }
               }
             };
             trackLoot(battleState);
 
             let consecutiveFailures = 0;
-            const MAX_CONSECUTIVE_FAILURES = 3;
 
             while (!complete && iterations < MAX_ITERATIONS) {
               if (cancelRef.current) break;
               iterations++;
-
               if (!battleState) break;
+
+              // Track room progress
+              const curRoom = battleState.data?.entity?.ROOM_NUM_CID ?? lastRoom;
+              if (curRoom > lastRoom) {
+                lastRoom = curRoom;
+                updateStep(stepId, { detail: `Run ${run + 1}/${alloc.runs} — Room ${curRoom}` });
+              }
 
               if (battleState.message === "Run Complete") {
                 complete = true;
-                const entity = battleState.data?.entity;
-                const room = entity?.ROOM_NUM_CID ?? 0;
-                runResults.push(String(room));
-                log(`[MC] ${alloc.name} run ${run + 1}: room ${room}`);
+                runResults.push(String(curRoom));
+                log(`${alloc.name} run ${run + 1}: reached room ${curRoom}`);
                 break;
+              }
+
+              // Loot phase
+              if (battleState.data?.run?.lootPhase) {
+                const lootAction = pickBestAction(battleState, g().enemyMoveRecords, g().enemyNames);
+                if (lootAction) {
+                  const lootResult = await g().performAction(lootAction);
+                  if (lootResult) { battleState = lootResult; trackLoot(lootResult); }
+                  await delay(150);
+                  continue;
+                }
               }
 
               const action = pickBestAction(battleState, g().enemyMoveRecords, g().enemyNames);
-              if (!action) {
-                log(`[MC] no action available`);
-                break;
-              }
-
-              const reason = explainAction(battleState, action, g().enemyMoveRecords, g().enemyNames);
-              log(`[MC] ${reason}`);
+              if (!action) break;
 
               const result = await g().performAction(action);
               if (!result) {
-                // Action failed — check if the run is actually over (player died, etc.)
                 const fresh = await g().fetchDungeonState();
                 if (!fresh?.data?.run || fresh.message === "Run Complete") {
-                  // Run ended — record result
-                  const room = fresh?.data?.entity?.ROOM_NUM_CID ?? 0;
+                  const room = fresh?.data?.entity?.ROOM_NUM_CID ?? lastRoom;
                   runResults.push(String(room));
-                  log(`[MC] ${alloc.name} run ${run + 1}: room ${room} (run ended)`);
+                  log(`${alloc.name} run ${run + 1}: reached room ${room}`);
                   trackLoot(fresh!);
                   complete = true;
                   break;
                 }
-                // Run still active — retry with fresh state
                 consecutiveFailures++;
-                if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                  log(`[MC] ${MAX_CONSECUTIVE_FAILURES} consecutive failures, giving up`);
-                  break;
-                }
-                log(`[MC] action failed but run still active, retrying (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})...`);
+                if (consecutiveFailures >= 3) break;
                 battleState = fresh;
                 await delay(500);
                 continue;
               }
               consecutiveFailures = 0;
-
-              // Update local state from response
               battleState = result;
               trackLoot(result);
 
-              // Record enemy move if in combat
+              // Record enemy move
               const enemy = result.data?.run?.players?.[1];
               const entity = result.data?.entity;
               if (enemy?.lastMove && entity && entity.ENEMY_CID >= 0) {
@@ -743,22 +735,20 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
               if (result.message === "Run Complete") {
                 complete = true;
-                const ent = result.data?.entity;
-                const room = ent?.ROOM_NUM_CID ?? 0;
+                const room = result.data?.entity?.ROOM_NUM_CID ?? lastRoom;
                 runResults.push(String(room));
-                log(`[MC] ${alloc.name} run ${run + 1}: room ${room}`);
+                log(`${alloc.name} run ${run + 1}: reached room ${room}`);
               }
 
               await delay(150);
             }
           } catch (e) {
-            log(`[MC] error: ${e instanceof Error ? e.message : "unknown"}`);
+            log(`Error: ${e instanceof Error ? e.message : "unknown"}`);
             runResults.push("err");
           }
 
           summaryStats.dungeonRuns++;
           if (run < alloc.runs - 1) {
-            // Fetch fresh dungeon state to confirm run finalized + get current token
             await g().fetchDungeonState();
             await delay(500);
           }
@@ -799,10 +789,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           let pendingCardsToAdd: { id: number }[] | null = null;
           if (preFish?.gameState?.COMPLETE_CID && preFish.gameState.SUCCESS_CID) {
             pendingCardsToAdd = preFish.gameState.data?.cardsToAdd ?? null;
-            log(`[MC] completed game found, cards to pick: ${pendingCardsToAdd?.map(c => c.id).join(", ") ?? "none"}`);
+            log(`Previous catch pending, cards to pick: ${pendingCardsToAdd?.map(c => c.id).join(", ") ?? "none"}`);
           } else if (preFish?.gameState?.data && !preFish.gameState.COMPLETE_CID) {
             // Active in-progress game — play through it first
-            log(`[MC] active fishing game found, playing through...`);
+            log(`Active fishing game found, finishing it...`);
             for (let i = 0; i < 50; i++) {
               if (cancelRef.current) break;
               const fs = await g().fetchFishingState();
@@ -830,7 +820,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           for (let cast = 0; cast < fishingAlloc.casts; cast++) {
             if (cancelRef.current) break;
             updateStep(stepId, { detail: `cast ${cast + 1}/${fishingAlloc.casts}...` });
-            log(`[MC] fishing cast ${cast + 1}/${fishingAlloc.casts} (${fishingAlloc.castLabel})`);
+            log(`Fishing cast ${cast + 1}/${fishingAlloc.casts} (${fishingAlloc.castLabel})`);
 
             try {
               let startResult;
@@ -839,7 +829,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                 // Use "loot" action: collect fish + pick card + start next cast in one request
                 // Pick the first earnable card (simple heuristic)
                 const chosenCard = pendingCardsToAdd[0].id;
-                log(`[MC] using loot action, picking card ${chosenCard}`);
+                log(`Collecting fish, picking card ${chosenCard}`);
                 startResult = await g().fishingAction("loot", { cards: [chosenCard], nodeId: fishingAlloc.castNodeId });
                 pendingCardsToAdd = null; // consumed
               } else {
@@ -853,7 +843,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               }
 
               if (!startResult) {
-                log(`[MC] fishing cast failed to start: ${g().lastErrorRef.current || "unknown"}`);
+                log(`Fishing cast failed to start: ${g().lastErrorRef.current || "unknown"}`);
                 escaped++;
                 continue;
               }
@@ -883,11 +873,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                     const seaweed = fish?.seaweedEarned ?? 0;
                     summaryStats.seaweedEarned += seaweed;
                     pendingCardsToAdd = gameData?.cardsToAdd ?? null;
-                    log(`[MC] caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
+                    log(`Caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
                   } else {
                     escaped++;
                     pendingCardsToAdd = null;
-                    log(`[MC] fish escaped`);
+                    log(`Fish escaped`);
                   }
                   break;
                 }
@@ -907,7 +897,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
                 const cardResult = await g().fishingAction("play_cards", { cards: [best.handIndex], nodeId: "" });
                 if (!cardResult) {
-                  log(`[MC] card play failed`);
+                  log(`Card play failed`);
                   break;
                 }
 
@@ -921,18 +911,18 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                     const seaweed = fish?.seaweedEarned ?? 0;
                     summaryStats.seaweedEarned += seaweed;
                     pendingCardsToAdd = doc.data?.cardsToAdd ?? null;
-                    log(`[MC] caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
+                    log(`Caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
                   } else {
                     escaped++;
                     pendingCardsToAdd = null;
-                    log(`[MC] fish escaped`);
+                    log(`Fish escaped`);
                   }
                 }
 
                 await delay(300);
               }
             } catch (e) {
-              log(`[MC] fishing error: ${e instanceof Error ? e.message : "unknown"}`);
+              log(`Fishing error: ${e instanceof Error ? e.message : "unknown"}`);
               escaped++;
             }
 
@@ -982,7 +972,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                   totalSold++;
                   totalEarned += r.data?.value ?? f.value;
                 } else {
-                  log(`[MC] sell failed: ${r?.message || "error"}`);
+                  log(`Sell failed: ${r?.message || "error"}`);
                   break;
                 }
               } catch { break; }
@@ -991,7 +981,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           }
           summaryStats.seaweedEarned += totalEarned;
           updateStep("sell-fish", { status: "done", detail: `${totalSold} sold, ${totalEarned} seaweed` });
-          log(`[MC] sold ${totalSold} fish for ${totalEarned} seaweed`);
+          log(`Sold ${totalSold} fish for ${totalEarned} seaweed`);
         }
       }
 
@@ -1004,7 +994,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
     } catch (e) {
       if ((e as Error).message !== "cancelled") {
-        log(`[MC] execution error: ${e instanceof Error ? e.message : "unknown"}`);
+        log(`Error: ${e instanceof Error ? e.message : "unknown"}`);
       }
       // Mark remaining steps as skipped
       setSteps((prev) => prev.map((s) => (s.status === "pending" ? { ...s, status: "skipped" as const } : s)));
@@ -1347,27 +1337,34 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               {steps.map((step) => (
                 <div
                   key={step.id}
-                  className="flex items-center gap-3 px-4 py-2.5"
+                  className="px-4 py-3"
                   style={{ borderColor: "var(--border)" }}
                 >
-                  <span
-                    className="text-[14px] font-bold shrink-0 w-5 text-center"
-                    style={{
-                      color: statusColor(step.status),
-                      animation: step.status === "running" ? "pulse 1.5s ease-in-out infinite" : "none",
-                    }}
-                  >
-                    {statusIcon(step.status)}
-                  </span>
-                  <span
-                    className="text-[12px] font-medium flex-1 min-w-0 truncate"
-                    style={{ color: step.status === "pending" ? "var(--text-faint)" : "var(--text)" }}
-                  >
-                    {step.label}
-                  </span>
-                  <span className="text-[11px] tabular-nums shrink-0" style={{ color: "var(--text-faint)" }}>
-                    {step.detail}
-                  </span>
+                  <div className="flex items-center gap-3">
+                    <span
+                      className="text-[14px] font-bold shrink-0 w-5 text-center"
+                      style={{
+                        color: statusColor(step.status),
+                        animation: step.status === "running" ? "pulse 1.5s ease-in-out infinite" : "none",
+                      }}
+                    >
+                      {statusIcon(step.status)}
+                    </span>
+                    <span
+                      className="text-[13px] font-medium"
+                      style={{ color: step.status === "pending" ? "var(--text-faint)" : "var(--text)" }}
+                    >
+                      {step.label}
+                    </span>
+                  </div>
+                  {step.detail && (
+                    <div
+                      className="text-[12px] mt-1 ml-8"
+                      style={{ color: "var(--text-dim)", lineHeight: 1.5 }}
+                    >
+                      {step.detail}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
