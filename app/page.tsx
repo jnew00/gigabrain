@@ -2430,7 +2430,8 @@ function FishingPage({ giga, addLog }: {
   const gameData = fs?.gameState?.data;
   const isInGame = fs?.gameState && !fs.gameState.COMPLETE_CID;
   const castsToday = fs?.dayDoc?.UINT256_CID ?? 0;
-  const maxCasts = fs?.maxPerDay ?? 50;
+  const fishJuiced = giga.energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false;
+  const maxCasts = fishJuiced ? (fs?.maxPerDayJuiced ?? fs?.maxPerDay ?? 50) : (fs?.maxPerDay ?? 50);
 
   const addFishLog = useCallback((msg: string) => {
     setFishingLog((prev) => [msg, ...prev].slice(0, 100));
@@ -2550,7 +2551,7 @@ function FishingPage({ giga, addLog }: {
         const state = await giga.fetchFishingState();
         if (!state || cancelled) break;
         const today = state.dayDoc?.UINT256_CID ?? 0;
-        const max = state.maxPerDay ?? 50;
+        const max = fishJuiced ? (state.maxPerDayJuiced ?? state.maxPerDay ?? 50) : (state.maxPerDay ?? 50);
         if (today >= max) {
           addFishLog(`=== Daily limit reached (${today}/${max}) ===`);
           break;

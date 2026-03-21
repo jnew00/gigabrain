@@ -259,13 +259,15 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
   // Fishing state
   const fs = giga.fishingState;
+  const isJuiced = eng?.isPlayerJuiced ?? false;
   const castsToday = fs?.dayDoc?.UINT256_CID ?? 0;
-  const maxCasts = fs?.maxPerDay ?? 50;
+  const maxCasts = isJuiced ? (fs?.maxPerDayJuiced ?? fs?.maxPerDay ?? 50) : (fs?.maxPerDay ?? 50);
   const remainingCasts = Math.max(0, maxCasts - castsToday);
 
   // Recommended cast
   function recommendCast(energy: number, fishState: NonNullable<typeof fs>): string {
-    const remaining = Math.max(0, (fishState.maxPerDay ?? 50) - (fishState.dayDoc?.UINT256_CID ?? 0));
+    const maxC = isJuiced ? (fishState.maxPerDayJuiced ?? fishState.maxPerDay ?? 50) : (fishState.maxPerDay ?? 50);
+    const remaining = Math.max(0, maxC - (fishState.dayDoc?.UINT256_CID ?? 0));
     if (remaining <= 0) return "0";
     const bigCasts = Math.min(remaining, Math.floor(energy / (fishState.node2Energy || 20)));
     const normalCasts = Math.min(remaining, Math.floor(energy / (fishState.node1Energy || 16)));
@@ -638,41 +640,19 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             log(`[MC] isJuiced=${juiced}`);
             let startResult = await g().startRun(alloc.dungeonId, juiced);
 
-            // If start fails (possibly stuck run), try to clear it and retry
+            // If start fails, the error response contains the correct actionToken
+            // (server rotates it even on failure). The startRun catch block already
+            // recovers it. Just retry directly — do NOT call fetchDungeonState as it
+            // returns actionToken=0 which clobbers the recovered token.
             if (!startResult || startResult.success === false) {
               const errMsg = startResult?.message || g().lastErrorRef.current || "null response";
-              log(`[MC] start failed (${errMsg}), checking for stuck run...`);
-              const stuckState = await g().fetchDungeonState();
-              log(`[MC] dungeon state: run=${!!stuckState?.data?.run}, msg=${stuckState?.message}`);
-
-              if (stuckState?.data?.run) {
-                log(`[MC] finishing stuck run (loot=${stuckState.data.run.lootPhase})...`);
-                let s = stuckState;
-                for (let i = 0; i < 150 && s?.data?.run; i++) {
-                  if (cancelRef.current) break;
-                  if (s.message === "Run Complete" && !s.data.run.lootPhase) break;
-                  let act = pickBestAction(s, g().enemyMoveRecords, g().enemyNames);
-                  if (!act && s.data.run.lootPhase) {
-                    log(`[MC] loot phase, no visible options — picking loot_one`);
-                    act = "loot_one";
-                  }
-                  if (!act) { log(`[MC] no action for stuck run`); break; }
-                  const r = await g().performAction(act);
-                  if (!r) break;
-                  s = r;
-                  await delay(150);
-                }
-                log(`[MC] stuck run finished (${s?.message})`);
-                await g().fetchDungeonState();
-                await delay(500);
-              }
-
-              // Retry start after clearing
+              log(`[MC] start failed (${errMsg}), retrying with recovered token...`);
+              await delay(500);
               startResult = await g().startRun(alloc.dungeonId, juiced);
               if (!startResult || startResult.success === false) {
                 log(`[MC] still can't start: ${startResult?.message || g().lastErrorRef.current || "unknown"} — skipping dungeon`);
                 runResults.push(...Array(alloc.runs - run).fill("err"));
-                break; // skip remaining runs for this dungeon
+                break;
               }
             }
 
@@ -809,13 +789,43 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
         const stepId = "fishing";
         if (cancelRef.current) { updateStep(stepId, { status: "skipped" }); }
         else {
-          // Refresh token before fishing — use fetchDungeonState which returns the
-          // authoritative server token. Do NOT call fetchFishingState here — its
-          // GET endpoint returns a stale token that would clobber the fresh one.
-          await g().fetchDungeonState();
           updateStep(stepId, { status: "running", detail: "starting..." });
           let caught = 0;
           let escaped = 0;
+
+          // Check if there's a completed game needing loot (card pick + collect)
+          const preFish = await g().fetchFishingState();
+          // Track pending cardsToAdd from completed games
+          let pendingCardsToAdd: { id: number }[] | null = null;
+          if (preFish?.gameState?.COMPLETE_CID && preFish.gameState.SUCCESS_CID) {
+            pendingCardsToAdd = preFish.gameState.data?.cardsToAdd ?? null;
+            log(`[MC] completed game found, cards to pick: ${pendingCardsToAdd?.map(c => c.id).join(", ") ?? "none"}`);
+          } else if (preFish?.gameState?.data && !preFish.gameState.COMPLETE_CID) {
+            // Active in-progress game — play through it first
+            log(`[MC] active fishing game found, playing through...`);
+            for (let i = 0; i < 50; i++) {
+              if (cancelRef.current) break;
+              const fs = await g().fetchFishingState();
+              if (!fs?.gameState?.data || fs.gameState.COMPLETE_CID) {
+                if (fs?.gameState?.SUCCESS_CID) {
+                  pendingCardsToAdd = fs.gameState.data?.cardsToAdd ?? null;
+                }
+                break;
+              }
+              const gd = fs.gameState.data;
+              if (!gd.hand || gd.hand.length === 0) { await delay(300); continue; }
+              const best = pickBestCard(gd.hand, gd.deckCardData, gd.fishPosition, gd.previousFishPosition, gd.nextPosition);
+              const cr = await g().fishingAction("play_cards", { cards: [best.handIndex], nodeId: "" });
+              if (!cr) break;
+              if (cr.data.doc.COMPLETE_CID) {
+                if (cr.data.doc.SUCCESS_CID) {
+                  pendingCardsToAdd = cr.data.doc.data?.cardsToAdd ?? null;
+                }
+                break;
+              }
+              await delay(300);
+            }
+          }
 
           for (let cast = 0; cast < fishingAlloc.casts; cast++) {
             if (cancelRef.current) break;
@@ -823,9 +833,25 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             log(`[MC] fishing cast ${cast + 1}/${fishingAlloc.casts} (${fishingAlloc.castLabel})`);
 
             try {
-              // Start cast — don't fetchFishingState here as it overwrites the
-              // shared actionToken with a stale fishing-specific value
-              const startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId });
+              let startResult;
+
+              if (pendingCardsToAdd && pendingCardsToAdd.length > 0) {
+                // Use "loot" action: collect fish + pick card + start next cast in one request
+                // Pick the first earnable card (simple heuristic)
+                const chosenCard = pendingCardsToAdd[0].id;
+                log(`[MC] using loot action, picking card ${chosenCard}`);
+                startResult = await g().fishingAction("loot", { cards: [chosenCard], nodeId: fishingAlloc.castNodeId });
+                pendingCardsToAdd = null; // consumed
+              } else {
+                // No pending card pick — normal start_run
+                startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId });
+                // If start fails, retry with recovered token
+                if (!startResult) {
+                  await delay(300);
+                  startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId });
+                }
+              }
+
               if (!startResult) {
                 log(`[MC] fishing cast failed to start: ${g().lastErrorRef.current || "unknown"}`);
                 escaped++;
@@ -856,9 +882,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                     const fish = gameData?.caughtFish;
                     const seaweed = fish?.seaweedEarned ?? 0;
                     summaryStats.seaweedEarned += seaweed;
+                    pendingCardsToAdd = gameData?.cardsToAdd ?? null;
                     log(`[MC] caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
                   } else {
                     escaped++;
+                    pendingCardsToAdd = null;
                     log(`[MC] fish escaped`);
                   }
                   break;
@@ -892,9 +920,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                     const fish = doc.data?.caughtFish;
                     const seaweed = fish?.seaweedEarned ?? 0;
                     summaryStats.seaweedEarned += seaweed;
+                    pendingCardsToAdd = doc.data?.cardsToAdd ?? null;
                     log(`[MC] caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
                   } else {
                     escaped++;
+                    pendingCardsToAdd = null;
                     log(`[MC] fish escaped`);
                   }
                 }

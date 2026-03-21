@@ -446,7 +446,7 @@ export interface FishingGameState {
   actionToken?: number;
 }
 
-export type FishingAction = "start_run" | "play_cards";
+export type FishingAction = "start_run" | "play_cards" | "loot";
 
 export interface FishingActionPayload {
   action: FishingAction;

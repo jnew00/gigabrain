@@ -82,6 +82,8 @@ export async function POST(req: NextRequest) {
       console.error(`[PROXY ${res.status}] ${method} ${endpoint}`, { body, response: text.slice(0, 300) });
     }
 
+
+
     // Try to parse as JSON, fall back to generic error
     let data;
     try {

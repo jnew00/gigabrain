@@ -390,7 +390,6 @@ export function useGigaverse() {
   const performAction = useCallback(
     async (action: DungeonAction, dungeonId: number = 0) => {
       if (!token) return null;
-      const juiced = energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false;
       try {
         const result = await proxy<DungeonActionResponse>(
           "/api/game/dungeon/action",
@@ -405,7 +404,6 @@ export function useGigaverse() {
               itemId: 0,
               expectedAmount: 0,
               index: 0,
-              isJuiced: juiced,
               gearInstanceIds: [],
             },
           }
@@ -431,7 +429,7 @@ export function useGigaverse() {
         return null;
       }
     },
-    [token, energy]
+    [token]
   );
 
   /** Fetch fresh dungeon state directly (bypasses async React state) */
@@ -452,7 +450,7 @@ export function useGigaverse() {
   }, [token]);
 
   const startRun = useCallback(
-    async (dungeonId: number = 0, isJuiced = false, gearInstanceIds: string[] = []) => {
+    async (dungeonId: number = 0, _isJuiced = false, gearInstanceIds: string[] = []) => {
       if (!token) return null;
       setLoading(true);
       setError(null);
@@ -470,7 +468,6 @@ export function useGigaverse() {
               itemId: 0,
               expectedAmount: 0,
               index: 0,
-              isJuiced,
               gearInstanceIds,
             },
           }
@@ -583,22 +580,17 @@ export function useGigaverse() {
 
   /** Perform a fishing action (start_run or play_cards) */
   const fishingAction = useCallback(
-    async (action: "start_run" | "play_cards", data: { cards: number[]; nodeId: string }) => {
-      if (!token) return null;
-      try {
+    async (action: "start_run" | "play_cards" | "loot", data: { cards: number[]; nodeId: string }) => {
+      if (!token || !address) return null;
+
+      const doRequest = async (a: string, tkn: string, d: typeof data) => {
         const result = await proxy<FishingActionResponse>(
           "/api/fishing/action",
           token,
           "POST",
-          {
-            action,
-            actionToken: actionTokenRef.current,
-            data,
-          }
+          { action: a, actionToken: tkn, data: d }
         );
         if (result) {
-          // Merge action response into fishing state shape
-          // Action response wraps game state inside data.doc
           setFishingState((prev) => ({
             ...prev!,
             gameState: result.data.doc,
@@ -607,25 +599,54 @@ export function useGigaverse() {
           if (result.actionToken) {
             setFishingActionToken(result.actionToken);
             fishingActionTokenRef.current = result.actionToken;
-            // Sync dungeon token — server uses one shared token
             actionTokenRef.current = result.actionToken;
           }
         }
         return result;
+      };
+
+      try {
+        const tkn = String(actionTokenRef.current);
+        return await doRequest(action, tkn, data);
       } catch (e) {
-        const msg = e instanceof Error ? e.message : "Fishing action failed";
-        lastErrorRef.current = msg;
-        // Recover token from error response
         const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
         if (respData?.actionToken) {
-          fishingActionTokenRef.current = respData.actionToken;
           actionTokenRef.current = respData.actionToken;
+          fishingActionTokenRef.current = respData.actionToken;
         }
+
+        // If start_run failed, check if there's a completed game needing loot
+        if (action === "start_run") {
+          try {
+            const state = await proxy<FishingGameState>(
+              `/api/fishing/state/${address}`, token
+            );
+            if (state?.gameState?.COMPLETE_CID && state.gameState.data?.cardsToAdd?.length) {
+              // Use loot action: pick first card + start next cast
+              const cardId = state.gameState.data.cardsToAdd[0].id;
+              return await doRequest("loot", String(actionTokenRef.current), { cards: [cardId], nodeId: data.nodeId });
+            }
+          } catch { /* fall through */ }
+
+          // No completed game — just retry with recovered token
+          try {
+            return await doRequest(action, String(actionTokenRef.current), data);
+          } catch (e2) {
+            const rd2 = (e2 as Error & { responseData?: { actionToken?: number } }).responseData;
+            if (rd2?.actionToken) {
+              actionTokenRef.current = rd2.actionToken;
+              fishingActionTokenRef.current = rd2.actionToken;
+            }
+          }
+        }
+
+        const msg = e instanceof Error ? e.message : "Fishing action failed";
+        lastErrorRef.current = msg;
         setError(msg);
         return null;
       }
     },
-    [token]
+    [token, address]
   );
 
   /** Sell fish at the Fish Stall */
