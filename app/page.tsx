@@ -8,11 +8,11 @@ import { authenticateWithSignature, recordRunAction, getRunStatsAction } from ".
 import { useLoginWithAbstract, useAbstractClient } from "@abstract-foundation/agw-react";
 import { useAccount, useSignMessage, useReadContract } from "wagmi";
 import { ABSTRACT_VOTING_ADDRESS, ABSTRACT_VOTING_ABI, GIGAVERSE_APP_ID } from "@/lib/voting-contract";
-import { Sword, Shield, Sparkles, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote, Waves, Rocket } from "lucide-react";
+import { Sword, Shield, Sparkles, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote, Fish, Rocket } from "lucide-react";
 import { MissionControlPage } from "./mission-control";
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import type { Player, DungeonAction, DungeonActionResponse, RomEntity, FishingCard } from "@/lib/types";
-import { pickBestCard, shouldRedraw } from "@/lib/fishing-ai";
+import { pickBestCard, shouldRedraw, predictNextPositions, coordToCell } from "@/lib/fishing-ai";
 
 const MOVE_ICONS: Record<string, typeof Sword> = {
   rock: Sword,
@@ -54,6 +54,11 @@ const MOVE_BG: Record<string, string> = {
 const RARITY_COLORS = ["var(--text-faint)", "var(--green)", "var(--blue)", "var(--gold)", "var(--orange)"];
 const RARITY_GLOW = ["none", "var(--green-glow)", "var(--blue-glow)", "var(--gold-glow)", "var(--orange-glow)"];
 
+/** Format numbers with locale separators (e.g. 1,234) */
+function fmt(n: number): string {
+  return n.toLocaleString();
+}
+
 /** Map raw API boon names to friendly display names */
 const BOON_NAMES: Record<string, string> = {
   UpgradeRock: "Sword",
@@ -76,9 +81,9 @@ function formatBoon(boonTypeString: string, val1: number, val2?: number): string
 }
 
 const BAR_GRADIENTS: Record<string, string> = {
-  hp: "linear-gradient(90deg, #16a34a, #4ade80)",
-  shield: "linear-gradient(90deg, #2563eb, #60a5fa)",
-  energy: "linear-gradient(90deg, #b45309, #e8863a)",
+  hp: "linear-gradient(90deg, var(--green-dim), var(--green))",
+  shield: "linear-gradient(90deg, var(--blue-dim), var(--blue))",
+  energy: "linear-gradient(90deg, var(--orange-dim), var(--orange))",
 };
 
 /* ─── Vital bar ──────────────────────────────────────────── */
@@ -120,7 +125,7 @@ function FighterPanel({ fighter, name, isEnemy }: { fighter: Player; name?: stri
     <div className="flex-1 min-w-0 relative">
       {/* Dead overlay */}
       {isDead && (
-        <div className="absolute inset-0 flex items-center justify-center rounded-lg z-10" style={{ background: "rgba(13,12,11,0.7)" }}>
+        <div className="absolute inset-0 flex items-center justify-center rounded-lg z-10" style={{ background: "var(--bg-overlay)" }}>
           <Skull size={40} style={{ color: "var(--red)", opacity: 0.8 }} />
         </div>
       )}
@@ -209,21 +214,21 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
 
       {/* Run Statistics */}
       <section>
-        <h2 className="text-[16px] font-bold mb-4">Run Statistics</h2>
+        <h2 className="text-[18px] font-bold mb-4">Run Statistics</h2>
         {!runStats || runStats.totalRuns === 0 ? (
           <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>No runs recorded yet.</p>
         ) : (
           <>
             {/* Summary cards */}
-            <div className="grid grid-cols-4 gap-3 mb-5">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
               {[
-                { label: "Total Runs", value: runStats.totalRuns, color: "var(--text)" },
+                { label: "Total Runs", value: fmt(runStats.totalRuns), color: "var(--text)" },
                 { label: "Win Rate", value: `${Math.round((runStats.wins / runStats.totalRuns) * 100)}%`, color: runStats.wins > runStats.losses ? "var(--green)" : "var(--red)" },
                 { label: "Avg Rooms", value: runStats.avgRooms.toFixed(1), color: "var(--text)" },
-                { label: "W / L", value: `${runStats.wins} / ${runStats.losses}`, color: "var(--text)" },
+                { label: "W / L", value: `${fmt(runStats.wins)} / ${fmt(runStats.losses)}`, color: "var(--text)" },
               ].map((card) => (
                 <div key={card.label} className="p-3 rounded-lg" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
+                  <div className="text-[11px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
                     {card.label}
                   </div>
                   <div className="text-[22px] font-bold tabular-nums" style={{ color: card.color }}>
@@ -242,7 +247,7 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
             {/* Total items collected */}
             {Object.keys(runStats.totalItems).length > 0 && (
               <div>
-                <h3 className="text-[12px] font-bold uppercase tracking-[0.1em] mb-2" style={{ color: "var(--gold)" }}>
+                <h3 className="text-[13px] font-bold uppercase tracking-[0.1em] mb-2" style={{ color: "var(--gold)" }}>
                   All-time items
                 </h3>
                 <div className="flex flex-wrap gap-2">
@@ -259,7 +264,7 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
                         >
                           {info?.icon && <img src={info.icon} alt="" width={14} height={14} style={{ objectFit: "contain" }} />}
                           {item.name}
-                          <span className="font-bold" style={{ color: "var(--text)" }}>x{item.amount}</span>
+                          <span className="font-bold" style={{ color: "var(--text)" }}>x{fmt(item.amount)}</span>
                         </span>
                       );
                     })}
@@ -272,15 +277,15 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
 
       {/* Enemy Intel */}
       <section>
-        <h2 className="text-[16px] font-bold mb-1">Enemy Intel</h2>
+        <h2 className="text-[18px] font-bold mb-1">Enemy Intel</h2>
         <p className="text-[11px] mb-4" style={{ color: "var(--text-faint)" }}>
-          {stats.totalRecords} moves tracked across {stats.uniqueEnemies} enemies
+          {fmt(stats.totalRecords)} moves tracked across {fmt(stats.uniqueEnemies)} enemies
         </p>
 
         {profiles.length === 0 ? (
           <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>No data yet. Run some dungeons first.</p>
         ) : (
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {profiles.map((p) => {
               const enemyEntry = enemyNames[String(p.enemyId)]
                 || enemyNames[`idx:${p.enemyId}`];
@@ -307,7 +312,7 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
                   className="p-3 rounded-lg"
                   style={{
                     background: hasPredictablePattern ? "var(--green-glow)" : "var(--bg-raised)",
-                    border: `1px solid ${hasPredictablePattern ? "rgba(74,222,128,0.25)" : "var(--border)"}`,
+                    border: `1px solid ${hasPredictablePattern ? "var(--green-border)" : "var(--border)"}`,
                   }}
                 >
                   <div className="flex items-center justify-between mb-2">
@@ -315,7 +320,7 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
                       {name}
                     </span>
                     <span className="text-[10px] tabular-nums" style={{ color: "var(--text-faint)" }}>
-                      {p.totalMoves} moves
+                      {fmt(p.totalMoves)} moves
                     </span>
                   </div>
 
@@ -334,9 +339,9 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
                   {/* Round-by-round patterns */}
                   {rounds.length > 0 && (
                     <>
-                      <div className="text-[9px] font-bold uppercase tracking-[0.1em] mb-1.5" style={{ color: "var(--text-faint)" }}>
+                      <h3 className="text-[11px] font-bold uppercase tracking-[0.1em] mb-1.5" style={{ color: "var(--text-faint)" }}>
                         Round patterns
-                      </div>
+                      </h3>
                       <div className="flex gap-1.5 flex-wrap">
                         {rounds.map((r) => {
                           const Icon = MOVE_ICONS[r.move];
@@ -353,11 +358,11 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
                               }}
                               title={`Round ${r.round + 1}: ${MOVE_LABELS[r.move]} ${Math.round(r.conf * 100)}% (${r.total} samples)`}
                             >
-                              <span className="text-[9px] font-bold tabular-nums" style={{ color: "var(--text-faint)" }}>
+                              <span className="text-[10px] font-bold tabular-nums" style={{ color: "var(--text-faint)" }}>
                                 R{r.round + 1}
                               </span>
-                              {Icon && <Icon size={10} style={{ color }} />}
-                              <span className="text-[9px] font-bold tabular-nums" style={{ color: strong ? color : "var(--text-faint)" }}>
+                              {Icon && <Icon size={12} style={{ color }} />}
+                              <span className="text-[10px] font-bold tabular-nums" style={{ color: strong ? color : "var(--text-faint)" }}>
                                 {Math.round(r.conf * 100)}%
                               </span>
                             </div>
@@ -376,10 +381,10 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
                   {/* Base Stats */}
                   {baseStats && baseStats.length >= 8 && (
                     <div className="mt-2">
-                      <div className="text-[9px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
+                      <h3 className="text-[11px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
                         Base Stats
-                      </div>
-                      <div className="text-[10px] tabular-nums" style={{ color: "var(--text-dim)" }}>
+                      </h3>
+                      <div className="text-[11px] tabular-nums" style={{ color: "var(--text-dim)" }}>
                         <span style={{ color: "var(--red)" }}>Sword</span>{" "}{baseStats[0]}/{baseStats[1]}
                         <span style={{ color: "var(--text-faint)" }}> · </span>
                         <span style={{ color: "var(--blue)" }}>Shield</span>{" "}{baseStats[2]}/{baseStats[3]}
@@ -434,7 +439,7 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
         try {
           const r = await onClaimRom(rom.docId, t);
           if (r?.success) { count++; addLog(`claimed ${t} #${fs.serialNumber}`); }
-        } catch { /* skip */ }
+        } catch { /* claim may fail if already claimed */ }
         await new Promise((r) => setTimeout(r, 200));
       }
     }
@@ -452,7 +457,7 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
       try {
         const r = await onConvertToDust(rom.docId, amt);
         if (r?.success) { total += amt; addLog(`converted ${amt}E #${rom.factoryStats.serialNumber}`); }
-      } catch { /* skip */ }
+      } catch { /* claim may fail if already claimed */ }
       await new Promise((r) => setTimeout(r, 200));
     }
     addLog(`done — ${total}E converted to dust`);
@@ -462,18 +467,18 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
 
   return (
     <div className="anim-in space-y-6">
-      <h2 className="text-[16px] font-bold">ROM Dashboard</h2>
+      <h2 className="text-[18px] font-bold">ROM Dashboard</h2>
 
       {/* Summary cards */}
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {[
-          { label: "Total ROMs", value: roms.length, color: "var(--text)" },
-          { label: "Energy", value: totalE, color: "var(--orange)" },
-          { label: "Shards", value: totalS, color: "var(--blue)" },
-          { label: "Dust", value: totalD, color: "var(--green)" },
+          { label: "Total ROMs", value: fmt(roms.length), color: "var(--text)" },
+          { label: "Energy", value: fmt(totalE), color: "var(--orange)" },
+          { label: "Shards", value: fmt(totalS), color: "var(--blue)" },
+          { label: "Dust", value: fmt(totalD), color: "var(--green)" },
         ].map((card) => (
           <div key={card.label} className="p-3 rounded-lg" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
-            <div className="text-[10px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
+            <div className="text-[11px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
               {card.label}
             </div>
             <div className="text-[22px] font-bold tabular-nums" style={{ color: card.color }}>
@@ -484,19 +489,19 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
       </div>
 
       {/* Production rates */}
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div className="p-3 rounded-lg" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
-          <div className="text-[10px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
             Shard Production
-          </div>
+          </h3>
           <div className="text-[18px] font-bold tabular-nums" style={{ color: "var(--blue)" }}>
             {totalShardRate.toFixed(1)}<span className="text-[11px] font-normal" style={{ color: "var(--text-faint)" }}>/week</span>
           </div>
         </div>
         <div className="p-3 rounded-lg" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
-          <div className="text-[10px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
             Dust Production
-          </div>
+          </h3>
           <div className="text-[18px] font-bold tabular-nums" style={{ color: "var(--green)" }}>
             {totalDustRate.toFixed(1)}<span className="text-[11px] font-normal" style={{ color: "var(--text-faint)" }}>/week</span>
           </div>
@@ -519,12 +524,12 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
           className="btn-press text-[11px] font-bold uppercase px-4 py-2 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
           style={{ background: "var(--green)", border: "none", color: "var(--bg)" }}
         >
-          {claiming ? "..." : `Convert All Energy to Dust (${totalE}E)`}
+          {claiming ? "..." : `Convert All Energy to Dust (${fmt(totalE)}E)`}
         </button>
       </div>
 
       {/* Per-ROM cards */}
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         {roms.map((rom) => {
           const fs = rom.factoryStats;
           const ePct = fs.maxEnergy > 0 ? Math.floor(fs.energyCollectable) / fs.maxEnergy : 0;
@@ -537,23 +542,23 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
               <div className="flex items-center justify-between mb-3">
                 <div>
                   <div className="text-[13px] font-bold">{fs.tier} ROM</div>
-                  <div className="text-[10px] tabular-nums" style={{ color: "var(--text-faint)" }}>#{fs.serialNumber}</div>
+                  <div className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>#{fs.serialNumber}</div>
                 </div>
                 <div className="text-right">
                   <div className="text-[11px] font-semibold" style={{ color: "var(--text-dim)" }}>{fs.faction}</div>
-                  <div className="text-[10px]" style={{ color: "var(--text-faint)" }}>{fs.memory} memory</div>
+                  <div className="text-[11px]" style={{ color: "var(--text-faint)" }}>{fs.memory} memory</div>
                 </div>
               </div>
 
               {/* Resource bars */}
-              <div className="space-y-2 mb-3">
+              <div className="space-y-3 mb-4">
                 {([
                   { label: "Energy", val: Math.floor(fs.energyCollectable), max: fs.maxEnergy, pct: ePct, color: "var(--orange)" },
                   { label: "Shards", val: Math.floor(fs.shardCollectable), max: fs.maxShard, pct: sPct, color: "var(--blue)" },
                   { label: "Dust", val: Math.floor(fs.dustCollectable), max: fs.maxDust, pct: dPct, color: "var(--green)" },
                 ] as const).map((res) => (
                   <div key={res.label}>
-                    <div className="flex justify-between text-[10px] mb-0.5">
+                    <div className="flex justify-between text-[11px] mb-0.5">
                       <span style={{ color: res.color }}>{res.label}</span>
                       <span className="tabular-nums" style={{ color: res.val > 0 ? "var(--text)" : "var(--text-faint)" }}>
                         {res.val} / {res.max}
@@ -570,7 +575,7 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
               </div>
 
               {/* Production rates */}
-              <div className="text-[10px] tabular-nums mb-3" style={{ color: "var(--text-faint)" }}>
+              <div className="text-[11px] tabular-nums mb-4" style={{ color: "var(--text-faint)" }}>
                 <span style={{ color: "var(--blue)" }}>{fs.shardProductionPerWeek.toFixed(1)}</span> shards/wk
                 <span className="mx-1">&middot;</span>
                 <span style={{ color: "var(--green)" }}>{fs.dustProductionPerWeek.toFixed(1)}</span> dust/wk
@@ -589,7 +594,7 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
                         if (r?.success) { addLog(`got ${t}`); onRefresh(); }
                       }}
                       disabled={loading || Math.floor(val) === 0}
-                      className="btn-press text-[9px] font-bold uppercase px-2.5 py-1 rounded cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                      className="btn-press text-[11px] font-bold uppercase px-3 py-1.5 rounded cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
                       style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text-dim)" }}
                     >
                       {t}
@@ -605,7 +610,7 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
                       if (r?.success) { addLog(`converted ${amt}E`); onRefresh(); }
                     }}
                     disabled={loading}
-                    className="btn-press text-[9px] font-bold px-2.5 py-1 rounded cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                    className="btn-press text-[11px] font-bold px-3 py-1.5 rounded cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
                     style={{ background: "var(--green)", border: "none", color: "var(--bg)" }}
                   >
                     E{"\u2192"}Dust
@@ -647,11 +652,24 @@ export default function Home() {
   const [jwtInput, setJwtInput] = useState("");
   const [showManualLogin, setShowManualLogin] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [log, setLog] = useState<string[]>([]);
+  const [log, setLog] = useState<{ id: number; text: string }[]>([]);
+  const logIdRef = useRef(0);
   const [activePage, setActivePage] = useState<"mission" | "dungeon" | "stats" | "roms" | "fishing" | "world">("mission");
   const [flyout, setFlyout] = useState<"skills" | "log" | null>(null);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [railExpanded, setRailExpanded] = useState(false);
+
+  // Escape key handler for overlays
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (userMenuOpen) setUserMenuOpen(false);
+        else if (flyout) setFlyout(null);
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [userMenuOpen, flyout]);
   const [lastDrops, setLastDrops] = useState<{ id: number; amount: number }[]>([]);
   const [runStats, setRunStats] = useState<{
     totalRuns: number; wins: number; losses: number; avgRooms: number;
@@ -733,8 +751,11 @@ export default function Home() {
   }, []);
 
   const addLog = useCallback(
-    (msg: string) =>
-      setLog((prev) => [`${new Date().toLocaleTimeString("en", { hour12: false })} ${msg}`, ...prev].slice(0, 80)),
+    (msg: string) => {
+      const id = ++logIdRef.current;
+      const text = `${new Date().toLocaleTimeString("en", { hour12: false })} ${msg}`;
+      setLog((prev) => [{ id, text }, ...prev].slice(0, 80));
+    },
     []
   );
 
@@ -931,7 +952,7 @@ export default function Home() {
         }
 
         if (typeof action === "string" && action.startsWith("loot_")) {
-          const idx = ["loot_one", "loot_two", "loot_three"].indexOf(action);
+          const idx = ["loot_one", "loot_two", "loot_three", "loot_four"].indexOf(action);
           const loot = run.lootOptions?.[idx];
           if (loot) {
             runBoonsRef.current.push(
@@ -968,10 +989,16 @@ export default function Home() {
             addLog(`  ${p.health.current}hp vs ${e.health.current}hp`);
           }
         } else {
-          addLog(`auto: action failed (${g.error || "unknown"}), retrying...`);
-          // Do NOT fetch dungeon state here — it rotates the actionToken on the
-          // server, making the current token stale. Just retry with current state.
-          await delay(1000);
+          addLog(`auto: action failed, recovering token...`);
+          const fresh = await g.fetchDungeonState();
+          if (fresh) {
+            currentState = fresh;
+            trackEnemyMove(fresh);
+          } else {
+            addLog(`auto: recovery failed, stopping`);
+            break;
+          }
+          await delay(500);
         }
 
         await delay(150);
@@ -1051,8 +1078,14 @@ export default function Home() {
   const isLoot = run?.lootPhase;
   const inRun = !!run;
   const eng = giga.energy?.entities?.[0]?.parsedData;
-  const stateScore = giga.dungeonState ? evaluateState(giga.dungeonState) : 0;
-  const recommended = giga.dungeonState ? pickBestAction(giga.dungeonState, giga.enemyMoveRecords, giga.enemyNames) : null;
+  const stateScore = useMemo(
+    () => giga.dungeonState ? evaluateState(giga.dungeonState) : 0,
+    [giga.dungeonState]
+  );
+  const recommended = useMemo(
+    () => giga.dungeonState ? pickBestAction(giga.dungeonState, giga.enemyMoveRecords, giga.enemyNames) : null,
+    [giga.dungeonState, giga.enemyMoveRecords, giga.enemyNames]
+  );
 
   // Track dungeon name while in a run so it's available after the run ends
   const lastDungeonNameRef = useRef("Unknown");
@@ -1083,25 +1116,59 @@ export default function Home() {
     }
   }, [inRun, runSummary, entity, player, addLog, giga, buildItemSummary, refreshRunStats]);
 
+  // Nav badge counts (memoized to avoid recalculating on every render)
+  const worldBadge = useMemo(() => {
+    const isOnCooldown = (recipeId: string) => {
+      const recipe = giga.worldRecipes.find((r) => r.docId === recipeId);
+      const progress = giga.playerRecipes?.entities?.find((p) => p.ID_CID === recipeId);
+      if (!recipe?.COOLDOWN_CID || !progress) return false;
+      return (progress.END_TIMESTAMP_CID + recipe.COOLDOWN_CID) > Math.floor(Date.now() / 1000);
+    };
+    const hasPaperHands = giga.gearInstances?.entities?.some((g) => {
+      const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || "";
+      return name.toLowerCase().includes("paper");
+    }) ?? false;
+    const hasRockHands = giga.gearInstances?.entities?.some((g) => {
+      const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || "";
+      return name.toLowerCase().includes("rock");
+    }) ?? false;
+    let count = 0;
+    if (!isOnCooldown("Recipe#700000")) count++;
+    if (!isOnCooldown("Recipe#700003") && eng?.isPlayerJuiced) count++;
+    if (!isOnCooldown("Recipe#700001") && hasPaperHands) count++;
+    if (!isOnCooldown("Recipe#700002") && hasRockHands) count++;
+    return count;
+  }, [giga.worldRecipes, giga.playerRecipes, giga.gearInstances, giga.itemInfo, eng?.isPlayerJuiced]);
+
+  const upgradableBadge = useMemo(() => {
+    return giga.skillTrees.filter((tree) => {
+      const prog = giga.skillProgress.find((p) => p.SKILL_CID === Number(tree.docId));
+      const totalLvl = prog?.LEVEL_CID ?? 0;
+      const nextCost = tree.xpPerLvl?.[totalLvl + 1];
+      const currencyBal = giga.itemBalances[String(tree.GAME_ITEM_ID_CID)] ?? 0;
+      return nextCost !== undefined && currencyBal >= nextCost;
+    }).length;
+  }, [giga.skillTrees, giga.skillProgress, giga.itemBalances]);
+
   /* ─── Restoring session ──────────────────────────────── */
   if (giga.restoringSession) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-[13px] pulse-glow" style={{ color: "var(--text-faint)" }}>
+      <main className="min-h-screen flex items-center justify-center">
+        <div className="text-[13px] pulse-glow" role="status" style={{ color: "var(--text-faint)" }}>
           Restoring session...
         </div>
-      </div>
+      </main>
     );
   }
 
   /* ─── Login ─────────────────────────────────────────── */
   if (!connected) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-5" style={{ background: `radial-gradient(ellipse at 50% 30%, rgba(232,134,58,0.06) 0%, var(--bg) 70%)` }}>
+      <main className="min-h-screen flex items-center justify-center p-5" style={{ background: `radial-gradient(ellipse at 50% 30%, rgba(232,134,58,0.06) 0%, var(--bg) 70%)` }}>
         <div className="w-full max-w-sm anim-in">
           {/* Brand */}
           <div className="mb-6 flex items-center gap-3">
-            <img src="/gigabrain-icon.png" alt="" width={40} height={40} style={{ imageRendering: "pixelated" }} />
+            <img src="/gigabrain-icon.png" alt="GigaBrain" width={40} height={40} style={{ imageRendering: "pixelated" }} />
             <div>
               <h1 className="text-3xl font-bold tracking-tight" style={{ letterSpacing: "-0.02em" }}>
                 GigaBrain
@@ -1122,7 +1189,7 @@ export default function Home() {
               className="btn-press w-full py-3 text-[13px] font-bold rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed mb-4"
               style={{
                 background: "linear-gradient(135deg, var(--orange), var(--orange-dim))",
-                color: "#fff",
+                color: "var(--text-inverse)",
                 border: "none",
                 boxShadow: "0 2px 8px var(--orange-glow), 0 1px 0 var(--orange-dim)",
               }}
@@ -1204,12 +1271,12 @@ export default function Home() {
           </div>
 
           {giga.error && (
-            <p className="text-[12px] mt-3 px-3 py-2 rounded-lg" style={{ color: "var(--red)", background: "var(--red-glow)" }}>
+            <p role="alert" className="text-[12px] mt-3 px-3 py-2 rounded-lg" style={{ color: "var(--red)", background: "var(--red-glow)" }}>
               {giga.error}
             </p>
           )}
         </div>
-      </div>
+      </main>
     );
   }
 
@@ -1226,7 +1293,7 @@ export default function Home() {
 
       {/* ── Top HUD Bar ── */}
       <header
-        className="shrink-0 flex flex-col justify-center px-6 anim-in"
+        className="hud-bar shrink-0 flex flex-col justify-center px-6 anim-in"
         style={{
           height: 72,
           background: "var(--bg-raised)",
@@ -1235,11 +1302,11 @@ export default function Home() {
         }}
       >
         {/* Row 1: Primary info */}
-        <div className="flex items-center gap-5">
+        <div className="flex items-center gap-3 md:gap-5">
           {/* App brand */}
           <div className="flex items-center gap-2.5 shrink-0">
-            <img src="/gigabrain-icon.png" alt="" width={24} height={24} style={{ imageRendering: "pixelated" }} />
-            <span className="text-[17px] font-bold tracking-tight">GigaBrain</span>
+            <img src="/gigabrain-icon.png" alt="GigaBrain" width={24} height={24} style={{ imageRendering: "pixelated" }} />
+            <h1 className="text-[17px] font-bold tracking-tight">GigaBrain</h1>
           </div>
 
           <div className="w-px h-5 shrink-0" style={{ background: "var(--border)" }} />
@@ -1256,7 +1323,7 @@ export default function Home() {
               </div>
             </div>
             {eng && (
-              <div className="flex flex-col gap-1">
+              <div className="hud-detail flex flex-col gap-1">
                 <div className="rounded-full overflow-hidden" style={{ width: 80, height: 6, background: "var(--bg-inset)" }}>
                   <div className="h-full rounded-full" style={{ width: `${Math.min(100, (Math.floor(eng.energyValue) / eng.maxEnergy) * 100)}%`, background: "var(--orange)" }} />
                 </div>
@@ -1280,10 +1347,10 @@ export default function Home() {
             )}
           </div>
 
-          <div className="w-px h-5 shrink-0" style={{ background: "var(--border)" }} />
+          <div className="hud-detail w-px h-5 shrink-0" style={{ background: "var(--border)" }} />
 
           {/* Dungeon status */}
-          <div className="shrink-0" title="Current dungeon run status">
+          <div className="hud-detail shrink-0" title="Current dungeon run status">
             <div className="text-[10px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>Dungeon</div>
             <div className="flex items-center gap-2">
               <span
@@ -1314,14 +1381,14 @@ export default function Home() {
           {/* Right cluster */}
           <div className="flex items-center gap-5 shrink-0">
             {giga.loading && (
-              <span className="text-[12px] font-semibold pulse-glow" style={{ color: "var(--orange)" }}>syncing...</span>
+              <span className="hud-detail text-[12px] font-semibold pulse-glow" style={{ color: "var(--orange)" }}>syncing...</span>
             )}
 
 
 
             {/* Portal vote */}
             {walletConnected && (
-              <div className="shrink-0" title="Abstract Portal — vote for Gigaverse to earn XP">
+              <div className="hud-detail-secondary shrink-0" title="Abstract Portal — vote for Gigaverse to earn XP">
                 <div className="text-[10px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>Vote</div>
                 {hasVoted ? (
                   <div className="flex items-center gap-1.5 text-[13px] font-semibold" style={{ color: "var(--green)" }}>
@@ -1345,6 +1412,8 @@ export default function Home() {
             <div className="relative shrink-0">
               <button
                 onClick={() => setUserMenuOpen(!userMenuOpen)}
+                aria-expanded={userMenuOpen}
+                aria-haspopup="menu"
                 className="flex items-center gap-2 cursor-pointer px-2.5 py-1.5 rounded-md"
                 style={{
                   background: userMenuOpen ? "var(--bg-inset)" : "transparent",
@@ -1363,6 +1432,7 @@ export default function Home() {
                 <>
                   <div className="fixed inset-0" style={{ zIndex: 60 }} onClick={() => setUserMenuOpen(false)} />
                   <div
+                    role="menu"
                     className="absolute right-0 mt-1 py-1 rounded-lg shadow-lg"
                     style={{ zIndex: 65, width: 200, background: "var(--bg-raised)", border: "1px solid var(--border)" }}
                   >
@@ -1376,6 +1446,7 @@ export default function Home() {
                       </div>
                     </div>
                     <button
+                      role="menuitem"
                       onClick={() => { giga.disconnect(); walletLogout(); setConnected(false); setUserMenuOpen(false); }}
                       className="w-full text-left px-3 py-2 text-[12px] cursor-pointer"
                       style={{ background: "none", border: "none", color: "var(--red)" }}
@@ -1392,11 +1463,12 @@ export default function Home() {
       </header>
 
       {/* ── Body: Icon Rail + Main + Flyout ── */}
-      <div className="flex flex-1 min-h-0">
+      <div className="body-layout flex flex-1 min-h-0">
 
         {/* ── Icon Rail (expandable) ── */}
         <nav
-          className="shrink-0 flex flex-col py-3 gap-1.5 anim-in"
+          aria-label="Main navigation"
+          className="nav-rail shrink-0 flex flex-col py-3 gap-1.5 anim-in"
           style={{
             width: railExpanded ? 180 : 56,
             background: "var(--bg-raised)",
@@ -1408,7 +1480,8 @@ export default function Home() {
           {/* Toggle expand/collapse */}
           <button
             onClick={() => setRailExpanded(!railExpanded)}
-            className="cursor-pointer flex items-center gap-2.5 rounded-md mx-auto mb-1"
+            aria-label={railExpanded ? "Collapse sidebar" : "Expand sidebar"}
+            className="nav-rail-hide cursor-pointer flex items-center gap-2.5 rounded-md mx-auto mb-1"
             style={{
               width: railExpanded ? 164 : 42,
               height: 32,
@@ -1427,34 +1500,10 @@ export default function Home() {
           </button>
 
           {/* Tab icons */}
-          {(() => {
-            // Compute pots/chests actually usable count for badge
-            const isOnCooldown = (recipeId: string) => {
-              const recipe = giga.worldRecipes.find((r) => r.docId === recipeId);
-              const progress = giga.playerRecipes?.entities?.find((p) => p.ID_CID === recipeId);
-              if (!recipe?.COOLDOWN_CID || !progress) return false; // never used = not on cooldown
-              return (progress.END_TIMESTAMP_CID + recipe.COOLDOWN_CID) > Math.floor(Date.now() / 1000);
-            };
-            // Find hands gear
-            const hasPaperHands = giga.gearInstances?.entities?.some((g) => {
-              const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || "";
-              return name.toLowerCase().includes("paper");
-            }) ?? false;
-            const hasRockHands = giga.gearInstances?.entities?.some((g) => {
-              const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || "";
-              return name.toLowerCase().includes("rock");
-            }) ?? false;
-
-            let worldBadge = 0;
-            if (!isOnCooldown("Recipe#700000")) worldBadge++; // chest
-            if (!isOnCooldown("Recipe#700003") && eng?.isPlayerJuiced) worldBadge++; // juice chest
-            if (!isOnCooldown("Recipe#700001") && hasPaperHands) worldBadge++; // blue pot (needs Paper Hands)
-            if (!isOnCooldown("Recipe#700002") && hasRockHands) worldBadge++; // tan pot (needs Rock Hands)
-
-            return ([
+          {([
               { id: "mission" as const, icon: Rocket, label: "Mission Control", badge: 0 },
               { id: "dungeon" as const, icon: Sword, label: "Dungeon", badge: 0 },
-              { id: "fishing" as const, icon: Waves, label: "Fishing", badge: 0 },
+              { id: "fishing" as const, icon: Fish, label: "Fishing", badge: 0 },
               { id: "stats" as const, icon: BarChart3, label: "Stats & Intel", badge: 0 },
               { id: "roms" as const, icon: HardDrive, label: "ROMs", badge: 0 },
               { id: "world" as const, icon: Package, label: "Pots & Chests", badge: worldBadge },
@@ -1466,10 +1515,12 @@ export default function Home() {
                   key={item.id}
                   onClick={() => { setActivePage(item.id); setFlyout(null); }}
                   title={railExpanded ? undefined : item.label}
+                  aria-label={item.label}
+                  aria-current={active ? "page" : undefined}
                   className="cursor-pointer flex items-center gap-2.5 rounded-md mx-auto relative"
                   style={{
                     width: railExpanded ? 164 : 42,
-                    height: 42,
+                    height: 44,
                     paddingLeft: railExpanded ? 12 : 0,
                     justifyContent: railExpanded ? "flex-start" : "center",
                     background: active ? "var(--orange-glow)" : "transparent",
@@ -1499,7 +1550,7 @@ export default function Home() {
                     )}
                   </span>
                   {railExpanded && (
-                    <span className="text-[13px] font-medium truncate">
+                    <span className="nav-label text-[13px] font-medium truncate">
                       {item.label}
                       {item.badge > 0 && (
                         <span className="ml-1.5 text-[11px] font-bold" style={{ color: "var(--green)" }}>
@@ -1510,25 +1561,15 @@ export default function Home() {
                   )}
                 </button>
               );
-            });
-          })()}
+            })
+          }
 
           {/* Divider */}
-          <div className="mx-auto my-1" style={{ width: railExpanded ? 148 : 24, height: 1, background: "var(--border)", transition: "width 200ms ease" }} />
+          <div className="nav-rail-hide mx-auto my-1" style={{ width: railExpanded ? 148 : 24, height: 1, background: "var(--border)", transition: "width 200ms ease" }} />
 
           {/* Flyout icons */}
-          {(() => {
-            // Count upgradable skill trees
-            const upgradableCount = giga.skillTrees.filter((tree) => {
-              const prog = giga.skillProgress.find((p) => p.SKILL_CID === Number(tree.docId));
-              const totalLvl = prog?.LEVEL_CID ?? 0;
-              const nextCost = tree.xpPerLvl?.[totalLvl + 1];
-              const currencyBal = giga.itemBalances[String(tree.GAME_ITEM_ID_CID)] ?? 0;
-              return nextCost !== undefined && currencyBal >= nextCost;
-            }).length;
-
-            return ([
-              { id: "skills" as const, icon: Star, label: "Skills", badge: upgradableCount },
+          {([
+              { id: "skills" as const, icon: Star, label: "Skills", badge: upgradableBadge },
               { id: "log" as const, icon: ScrollText, label: "Activity Log", badge: 0 },
             ] as const).map((item) => {
               const Icon = item.icon;
@@ -1541,7 +1582,7 @@ export default function Home() {
                   className="cursor-pointer flex items-center gap-2.5 rounded-md mx-auto relative"
                   style={{
                     width: railExpanded ? 164 : 42,
-                    height: 42,
+                    height: 44,
                     paddingLeft: railExpanded ? 12 : 0,
                     justifyContent: railExpanded ? "flex-start" : "center",
                     background: active ? "var(--orange-glow)" : "transparent",
@@ -1571,7 +1612,7 @@ export default function Home() {
                     )}
                   </span>
                   {railExpanded && (
-                    <span className="text-[13px] font-medium truncate">
+                    <span className="nav-label text-[13px] font-medium truncate">
                       {item.label}
                       {item.badge > 0 && (
                         <span className="ml-1.5 text-[11px] font-bold" style={{ color: "var(--green)" }}>
@@ -1582,17 +1623,18 @@ export default function Home() {
                   )}
                 </button>
               );
-            });
-          })()}
+            })
+          }
 
           {/* Spacer */}
-          <div className="flex-1" />
+          <div className="nav-rail-hide flex-1" />
 
           {/* Refresh button at bottom */}
           <button
             onClick={() => giga.refreshAll()}
             title={railExpanded ? undefined : "Refresh"}
-            className="cursor-pointer flex items-center gap-2.5 rounded-md mx-auto mb-1"
+            aria-label="Refresh all data"
+            className="nav-rail-hide cursor-pointer flex items-center gap-2.5 rounded-md mx-auto mb-1"
             style={{
               width: railExpanded ? 164 : 42,
               height: 36,
@@ -1625,6 +1667,8 @@ export default function Home() {
             />
             {/* Panel */}
             <div
+              role="dialog"
+              aria-label={flyout === "skills" ? "Skills" : "Activity Log"}
               className="fixed top-[72px] bottom-0 flyout-panel"
               style={{
                 left: railExpanded ? 180 : 56,
@@ -1634,15 +1678,17 @@ export default function Home() {
                 borderRight: "1px solid var(--border)",
                 zIndex: 45,
                 overflowY: "auto",
+                overscrollBehavior: "contain",
               }}
             >
               {/* Flyout header */}
               <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: "1px solid var(--border)" }}>
-                <span className="text-[16px] font-bold">
+                <span className="text-[18px] font-bold">
                   {flyout === "skills" ? "Skills" : "Activity Log"}
                 </span>
                 <button
                   onClick={() => setFlyout(null)}
+                  aria-label="Close panel"
                   className="cursor-pointer flex items-center justify-center rounded"
                   style={{ width: 32, height: 32, background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text-faint)" }}
                 >
@@ -1723,14 +1769,14 @@ export default function Home() {
                     ) : (
                       log.map((entry, i) => (
                         <div
-                          key={i}
+                          key={entry.id}
                           className="text-[12px] leading-relaxed py-0.5 font-[family-name:monospace]"
                           style={{
                             color: i === 0 ? "var(--text-dim)" : "var(--text-faint)",
                             opacity: Math.max(0.3, 1 - i * 0.05),
                           }}
                         >
-                          {entry}
+                          {entry.text}
                         </div>
                       ))
                     )}
@@ -1742,7 +1788,7 @@ export default function Home() {
         )}
 
         {/* ── Main Content Area ── */}
-        <main className="flex-1 min-w-0 overflow-y-auto" style={{ padding: "clamp(20px, 3vw, 40px)" }}>
+        <main className="main-content flex-1 min-w-0 overflow-y-auto" style={{ padding: "clamp(20px, 3vw, 40px)" }}>
 
           {/* ── Mission Control Page ── */}
           {activePage === "mission" && (
@@ -1841,7 +1887,7 @@ export default function Home() {
               className="btn-press text-[12px] font-bold px-5 py-2 rounded-md cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
               style={{
                 background: autoPlay ? "linear-gradient(135deg, var(--orange), var(--orange-dim))" : "var(--bg-inset)",
-                color: autoPlay ? "#fff" : "var(--text-dim)",
+                color: autoPlay ? "var(--text-inverse)" : "var(--text-dim)",
                 border: autoPlay ? "none" : "1px solid var(--border)",
                 boxShadow: autoPlay ? "0 2px 8px var(--orange-glow)" : "none",
                 minWidth: 110,
@@ -1885,7 +1931,7 @@ export default function Home() {
               className="mb-6 p-5 rounded-lg anim-in"
               style={{
                 background: "var(--bg-raised)",
-                border: `1px solid ${runSummary.won ? "rgba(74,222,128,0.2)" : "rgba(248,113,113,0.2)"}`,
+                border: `1px solid ${runSummary.won ? "var(--green-border)" : "var(--red-border)"}`,
                 boxShadow: runSummary.won ? "0 0 30px var(--green-glow)" : "0 0 30px var(--red-glow)",
               }}
             >
@@ -1905,9 +1951,9 @@ export default function Home() {
               {/* Item drops */}
               {runSummary.items.length > 0 && (
                 <div className="mb-4">
-                  <div className="text-[10px] font-bold uppercase tracking-[0.12em] mb-2" style={{ color: "var(--gold)" }}>
+                  <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-2" style={{ color: "var(--gold)" }}>
                     Items collected
-                  </div>
+                  </h3>
                   <div className="flex flex-wrap gap-2">
                     {runSummary.items.map((item) => (
                       <span
@@ -1915,7 +1961,7 @@ export default function Home() {
                         className="text-[11px] font-medium px-2.5 py-1 rounded-md"
                         style={{ background: "var(--bg-inset)", color: "var(--text-dim)", border: "1px solid var(--border)" }}
                       >
-                        {item.name} <span className="font-bold" style={{ color: "var(--orange)" }}>x{item.amount}</span>
+                        {item.name} <span className="font-bold" style={{ color: "var(--orange)" }}>x{fmt(item.amount)}</span>
                       </span>
                     ))}
                   </div>
@@ -1925,9 +1971,9 @@ export default function Home() {
               {/* Boons picked */}
               {runSummary.boons.length > 0 && (
                 <div>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.12em] mb-2" style={{ color: "var(--text-faint)" }}>
+                  <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-2" style={{ color: "var(--text-faint)" }}>
                     Boons chosen ({runSummary.boons.length})
-                  </div>
+                  </h3>
                   <div className="flex flex-wrap gap-2">
                     {runSummary.boons.map((b: string, i: number) => (
                       <span
@@ -1967,22 +2013,22 @@ export default function Home() {
                   Chain Complete
                 </span>
                 <span className="text-[12px] font-medium" style={{ color: "var(--text-dim)" }}>
-                  {chainSummary.totalRuns} runs
+                  {fmt(chainSummary.totalRuns)} runs
                 </span>
               </div>
 
               <div className="flex gap-6 mb-4">
-                <StatPill label="Wins" value={chainSummary.wins} color="var(--green)" />
-                <StatPill label="Losses" value={chainSummary.losses} color="var(--red)" />
+                <StatPill label="Wins" value={fmt(chainSummary.wins)} color="var(--green)" />
+                <StatPill label="Losses" value={fmt(chainSummary.losses)} color="var(--red)" />
                 <StatPill label="Win rate" value={`${Math.round((chainSummary.wins / chainSummary.totalRuns) * 100)}%`} color="var(--text)" />
-                <StatPill label="Total rooms" value={chainSummary.totalRooms} />
+                <StatPill label="Total rooms" value={fmt(chainSummary.totalRooms)} />
               </div>
 
               {chainSummary.allItems.length > 0 && (
                 <div className="mb-3">
-                  <div className="text-[10px] font-bold uppercase tracking-[0.12em] mb-2" style={{ color: "var(--gold)" }}>
+                  <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-2" style={{ color: "var(--gold)" }}>
                     All items collected
-                  </div>
+                  </h3>
                   <div className="flex flex-wrap gap-2">
                     {chainSummary.allItems.map((item) => {
                       const info = giga.itemInfo[String(item.id)];
@@ -1993,7 +2039,7 @@ export default function Home() {
                           className="text-[11px] font-medium px-2.5 py-1 rounded-md"
                           style={{ background: "var(--bg-inset)", color: rarityColor, border: `1px solid ${rarityColor}` }}
                         >
-                          {item.name} <span className="font-bold" style={{ color: "var(--text)" }}>x{item.amount}</span>
+                          {item.name} <span className="font-bold" style={{ color: "var(--text)" }}>x{fmt(item.amount)}</span>
                         </span>
                       );
                     })}
@@ -2064,7 +2110,7 @@ export default function Home() {
                           style={{
                             background: notEnough ? "var(--bg-inset)" : "linear-gradient(135deg, var(--orange), var(--orange-dim))",
                             border: notEnough ? "1px solid var(--border)" : "none",
-                            color: notEnough ? "var(--text-faint)" : "#fff",
+                            color: notEnough ? "var(--text-faint)" : "var(--text-inverse)",
                             boxShadow: notEnough ? "none" : "0 3px 12px var(--orange-glow)",
                           }}
                         >
@@ -2203,7 +2249,7 @@ export default function Home() {
                             <img src={info.icon} alt="" width={14} height={14} style={{ objectFit: "contain" }} />
                           )}
                           {name}
-                          <span className="font-bold" style={{ color: "var(--text)" }}>x{drop.amount}</span>
+                          <span className="font-bold" style={{ color: "var(--text)" }}>x{fmt(drop.amount)}</span>
                         </span>
                       );
                     })}
@@ -2222,7 +2268,7 @@ export default function Home() {
                   </span>
                   <div className="flex gap-3">
                     {run.lootOptions.map((loot, i) => {
-                      const lootActions = ["loot_one", "loot_two", "loot_three"] as const;
+                      const lootActions = ["loot_one", "loot_two", "loot_three", "loot_four"] as const;
                       const isRecommended = recommended === lootActions[i];
                       const rarityColor = RARITY_COLORS[loot.RARITY_CID] || RARITY_COLORS[0];
                       const rarityGlow = RARITY_GLOW[loot.RARITY_CID] || "none";
@@ -2258,7 +2304,7 @@ export default function Home() {
                             }
                           </div>
                           {isRecommended && (
-                            <div className="text-[9px] mt-1.5 font-bold uppercase" style={{ color: "var(--orange)" }}>
+                            <div className="text-[10px] mt-1.5 font-bold uppercase" style={{ color: "var(--orange)" }}>
                               recommended
                             </div>
                           )}
@@ -2372,7 +2418,7 @@ export default function Home() {
           className="fixed bottom-4 right-4 text-[12px] font-semibold px-4 py-2.5 rounded-lg"
           style={{
             background: "var(--red)",
-            color: "#fff",
+            color: "var(--text-inverse)",
             boxShadow: "0 4px 20px var(--red-glow)",
             zIndex: 60,
           }}
@@ -2596,7 +2642,10 @@ function FishingPage({ giga, addLog }: {
     gameData?.deckCardData.find((c) => c.id === id)
   );
 
-  const noHit = gameData ? shouldRedraw(gameData.hand, gameData.deckCardData, gameData.fishPosition) : false;
+  const noHit = gameData ? shouldRedraw(
+    gameData.hand, gameData.deckCardData, gameData.fishPosition,
+    gameData.previousFishPosition, gameData.nextPosition
+  ) : false;
 
   // Recommend best cast type based on energy budget and remaining casts
   const recommendedCast = (() => {
@@ -2653,9 +2702,9 @@ function FishingPage({ giga, addLog }: {
 
           {/* Cast Buttons */}
           <div className="card p-4">
-            <div className="text-[11px] font-bold uppercase tracking-wider mb-3" style={{ color: "var(--text-faint)" }}>
+            <h3 className="text-[11px] font-bold uppercase tracking-wider mb-3" style={{ color: "var(--text-faint)" }}>
               Cast Line
-            </div>
+            </h3>
             <div className="flex gap-2.5">
               {CAST_NODES.map((node) => {
                 const nodeEnergy = getNodeEnergy(node.nodeId);
@@ -2681,7 +2730,7 @@ function FishingPage({ giga, addLog }: {
                       {!disabled && <span className="ml-1">({Math.floor(energyAvailable / nodeEnergy)} casts)</span>}
                     </div>
                     {isRec && !disabled && (
-                      <div className="text-[9px] font-bold mt-0.5" style={{ color: "var(--orange)" }}>BEST</div>
+                      <div className="text-[10px] font-bold mt-0.5" style={{ color: "var(--orange)" }}>BEST</div>
                     )}
                   </button>
                 );
@@ -2699,67 +2748,98 @@ function FishingPage({ giga, addLog }: {
 
           {/* 3x3 Grid */}
           <div className="card p-4">
-            <div className="text-[11px] font-bold uppercase tracking-wider mb-3" style={{ color: "var(--text-faint)" }}>
+            <h3 className="text-[11px] font-bold uppercase tracking-wider mb-3" style={{ color: "var(--text-faint)" }}>
               Fishing Grid
-            </div>
-            <div
-              className="grid gap-1.5 mx-auto"
-              style={{ gridTemplateColumns: "repeat(3, 1fr)", maxWidth: 200 }}
-            >
-              {GRID_LABELS.flat().map((pos) => {
-                const hasFish = gameData?.fishPosition?.includes(pos);
-                const hadFish = gameData?.previousFishPosition?.includes(pos);
-                // Check which hand cards cover this position
-                const coveredBy = handCards
-                  .map((c, i) => (c?.hitZones.includes(pos) ? i : -1))
-                  .filter((i) => i >= 0);
-                const isCritZone = handCards.some((c) => c?.critZones.includes(pos) && c?.hitZones.includes(pos));
+            </h3>
+            {(() => {
+              // Convert API [col,row] coordinates to cell IDs (1-9)
+              const fishCell = gameData ? coordToCell(gameData.fishPosition) : 0;
+              const prevCell = gameData ? coordToCell(gameData.previousFishPosition) : 0;
+              const hasFintuition = gameData?.nextPosition && gameData.nextPosition.length === 2;
+              const nextCell = hasFintuition ? coordToCell(gameData!.nextPosition!) : 0;
 
-                return (
+              // Predicted cells — where the fish is GOING
+              const predicted = hasFintuition
+                ? [nextCell]
+                : gameData
+                ? predictNextPositions(fishCell, prevCell)
+                : [];
+
+              return (
+                <>
                   <div
-                    key={pos}
-                    className="relative flex items-center justify-center rounded"
-                    style={{
-                      aspectRatio: "1",
-                      background: hasFish
-                        ? "var(--orange-glow)"
-                        : hadFish
-                        ? "rgba(232, 134, 58, 0.04)"
-                        : "var(--bg-inset)",
-                      border: hasFish
-                        ? "2px solid var(--orange)"
-                        : coveredBy.length > 0
-                        ? `1px solid ${isCritZone ? "var(--gold)" : "var(--border-lite)"}`
-                        : "1px solid var(--border)",
-                      transition: "all 200ms ease",
-                    }}
+                    className="grid gap-1.5 mx-auto"
+                    style={{ gridTemplateColumns: "repeat(3, 1fr)", maxWidth: 200 }}
                   >
-                    {hasFish && (
-                      <Waves size={20} style={{ color: "var(--orange)" }} />
-                    )}
-                    <span
-                      className="absolute text-[9px] font-medium"
-                      style={{ top: 2, left: 4, color: "var(--text-faint)" }}
-                    >
-                      {pos}
-                    </span>
-                    {coveredBy.length > 0 && !hasFish && (
-                      <span className="text-[9px] font-bold" style={{ color: isCritZone ? "var(--gold)" : "var(--text-faint)" }}>
-                        {isCritZone ? "!" : "+"}
-                      </span>
-                    )}
+                    {GRID_LABELS.flat().map((pos) => {
+                      const hasFish = pos === fishCell;
+                      const isPredicted = predicted.includes(pos);
+                      // Check which hand cards cover this PREDICTED position
+                      const coveredBy = isPredicted
+                        ? handCards.map((c, i) => (c?.hitZones.includes(pos) ? i : -1)).filter((i) => i >= 0)
+                        : [];
+                      const isCritZone = isPredicted && handCards.some((c) => c?.critZones.includes(pos) && c?.hitZones.includes(pos));
+
+                      return (
+                        <div
+                          key={pos}
+                          className="relative flex items-center justify-center rounded"
+                          style={{
+                            aspectRatio: "1",
+                            background: hasFish
+                              ? "var(--orange-glow)"
+                              : isPredicted
+                              ? hasFintuition ? "rgba(100, 200, 255, 0.08)" : "rgba(232, 134, 58, 0.04)"
+                              : "var(--bg-inset)",
+                            border: hasFish
+                              ? "2px solid var(--orange)"
+                              : isPredicted && hasFintuition
+                              ? `2px solid ${isCritZone ? "var(--gold)" : "var(--blue)"}`
+                              : coveredBy.length > 0
+                              ? `1px solid ${isCritZone ? "var(--gold)" : "var(--border-lite)"}`
+                              : "1px solid var(--border)",
+                            transition: "all 200ms ease",
+                          }}
+                        >
+                          {hasFish && (
+                            <Fish size={20} style={{ color: "var(--orange)" }} />
+                          )}
+                          <span
+                            className="absolute text-[10px] font-medium"
+                            style={{ top: 2, left: 4, color: "var(--text-faint)" }}
+                          >
+                            {pos}
+                          </span>
+                          {coveredBy.length > 0 && !hasFish && (
+                            <span className="text-[10px] font-bold" style={{ color: isCritZone ? "var(--gold)" : "var(--text-faint)" }}>
+                              {isCritZone ? "!" : "+"}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
-                );
-              })}
-            </div>
-            {gameData && (
-              <div className="text-[11px] mt-3 text-center" style={{ color: "var(--text-faint)" }}>
-                Fish at: [{gameData.fishPosition.join(", ")}]
-                {gameData.previousFishPosition.length > 0 && (
-                  <span> (was [{gameData.previousFishPosition.join(", ")}])</span>
-                )}
-              </div>
-            )}
+                  {gameData && (
+                    <div className="mt-3 space-y-1.5">
+                      <div className="text-[11px] text-center" style={{ color: "var(--text-faint)" }}>
+                        Fish at cell {fishCell}
+                        {prevCell > 0 && prevCell !== fishCell && (
+                          <span> (was {prevCell})</span>
+                        )}
+                        {hasFintuition && (
+                          <span style={{ color: "var(--blue)" }}> → {nextCell}</span>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-center gap-3 text-[10px]" style={{ color: "var(--text-faint)" }}>
+                        <span><span style={{ color: "var(--orange)" }}>~</span> fish now</span>
+                        <span><span style={{ color: "var(--text-dim)" }}>+</span> predicted</span>
+                        <span><span style={{ color: "var(--gold)" }}>!</span> crit zone</span>
+                      </div>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
 
           {/* HP Bars */}
@@ -2826,69 +2906,101 @@ function FishingPage({ giga, addLog }: {
                 )}
               </div>
               <div className="flex flex-col gap-2">
-                {handCards.map((card, handIdx) => {
-                  if (!card) return null;
-                  const hitsOverlap = card.hitZones.some((z) => gameData.fishPosition.includes(z));
-                  const critOverlap = hitsOverlap && card.critZones.some((z) => gameData.fishPosition.includes(z));
-                  const hitDmg = card.hitEffects.reduce((s, e) => s + e.amount, 0);
-                  const missPenalty = card.missEffects.reduce((s, e) => s + Math.abs(e.amount), 0);
-                  const critDmg = card.critEffects.reduce((s, e) => s + e.amount, 0);
+                {(() => {
+                  // Convert coordinates to cell IDs, then predict
+                  const fishCell = coordToCell(gameData.fishPosition);
+                  const prevCell = coordToCell(gameData.previousFishPosition);
+                  const hasFintuition = gameData.nextPosition && gameData.nextPosition.length === 2;
+                  const targetPos = hasFintuition
+                    ? [coordToCell(gameData.nextPosition!)]
+                    : predictNextPositions(fishCell, prevCell);
 
-                  return (
-                    <button
-                      key={handIdx}
-                      onClick={() => playCard(handIdx)}
-                      disabled={autoFish}
-                      className="btn-press rounded-md p-3 cursor-pointer text-left"
-                      style={{
-                        background: critOverlap
-                          ? "var(--gold-glow)"
-                          : hitsOverlap
-                          ? "var(--green-glow)"
-                          : "var(--bg-inset)",
-                        border: `1px solid ${
-                          critOverlap ? "var(--gold)" : hitsOverlap ? "var(--green-dim)" : "var(--border)"
-                        }`,
-                      }}
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <span className="text-[13px] font-bold" style={{
-                            color: critOverlap ? "var(--gold)" : hitsOverlap ? "var(--green)" : "var(--text-dim)",
-                          }}>
-                            Card #{card.id}
-                          </span>
-                          <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{
-                            background: "var(--bg-raised)",
-                            color: critOverlap ? "var(--gold)" : hitsOverlap ? "var(--green)" : "var(--red)",
-                          }}>
-                            {critOverlap ? "CRIT" : hitsOverlap ? "HIT" : "MISS"}
+                  // Score each card to find the best one
+                  const scored = handCards.map((card, handIdx) => {
+                    if (!card) return { card: null, handIdx, score: -Infinity, hitsOverlap: false, critOverlap: false, coverageCount: 0 };
+                    const hitsOverlap = card.hitZones.some((z) => targetPos.includes(z));
+                    const critOverlap = hitsOverlap && card.critZones.some((z) => targetPos.includes(z));
+                    const hitDmg = card.hitEffects.reduce((s, e) => s + e.amount, 0);
+                    const missPenalty = card.missEffects.reduce((s, e) => s + Math.abs(e.amount), 0);
+                    const critDmg = card.critEffects.reduce((s, e) => s + e.amount, 0);
+                    const coverageCount = card.hitZones.filter((z) => targetPos.includes(z)).length;
+                    const score = hitsOverlap
+                      ? hitDmg + (critOverlap ? critDmg : 0) + coverageCount * 0.5
+                      : -missPenalty;
+                    return { card, handIdx, score, hitsOverlap, critOverlap, coverageCount, hitDmg, missPenalty, critDmg };
+                  });
+                  const bestIdx = scored.reduce((best, s, i) => s.score > scored[best].score ? i : best, 0);
+
+                  return scored.map((s) => {
+                    if (!s.card) return null;
+                    const card = s.card;
+                    const isBest = s.handIdx === scored[bestIdx].handIdx;
+
+                    return (
+                      <button
+                        key={s.handIdx}
+                        onClick={() => playCard(s.handIdx)}
+                        disabled={autoFish}
+                        className="btn-press rounded-md p-3 cursor-pointer text-left relative"
+                        style={{
+                          background: s.critOverlap
+                            ? "var(--gold-glow)"
+                            : s.hitsOverlap
+                            ? "var(--green-glow)"
+                            : "var(--bg-inset)",
+                          border: isBest
+                            ? `2px solid ${s.critOverlap ? "var(--gold)" : s.hitsOverlap ? "var(--green)" : "var(--text-dim)"}`
+                            : `1px solid ${s.critOverlap ? "var(--gold)" : s.hitsOverlap ? "var(--green-dim)" : "var(--border)"}`,
+                        }}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="text-[13px] font-bold" style={{
+                              color: s.critOverlap ? "var(--gold)" : s.hitsOverlap ? "var(--green)" : "var(--text-dim)",
+                            }}>
+                              Card #{card.id}
+                            </span>
+                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{
+                              background: "var(--bg-raised)",
+                              color: s.critOverlap ? "var(--gold)" : s.hitsOverlap ? "var(--green)" : "var(--red)",
+                            }}>
+                              {s.critOverlap ? "CRIT" : s.hitsOverlap ? "HIT" : "MISS"}
+                            </span>
+                            {isBest && (
+                              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded" style={{
+                                background: s.hitsOverlap ? "var(--green)" : "var(--text-dim)",
+                                color: "var(--bg)",
+                              }}>
+                                BEST
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-[11px] tabular-nums" style={{ color: "var(--blue)" }}>
+                            {card.manaCost} mana
                           </span>
                         </div>
-                        <span className="text-[11px] tabular-nums" style={{ color: "var(--blue)" }}>
-                          {card.manaCost} mana
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-3 mt-1.5">
-                        <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
-                          Hit: <span style={{ color: "var(--green)" }}>-{hitDmg}</span>
-                        </span>
-                        <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
-                          Miss: <span style={{ color: "var(--red)" }}>+{missPenalty}</span>
-                        </span>
-                        {critDmg > 0 && (
+                        <div className="flex items-center gap-3 mt-1.5">
                           <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
-                            Crit: <span style={{ color: "var(--gold)" }}>-{critDmg}</span>
+                            Hit: <span style={{ color: "var(--green)" }}>-{s.hitDmg}</span>
                           </span>
-                        )}
-                      </div>
-                      <div className="text-[10px] mt-1" style={{ color: "var(--text-faint)" }}>
-                        Zones: [{card.hitZones.join(",")}]
-                        {card.critZones.length > 0 && <span> | Crit: [{card.critZones.join(",")}]</span>}
-                      </div>
-                    </button>
-                  );
-                })}
+                          <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+                            Miss: <span style={{ color: "var(--red)" }}>+{s.missPenalty}</span>
+                          </span>
+                          {(s.critDmg ?? 0) > 0 && (
+                            <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+                              Crit: <span style={{ color: "var(--gold)" }}>-{s.critDmg}</span>
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[10px] mt-1" style={{ color: "var(--text-faint)" }}>
+                          Targets: [{card.hitZones.join(",")}]
+                          {s.hitsOverlap && <span> — covers {s.coverageCount}/{targetPos.length} predicted</span>}
+                          {card.critZones.length > 0 && <span> | Crit: [{card.critZones.join(",")}]</span>}
+                        </div>
+                      </button>
+                    );
+                  });
+                })()}
               </div>
             </div>
           )}
@@ -2898,11 +3010,11 @@ function FishingPage({ giga, addLog }: {
             <div className="card p-4" style={{
               borderColor: RARITY_FISH_COLORS[gameData.caughtFish.rarity] ?? "var(--border)",
             }}>
-              <div className="text-[11px] font-bold uppercase tracking-wider mb-2" style={{ color: "var(--text-faint)" }}>
+              <h3 className="text-[11px] font-bold uppercase tracking-wider mb-2" style={{ color: "var(--text-faint)" }}>
                 Last Catch
-              </div>
+              </h3>
               <div className="flex items-center gap-3">
-                <Waves size={24} style={{ color: RARITY_FISH_COLORS[gameData.caughtFish.rarity] ?? "var(--text)" }} />
+                <Fish size={24} style={{ color: RARITY_FISH_COLORS[gameData.caughtFish.rarity] ?? "var(--text)" }} />
                 <div>
                   <div className="text-[14px] font-bold" style={{
                     color: RARITY_FISH_COLORS[gameData.caughtFish.rarity] ?? "var(--text)",
@@ -2922,9 +3034,9 @@ function FishingPage({ giga, addLog }: {
 
           {/* Auto-Fish Controls */}
           <div className="card p-4">
-            <div className="text-[11px] font-bold uppercase tracking-wider mb-3" style={{ color: "var(--text-faint)" }}>
+            <h3 className="text-[11px] font-bold uppercase tracking-wider mb-3" style={{ color: "var(--text-faint)" }}>
               Auto-Fish
-            </div>
+            </h3>
             <div className="flex items-center gap-3 mb-3">
               <button
                 onClick={() => setAutoFish(!autoFish)}
@@ -2955,22 +3067,22 @@ function FishingPage({ giga, addLog }: {
                   title={node.nodeId === "auto" ? "Automatically picks the best cast type based on your energy and remaining daily casts" : undefined}
                 >
                   {node.label}
-                  {node.nodeId === "auto" && <span className="ml-1 text-[9px]" style={{ color: "var(--green)" }}>({CAST_NODES.find(n => n.nodeId === recommendedCast)?.label})</span>}
+                  {node.nodeId === "auto" && <span className="ml-1 text-[10px]" style={{ color: "var(--green)" }}>({CAST_NODES.find(n => n.nodeId === recommendedCast)?.label})</span>}
                 </button>
               ))}
             </div>
 
             {/* Session Stats */}
-            <div className="grid grid-cols-4 gap-2 mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
               {[
-                { label: "Casts", value: sessionStats.casts, color: "var(--text)" },
-                { label: "Caught", value: sessionStats.caught, color: "var(--green)" },
-                { label: "Escaped", value: sessionStats.escaped, color: "var(--red)" },
-                { label: "Seaweed", value: sessionStats.seaweed, color: "var(--green)" },
+                { label: "Casts", value: fmt(sessionStats.casts), color: "var(--text)" },
+                { label: "Caught", value: fmt(sessionStats.caught), color: "var(--green)" },
+                { label: "Escaped", value: fmt(sessionStats.escaped), color: "var(--red)" },
+                { label: "Seaweed", value: fmt(sessionStats.seaweed), color: "var(--green)" },
               ].map((stat) => (
                 <div key={stat.label} className="text-center">
-                  <div className="text-[10px] font-bold uppercase" style={{ color: "var(--text-faint)" }}>{stat.label}</div>
-                  <div className="text-[16px] font-bold tabular-nums" style={{ color: stat.color }}>{stat.value}</div>
+                  <div className="text-[11px] font-bold uppercase" style={{ color: "var(--text-faint)" }}>{stat.label}</div>
+                  <div className="text-[18px] font-bold tabular-nums" style={{ color: stat.color }}>{stat.value}</div>
                 </div>
               ))}
             </div>
@@ -2979,9 +3091,9 @@ function FishingPage({ giga, addLog }: {
           {/* Fish Inventory + Sell */}
           <div className="card p-4">
             <div className="flex items-center justify-between mb-3">
-              <div className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
+              <h3 className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
                 Fish Stall
-              </div>
+              </h3>
               {(() => {
                 const rates = fs?.exchangeRates || [];
                 const balMap = giga.itemBalances;
@@ -3094,9 +3206,9 @@ function FishingPage({ giga, addLog }: {
 
           {/* Fishing Log */}
           <div className="card p-4" style={{ maxHeight: 260, display: "flex", flexDirection: "column" }}>
-            <div className="text-[11px] font-bold uppercase tracking-wider mb-2" style={{ color: "var(--text-faint)" }}>
+            <h3 className="text-[11px] font-bold uppercase tracking-wider mb-2" style={{ color: "var(--text-faint)" }}>
               Log
-            </div>
+            </h3>
             <div className="flex-1 overflow-y-auto log-area" style={{ minHeight: 0 }}>
               {fishingLog.length === 0 ? (
                 <div className="text-[12px]" style={{ color: "var(--text-faint)" }}>No activity yet</div>
@@ -3191,9 +3303,9 @@ function WorldPage({ giga, addLog, eng }: {
 
   return (
     <div className="anim-in space-y-6">
-      <h2 className="text-[16px] font-bold">Pots & Chests</h2>
+      <h2 className="text-[18px] font-bold">Pots & Chests</h2>
 
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         {items.map((item) => {
           const cd = getCooldownInfo(item.id);
           const juiceLocked = item.needsJuice && !isJuiced;
@@ -3231,7 +3343,7 @@ function WorldPage({ giga, addLog, eng }: {
                 style={{
                   background: disabled ? "var(--bg-inset)" : `linear-gradient(135deg, ${item.color}, var(--bg-raised))`,
                   border: disabled ? "1px solid var(--border)" : "none",
-                  color: disabled ? "var(--text-faint)" : "#fff",
+                  color: disabled ? "var(--text-faint)" : "var(--text-inverse)",
                   boxShadow: disabled ? "none" : `0 3px 12px color-mix(in srgb, ${item.color} 30%, transparent)`,
                 }}
               >

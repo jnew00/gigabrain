@@ -369,9 +369,12 @@ export function useGigaverse() {
         // Only update fishing token ref if not in auto-battle — the fishing
         // state endpoint returns a stale token that clobbers the current one
         if (fs.actionToken && !autoBattleRef.current) {
+          console.log(`[TOKEN] refreshAll fishing → clobbering token from ${actionTokenRef.current} to ${fs.actionToken}`);
           setFishingActionToken(fs.actionToken);
           fishingActionTokenRef.current = fs.actionToken;
           actionTokenRef.current = fs.actionToken;
+        } else if (fs.actionToken && autoBattleRef.current) {
+          console.log(`[TOKEN] refreshAll fishing → SKIPPED (autoBattle=true), would have set ${fs.actionToken}`);
         }
       }
     } catch {
@@ -390,6 +393,7 @@ export function useGigaverse() {
   const performAction = useCallback(
     async (action: DungeonAction, dungeonId: number = 0) => {
       if (!token) return null;
+      console.log(`[TOKEN] performAction(${action}) sending token=${actionTokenRef.current}`);
       try {
         const result = await proxy<DungeonActionResponse>(
           "/api/game/dungeon/action",
@@ -411,6 +415,7 @@ export function useGigaverse() {
         if (result) {
           setDungeonState(result);
           if (result.actionToken) {
+            console.log(`[TOKEN] performAction(${action}) OK → new token=${result.actionToken}`);
             setActionToken(result.actionToken);
             actionTokenRef.current = result.actionToken;
             fishingActionTokenRef.current = result.actionToken;
@@ -419,11 +424,21 @@ export function useGigaverse() {
         return result;
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Action failed";
-        // Recover actionToken from error response — server rotates even on failure
         const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
         if (respData?.actionToken) {
+          console.log(`[TOKEN] performAction(${action}) FAILED → recovered token=${respData.actionToken} from error response`);
           actionTokenRef.current = respData.actionToken;
           fishingActionTokenRef.current = respData.actionToken;
+        } else {
+          console.log(`[TOKEN] performAction(${action}) FAILED → NO token in error response, fetching fresh state`);
+          try {
+            const fresh = await proxy<DungeonActionResponse>("/api/game/dungeon/state", token);
+            if (fresh?.actionToken) {
+              console.log(`[TOKEN] recovered from fetchState → token=${fresh.actionToken}`);
+              actionTokenRef.current = fresh.actionToken;
+              fishingActionTokenRef.current = fresh.actionToken;
+            }
+          } catch { /* ignore */ }
         }
         setError(msg);
         return null;
@@ -435,10 +450,12 @@ export function useGigaverse() {
   /** Fetch fresh dungeon state directly (bypasses async React state) */
   const fetchDungeonState = useCallback(async () => {
     if (!token) return null;
+    console.log(`[TOKEN] fetchDungeonState (current ref=${actionTokenRef.current})`);
     try {
       const ds = await proxy<DungeonActionResponse>("/api/game/dungeon/state", token);
       setDungeonState(ds);
       if (ds.actionToken) {
+        console.log(`[TOKEN] fetchDungeonState → new token=${ds.actionToken}`);
         setActionToken(ds.actionToken);
         actionTokenRef.current = ds.actionToken;
         fishingActionTokenRef.current = ds.actionToken;
@@ -454,6 +471,7 @@ export function useGigaverse() {
       if (!token) return null;
       setLoading(true);
       setError(null);
+      console.log(`[TOKEN] startRun sending token=${actionTokenRef.current}`);
       try {
         const result = await proxy<DungeonActionResponse>(
           "/api/game/dungeon/action",
@@ -569,7 +587,11 @@ export function useGigaverse() {
       if (state.actionToken) {
         setFishingActionToken(state.actionToken);
         fishingActionTokenRef.current = state.actionToken;
-        actionTokenRef.current = state.actionToken;
+        // Only update shared actionTokenRef if not in auto-battle — the fishing
+        // state endpoint returns a stale token that clobbers the current one
+        if (!autoBattleRef.current) {
+          actionTokenRef.current = state.actionToken;
+        }
       }
       return state;
     } catch (e) {
@@ -591,6 +613,22 @@ export function useGigaverse() {
           { action: a, actionToken: tkn, data: d }
         );
         if (result) {
+          const gd = result.data.doc.data;
+          if (gd) {
+            console.log("[FISH-DEBUG] raw API →", JSON.stringify({
+              fishPosition: gd.fishPosition,
+              previousFishPosition: gd.previousFishPosition,
+              nextPosition: gd.nextPosition,
+              fishHp: gd.fishHp,
+              fishMaxHp: gd.fishMaxHp,
+              hand: gd.hand,
+              caughtFish: gd.caughtFish ?? null,
+            }));
+            if (gd.caughtFish) {
+              console.log("[FISH-DEBUG] full caughtFish →", JSON.stringify(gd.caughtFish));
+              console.log("[FISH-DEBUG] full response doc →", JSON.stringify(result.data.doc));
+            }
+          }
           setFishingState((prev) => ({
             ...prev!,
             gameState: result.data.doc,

@@ -7,6 +7,7 @@
   --bg-raised-hover: #1e1d1b;
   --bg-inset: #080807;
   --bg-card: #1a1918;
+  --bg-overlay: rgba(13, 12, 11, 0.7);
 
   /* Borders */
   --border: #262422;
@@ -16,7 +17,8 @@
   /* Text — higher contrast range */
   --text: #f2ede7;
   --text-dim: #a8a29e;
-  --text-faint: #5c5752;
+  --text-faint: #8a8480;
+  --text-inverse: #fff;
 
   /* Accents */
   --orange: #e8863a;
@@ -26,9 +28,12 @@
   --green: #4ade80;
   --green-dim: #22c55e;
   --green-glow: rgba(74, 222, 128, 0.1);
+  --green-border: rgba(74, 222, 128, 0.25);
   --red: #f87171;
   --red-dim: #ef4444;
+  --red-dark: #7f1d1d;
   --red-glow: rgba(248, 113, 113, 0.1);
+  --red-border: rgba(248, 113, 113, 0.2);
   --blue: #60a5fa;
   --blue-dim: #3b82f6;
   --blue-glow: rgba(96, 165, 250, 0.1);
@@ -141,9 +146,16 @@ textarea::placeholder { color: var(--text-faint); }
 
 /* ─── Focus ─────────────────────────────────────────────── */
 
-textarea:focus {
+:focus-visible {
+  outline: 2px solid var(--orange);
+  outline-offset: 2px;
+}
+
+/* Inputs/textareas get a subtler glow instead of outline */
+textarea:focus-visible,
+input:focus-visible {
   outline: none;
-  border-color: var(--orange-dim) !important;
+  border-color: var(--orange-dim);
   box-shadow: 0 0 0 3px var(--orange-glow);
 }
 
@@ -157,13 +169,13 @@ textarea:focus {
 /* ─── Vital bar gradient ────────────────────────────────── */
 
 .bar-hp {
-  background: linear-gradient(90deg, #16a34a, #4ade80);
+  background: linear-gradient(90deg, var(--green-dim), var(--green));
 }
 .bar-shield {
-  background: linear-gradient(90deg, #2563eb, #60a5fa);
+  background: linear-gradient(90deg, var(--blue-dim), var(--blue));
 }
 .bar-energy {
-  background: linear-gradient(90deg, #b45309, #e8863a);
+  background: linear-gradient(90deg, var(--orange-dim), var(--orange));
 }
 
 /* ─── Flyout panel ─────────────────────────────────────── */
@@ -184,4 +196,79 @@ textarea:focus {
 
 .flyout-backdrop {
   animation: flyout-backdrop-in 0.2s ease both;
+}
+
+/* ─── Mobile layout ────────────────────────────────────── */
+
+@media (max-width: 767px) {
+  /* Header: compact on mobile */
+  .hud-bar {
+    height: 56px !important;
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+  }
+  .hud-detail { display: none !important; }
+
+  /* Nav rail → bottom bar */
+  .nav-rail {
+    position: fixed !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    top: auto !important;
+    width: 100% !important;
+    height: 60px !important;
+    flex-direction: row !important;
+    justify-content: space-around !important;
+    align-items: center !important;
+    padding: 0 4px !important;
+    gap: 0 !important;
+    border-right: none !important;
+    border-top: 1px solid var(--border) !important;
+    z-index: 50;
+    overflow: visible !important;
+  }
+  .nav-rail button {
+    width: 48px !important;
+    height: 48px !important;
+    padding: 0 !important;
+    justify-content: center !important;
+    margin: 0 !important;
+  }
+  .nav-rail-hide { display: none !important; }
+  .nav-label { display: none !important; }
+
+  /* Body layout adjusts for bottom nav */
+  .body-layout {
+    padding-bottom: 60px !important;
+  }
+
+  /* Flyout: full width on mobile */
+  .flyout-panel {
+    left: 0 !important;
+    width: 100% !important;
+    top: 56px !important;
+  }
+
+  /* Main content: tighter padding */
+  .main-content {
+    padding: 16px !important;
+  }
+}
+
+/* ─── Tablet tweaks ────────────────────────────────────── */
+
+@media (min-width: 768px) and (max-width: 1023px) {
+  .hud-detail-secondary { display: none !important; }
+}
+
+/* ─── Reduced motion ───────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

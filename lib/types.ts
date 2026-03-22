@@ -478,6 +478,7 @@ export type DungeonAction =
   | "loot_one"
   | "loot_two"
   | "loot_three"
+  | "loot_four"
   | "use_item";
 
 export interface DungeonActionPayload {

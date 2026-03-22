@@ -1,144 +1,216 @@
 import type { FishingCard } from "./types";
 
-/* ─── 3x3 Grid Adjacency ──────────────────────────────────── */
+/* ─── 3x3 Grid Layout ────────────────────────────────────────
+   Cell IDs:
+   1 2 3
+   4 5 6
+   7 8 9
 
-// Grid layout:
-// 1 2 3
-// 4 5 6
-// 7 8 9
+   API coordinates are [col, row] where col=1-3, row=1-3
+   row 1 = top, row 3 = bottom
+   ──────────────────────────────────────────────────────────── */
 
-// Row/col for each position
+/** Convert API [col, row] coordinate to cell ID (1-9) */
+export function coordToCell(coord: number[]): number {
+  if (coord.length !== 2) return 0;
+  const [col, row] = coord;
+  return (row - 1) * 3 + col;
+}
+
 const POS_ROW: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: 1, 7: 2, 8: 2, 9: 2 };
 const POS_COL: Record<number, number> = { 1: 0, 2: 1, 3: 2, 4: 0, 5: 1, 6: 2, 7: 0, 8: 1, 9: 2 };
 
-/** Get all positions reachable from `pos` within `distance` steps (Manhattan distance) */
-function getReachable(pos: number, distance: number): number[] {
+/* ─── Movement Pattern Detection ──────────────────────────── */
+
+// Fish follow one of 3 deterministic patterns per encounter:
+// 1. Orthogonal: moves 1 cell up/down/left/right (never diagonal)
+// 2. Diagonal:   moves diagonally (like a chess bishop)
+// 3. Plus/Cross: stays on the cross cells (2,4,5,6,8)
+
+type MovementPattern = "orthogonal" | "diagonal" | "plus";
+
+const CROSS_CELLS = new Set([2, 4, 5, 6, 8]);
+
+/** Orthogonal neighbors (up/down/left/right, 1 step) */
+function orthogonalNeighbors(pos: number): number[] {
   const r = POS_ROW[pos], c = POS_COL[pos];
   const result: number[] = [];
   for (let p = 1; p <= 9; p++) {
     const dr = Math.abs(POS_ROW[p] - r);
     const dc = Math.abs(POS_COL[p] - c);
-    // Manhattan distance, but fish likely moves in grid steps (adjacent including diagonal)
-    // Chebyshev distance (king moves) is more appropriate for grid movement
-    if (Math.max(dr, dc) <= distance && p !== pos) {
-      result.push(p);
-    }
+    if ((dr + dc) === 1) result.push(p);
   }
   return result;
 }
 
-/** Predict likely next positions based on current + previous position and move distance */
-export function predictNextPositions(
-  fishPosition: number[],
-  previousFishPosition: number[],
-  moveDistance: number = 1
-): number[] {
-  if (fishPosition.length === 0) return [1, 2, 3, 4, 5, 6, 7, 8, 9];
+/** Diagonal neighbors (1 step diagonally) */
+function diagonalNeighbors(pos: number): number[] {
+  const r = POS_ROW[pos], c = POS_COL[pos];
+  const result: number[] = [];
+  for (let p = 1; p <= 9; p++) {
+    const dr = Math.abs(POS_ROW[p] - r);
+    const dc = Math.abs(POS_COL[p] - c);
+    if (dr === 1 && dc === 1) result.push(p);
+  }
+  return result;
+}
 
-  // Get all reachable from each current fish position
-  const reachable = new Set<number>();
-  for (const pos of fishPosition) {
-    for (const r of getReachable(pos, moveDistance)) {
-      reachable.add(r);
+/** Plus/cross pattern neighbors: orthogonal moves but constrained to cross cells */
+function plusNeighbors(pos: number): number[] {
+  return orthogonalNeighbors(pos).filter((p) => CROSS_CELLS.has(p));
+}
+
+/** Get reachable positions for a given pattern */
+function getReachableForPattern(cell: number, pattern: MovementPattern): number[] {
+  const neighborFn =
+    pattern === "orthogonal" ? orthogonalNeighbors :
+    pattern === "diagonal" ? diagonalNeighbors :
+    plusNeighbors;
+  return neighborFn(cell).filter((n) => n !== cell);
+}
+
+/**
+ * Detect which movement pattern the fish is likely following based on
+ * observed movement from previousPosition → currentPosition.
+ * Returns a weight map (higher = more likely).
+ */
+function detectPatternWeights(
+  prevCell: number,
+  currCell: number
+): Record<MovementPattern, number> {
+  const weights: Record<MovementPattern, number> = {
+    orthogonal: 1,
+    diagonal: 1,
+    plus: 1,
+  };
+
+  if (!prevCell || !currCell || prevCell === currCell) {
+    // No useful movement — equal weights, slight bias toward orthogonal
+    weights.orthogonal = 1.2;
+    return weights;
+  }
+
+  const dr = POS_ROW[currCell] - POS_ROW[prevCell];
+  const dc = POS_COL[currCell] - POS_COL[prevCell];
+  const absDr = Math.abs(dr);
+  const absDc = Math.abs(dc);
+
+  // Orthogonal move (exactly 1 step in cardinal direction)
+  if ((absDr + absDc) === 1) {
+    weights.orthogonal = 5;
+    weights.diagonal = 0.1;
+    // Plus pattern also moves orthogonally, but only on cross cells
+    if (CROSS_CELLS.has(prevCell) && CROSS_CELLS.has(currCell)) {
+      weights.plus = 3;
+    } else {
+      weights.plus = 0.1;
+    }
+  }
+  // Diagonal move (1 step diagonally)
+  else if (absDr === 1 && absDc === 1) {
+    weights.diagonal = 5;
+    weights.orthogonal = 0.1;
+    weights.plus = 0.1;
+  }
+
+  return weights;
+}
+
+/**
+ * Predict where the fish will move next, considering all 3 movement patterns
+ * weighted by likelihood from observed movement history.
+ *
+ * Takes cell IDs (1-9), returns cell IDs sorted by likelihood (most likely first).
+ */
+export function predictNextPositions(
+  currentCell: number,
+  previousCell: number,
+): number[] {
+  if (!currentCell) return [1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+  const weights = detectPatternWeights(previousCell, currentCell);
+
+  // Score each potential next position by summing pattern weights
+  const posScores = new Map<number, number>();
+  const patterns: MovementPattern[] = ["orthogonal", "diagonal", "plus"];
+
+  for (const pattern of patterns) {
+    const w = weights[pattern];
+    if (w <= 0) continue;
+    const reachable = getReachableForPattern(currentCell, pattern);
+    for (const pos of reachable) {
+      posScores.set(pos, (posScores.get(pos) ?? 0) + w);
     }
   }
 
-  // If we have previous position, the fish tends to continue in the same direction
-  // (momentum heuristic) — weight those positions higher
-  if (previousFishPosition.length > 0 && fishPosition.length > 0) {
-    const dr = POS_ROW[fishPosition[0]] - POS_ROW[previousFishPosition[0]];
-    const dc = POS_COL[fishPosition[0]] - POS_COL[previousFishPosition[0]];
+  // Apply momentum bonus
+  if (previousCell && previousCell !== currentCell) {
+    const dr = POS_ROW[currentCell] - POS_ROW[previousCell];
+    const dc = POS_COL[currentCell] - POS_COL[previousCell];
     if (dr !== 0 || dc !== 0) {
-      // Project momentum: where would it go if continuing same direction?
-      const nextR = POS_ROW[fishPosition[0]] + dr;
-      const nextC = POS_COL[fishPosition[0]] + dc;
-      // Find the position at that row/col
+      const nextR = POS_ROW[currentCell] + dr;
+      const nextC = POS_COL[currentCell] + dc;
       for (let p = 1; p <= 9; p++) {
         if (POS_ROW[p] === nextR && POS_COL[p] === nextC) {
-          // Return momentum position first (highest priority)
-          const others = Array.from(reachable).filter((r) => r !== p);
-          return [p, ...others];
+          posScores.set(p, (posScores.get(p) ?? 0) + 2);
+          break;
         }
       }
     }
   }
 
-  return Array.from(reachable);
+  // Sort by score descending
+  return Array.from(posScores.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([pos]) => pos);
 }
 
 /* ─── Card Scoring ─────────────────────────────────────────── */
 
+/**
+ * Score a card against TARGET cell IDs (where the fish is expected to be).
+ * Cards resolve AFTER the fish moves, so we score against predicted/Fintuition
+ * positions, not where the fish currently sits.
+ */
 function scoreCard(
   card: FishingCard,
-  fishPosition: number[]
-): { score: number; isHit: boolean; isCrit: boolean; hitDmg: number; missPenalty: number; critDmg: number } {
-  const isHit = card.hitZones.some((z) => fishPosition.includes(z));
-  const isCrit = isHit && card.critZones.some((z) => fishPosition.includes(z));
+  targetCells: number[]
+): { score: number; isHit: boolean; isCrit: boolean; hitDmg: number; missPenalty: number; critDmg: number; coverageCount: number } {
+  const isHit = card.hitZones.some((z) => targetCells.includes(z));
+  const isCrit = isHit && card.critZones.some((z) => targetCells.includes(z));
 
   const hitDmg = card.hitEffects.reduce((sum, e) => sum + e.amount, 0);
   const missPenalty = card.missEffects.reduce((sum, e) => sum + Math.abs(e.amount), 0);
   const critDmg = card.critEffects.reduce((sum, e) => sum + e.amount, 0);
 
+  const coverageCount = card.hitZones.filter((z) => targetCells.includes(z)).length;
+  const critCount = card.critZones.filter((z) => targetCells.includes(z)).length;
+
   let score: number;
   if (isHit) {
-    score = hitDmg + (isCrit ? critDmg : 0);
+    score = hitDmg + (isCrit ? critDmg : 0) + coverageCount * 0.5 + critCount * 0.3;
   } else {
     score = -missPenalty;
   }
 
-  return { score, isHit, isCrit, hitDmg, missPenalty, critDmg };
-}
-
-/**
- * Score a card considering both current fish position AND predicted next positions.
- * When the card misses the current position, we factor in how likely it is to hit
- * the fish's next position (since the fish moves after we play).
- */
-function scoreCardWithPrediction(
-  card: FishingCard,
-  fishPosition: number[],
-  predictedPositions: number[]
-): { score: number; isHit: boolean; isCrit: boolean; hitDmg: number; missPenalty: number; critDmg: number; futureHitChance: number } {
-  const base = scoreCard(card, fishPosition);
-
-  // If it's already a hit, no need for prediction
-  if (base.isHit) {
-    return { ...base, futureHitChance: 1 };
-  }
-
-  // Card misses current position — how well does it cover predicted next positions?
-  // This matters because the fish moves AFTER we play, and our card resolves against
-  // the NEW position. Wait — actually from the API, the card resolves against the
-  // position AT TIME OF PLAY. The fish moves as a separate event.
-  // So prediction helps us decide: if we must miss now, pick the card that's most
-  // likely to hit NEXT round (since it'll be drawn again or similar cards remain).
-  //
-  // But more practically: when ALL cards miss, pick the one with:
-  // 1. Lowest miss penalty (least damage to us)
-  // 2. Best coverage of predicted positions (tiebreaker for future value)
-  const futureHits = predictedPositions.filter((p) => card.hitZones.includes(p)).length;
-  const futureHitChance = predictedPositions.length > 0 ? futureHits / predictedPositions.length : 0;
-
-  // Adjust score: less penalty if card covers future positions well
-  // (small bonus, doesn't override "lowest penalty" priority)
-  return {
-    ...base,
-    score: base.score + futureHitChance * 0.5,
-    futureHitChance,
-  };
+  return { score, isHit, isCrit, hitDmg, missPenalty, critDmg, coverageCount };
 }
 
 /* ─── Main Exports ─────────────────────────────────────────── */
 
 /**
- * Pick the best card from hand given fish position, movement history, and Fintuition data.
+ * Pick the best card from hand to play.
+ *
+ * Key insight: the fish ALWAYS moves before the card resolves.
+ * So we target where the fish is GOING, not where it IS.
+ *
+ * All position params are API [col, row] coordinates — converted to cell IDs internally.
  *
  * Strategy:
- * 1. If any card CRITS current position → play it
- * 2. If any card HITS current position → play highest damage
- * 3. If ALL miss current position BUT Fintuition reveals nextPosition:
- *    → pick the card that HITS the next position (fish moves there after we play)
- * 4. If all miss and no Fintuition → lowest miss penalty, tiebreak by predicted coverage
+ * 1. With Fintuition (nextPosition) → score cards against exact next cell
+ * 2. Without Fintuition → detect movement pattern, predict next cells
+ * 3. Play the highest-scoring card (crit > hit > best coverage)
+ * 4. If nothing covers predicted cells → lowest miss penalty
  */
 export function pickBestCard(
   hand: number[],
@@ -156,96 +228,66 @@ export function pickBestCard(
     cardLookup.set(c.id, c);
   }
 
-  // Use Fintuition's nextPosition if available, otherwise predict from movement
-  const fintuitionPos = nextPosition && nextPosition.length > 0 ? nextPosition : null;
-  const predicted = fintuitionPos
-    ?? (previousFishPosition ? predictNextPositions(fishPosition, previousFishPosition) : []);
+  // Convert API coordinates to cell IDs
+  const currentCell = coordToCell(fishPosition);
+  const prevCell = previousFishPosition ? coordToCell(previousFishPosition) : 0;
 
-  // First pass: score all cards against CURRENT fish position
+  // Determine target cells — where the fish is GOING
+  const hasFintuition = nextPosition && nextPosition.length === 2;
+  const targetCells = hasFintuition
+    ? [coordToCell(nextPosition)]
+    : predictNextPositions(currentCell, prevCell);
+
+  // Score all cards against target cells
   const scores = hand.map((cardId, i) => {
     const card = cardLookup.get(cardId);
     if (!card) return { index: i, cardId, score: -Infinity, reason: "unknown card", isHit: false };
-    const result = scoreCardWithPrediction(card, fishPosition, predicted);
+
+    const result = scoreCard(card, targetCells);
+    const source = hasFintuition ? "Fintuition" : "predicted";
     let reason: string;
     if (result.isCrit) {
-      reason = `CRIT #${cardId} (${result.hitDmg}+${result.critDmg} dmg)`;
+      reason = `${source} CRIT #${cardId} (${result.hitDmg}+${result.critDmg} dmg)`;
     } else if (result.isHit) {
-      reason = `HIT #${cardId} (${result.hitDmg} dmg)`;
+      reason = `${source} HIT #${cardId} (${result.hitDmg} dmg, covers ${result.coverageCount}/${targetCells.length})`;
     } else {
-      reason = `MISS #${cardId} (-${result.missPenalty})`;
+      reason = `MISS #${cardId} (-${result.missPenalty} mana)`;
     }
     return { index: i, cardId, score: result.score, reason, isHit: result.isHit };
   });
 
-  // Check if any card hits current position
-  const anyHit = scores.some((s) => s.isHit);
-
-  if (anyHit) {
-    // Play the best hitting card
-    const best = scores.reduce((a, b) => (b.score > a.score ? b : a));
-    return { handIndex: best.index, reason: best.reason };
-  }
-
-  // No card hits current position — use Fintuition if available
-  if (fintuitionPos) {
-    // Score cards against the NEXT position (Fintuition tells us exactly where fish goes)
-    let bestFutureIndex = 0;
-    let bestFutureScore = -Infinity;
-    let bestFutureReason = "";
-
-    for (let i = 0; i < hand.length; i++) {
-      const card = cardLookup.get(hand[i]);
-      if (!card) continue;
-      const futureResult = scoreCard(card, fintuitionPos);
-      if (futureResult.isHit && futureResult.score > bestFutureScore) {
-        bestFutureScore = futureResult.score;
-        bestFutureIndex = i;
-        bestFutureReason = futureResult.isCrit
-          ? `Fintuition CRIT #${hand[i]} → fish moving to [${fintuitionPos}] (${futureResult.hitDmg}+${futureResult.critDmg} dmg)`
-          : `Fintuition HIT #${hand[i]} → fish moving to [${fintuitionPos}] (${futureResult.hitDmg} dmg)`;
-      }
-    }
-
-    // If a card can hit the next position, that's a strategic miss now for a guaranteed hit next
-    // But wait — the card resolves against current position, not next. So playing a card that
-    // covers nextPosition means it will miss NOW but we're choosing the "best miss".
-    // Actually, we should just pick lowest penalty miss since the card resolves against current pos.
-    // The Fintuition value is: if we must miss, pick the miss card that also covers next pos,
-    // so when fish moves there and we draw a similar card, we're set up.
-    // More importantly: if ALL cards miss, just pick lowest penalty.
-    // Fintuition's real value is knowing the next position for the NEXT card play.
-    if (bestFutureScore > 0) {
-      // There's a card that covers the next position — prefer it as tiebreaker
-      // but still prioritize lowest miss penalty
-      const lowestPenalty = scores.reduce((a, b) => (b.score > a.score ? b : a));
-      // If the future-covering card has similar penalty, prefer it
-      const futureCard = scores[bestFutureIndex];
-      if (futureCard && Math.abs(futureCard.score - lowestPenalty.score) <= 1) {
-        return { handIndex: bestFutureIndex, reason: bestFutureReason };
-      }
-    }
-  }
-
-  // All miss, no useful Fintuition — pick lowest penalty
+  // Play the highest-scoring card
   const best = scores.reduce((a, b) => (b.score > a.score ? b : a));
   return { handIndex: best.index, reason: best.reason };
 }
 
 /**
- * Returns true if no card in hand can hit the fish at its current position.
+ * Returns true if no card in hand can hit any of the predicted next cells.
+ * This means we should redraw the hand (costs 1 mana per card).
+ *
+ * All position params are API [col, row] coordinates.
  */
 export function shouldRedraw(
   hand: number[],
   deckCardData: FishingCard[],
-  fishPosition: number[]
+  fishPosition: number[],
+  previousFishPosition?: number[],
+  nextPosition?: number[] | null
 ): boolean {
   const cardLookup = new Map<number, FishingCard>();
   for (const c of deckCardData) cardLookup.set(c.id, c);
 
+  const currentCell = coordToCell(fishPosition);
+  const prevCell = previousFishPosition ? coordToCell(previousFishPosition) : 0;
+  const hasFintuition = nextPosition && nextPosition.length === 2;
+  const targetCells = hasFintuition
+    ? [coordToCell(nextPosition)]
+    : predictNextPositions(currentCell, prevCell);
+
   for (const cardId of hand) {
     const card = cardLookup.get(cardId);
     if (!card) continue;
-    if (card.hitZones.some((z) => fishPosition.includes(z))) return false;
+    if (card.hitZones.some((z) => targetCells.includes(z))) return false;
   }
   return true;
 }

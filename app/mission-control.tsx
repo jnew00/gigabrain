@@ -137,6 +137,10 @@ function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function fmt(n: number): string {
+  return n.toLocaleString();
+}
+
 function statusIcon(status: StepStatus): string {
   switch (status) {
     case "pending": return "\u25CB";  // gray circle
@@ -167,7 +171,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
   const [executing, setExecuting] = useState(false);
   const [steps, setSteps] = useState<ExecutionStep[]>([]);
   const [summary, setSummary] = useState<string | null>(null);
-  const [mcLog, setMcLog] = useState<string[]>([]);
+  const [mcLog, setMcLog] = useState<{ id: number; text: string }[]>([]);
+  const mcLogIdRef = useRef(0);
   const [showLog, setShowLog] = useState(false);
   const mcLogRef = useRef<HTMLDivElement>(null);
 
@@ -419,6 +424,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
     setExecuting(true);
     setSummary(null);
     setMcLog([]);
+    mcLogIdRef.current = 0;
     setShowLog(true);
     gigaRef.current.autoBattleRef.current = true;
 
@@ -427,17 +433,19 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
     // Log to both parent log and local MC log panel
     const log = (msg: string) => {
       addLog(msg);
-      setMcLog((prev) => [...prev, `${new Date().toLocaleTimeString("en", { hour12: false })} ${msg}`]);
+      const id = ++mcLogIdRef.current;
+      const text = `${new Date().toLocaleTimeString("en", { hour12: false })} ${msg}`;
+      setMcLog((prev) => [...prev, { id, text }]);
     };
 
     // Build step list
     const stepList: ExecutionStep[] = [];
     if (freeActions.claimRomResources && (totalRomS > 0 || totalRomD > 0))
-      stepList.push({ id: "claim-roms", label: "Claim ROM shards & dust", status: "pending", detail: `${totalRomS}S / ${totalRomD}D` });
+      stepList.push({ id: "claim-roms", label: "Claim ROM shards & dust", status: "pending", detail: `${fmt(totalRomS)}S / ${fmt(totalRomD)}D` });
     if (freeActions.romEnergyMode === "convert" && totalRomE > 0)
-      stepList.push({ id: "convert-energy", label: "Convert ROM energy to dust", status: "pending", detail: `${totalRomE}E` });
+      stepList.push({ id: "convert-energy", label: "Convert ROM energy to dust", status: "pending", detail: `${fmt(totalRomE)}E` });
     if (freeActions.romEnergyMode === "claim" && totalRomE > 0)
-      stepList.push({ id: "claim-energy", label: "Claim ROM energy", status: "pending", detail: `${totalRomE}E` });
+      stepList.push({ id: "claim-energy", label: "Claim ROM energy", status: "pending", detail: `${fmt(totalRomE)}E` });
     if (freeActions.openChests && chestsReady)
       stepList.push({ id: "open-chests", label: "Open chests", status: "pending", detail: "" });
     if (freeActions.breakPots && potsActuallyReady)
@@ -454,7 +462,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
       stepList.push({ id: "fishing", label: `Fishing ${fishingAlloc.castLabel} x${fishingAlloc.casts}`, status: "pending", detail: `${fishingAlloc.casts * fishingAlloc.castCost}E` });
     }
     if (freeActions.sellFish && fishStallInfo.totalCount > 0) {
-      stepList.push({ id: "sell-fish", label: `Sell +50% fish`, status: "pending", detail: `${fishStallInfo.totalCount} fish` });
+      stepList.push({ id: "sell-fish", label: `Sell +50% fish`, status: "pending", detail: `${fmt(fishStallInfo.totalCount)} fish` });
     }
 
     setSteps(stepList);
@@ -479,7 +487,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             try {
               const r = await g().claimRom(rom.docId, t);
               if (r?.success) { count++; log(`claimed ${t} #${fStats.serialNumber}`); }
-            } catch { /* skip */ }
+            } catch { /* already claimed or rate limited */ }
             await delay(200);
           }
         }
@@ -498,7 +506,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           try {
             const r = await g().claimRom(rom.docId, "energy");
             if (r?.success) { count++; log(`claimed energy #${rom.factoryStats.serialNumber}`); }
-          } catch { /* skip */ }
+          } catch { /* already claimed or rate limited */ }
           await delay(200);
         }
         updateStep("claim-energy", { status: cancelRef.current ? "skipped" : "done", detail: `${count} ROMs` });
@@ -516,7 +524,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           try {
             const r = await g().convertEnergyToDust(rom.docId, amt);
             if (r?.success) { total += amt; log(`converted ${amt}E #${rom.factoryStats.serialNumber}`); }
-          } catch { /* skip */ }
+          } catch { /* conversion may fail if energy was already claimed */ }
           await delay(200);
         }
         updateStep("convert-energy", { status: cancelRef.current ? "skipped" : "done", detail: `${total}E converted` });
@@ -609,7 +617,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
           const result = await g().performAction(action);
           if (!result) {
-            log(`Action failed during stuck run`);
+            log(`Action failed during stuck run, recovering...`);
+            const fresh = await g().fetchDungeonState();
+            if (fresh) { s = fresh; await delay(150); continue; }
             break;
           }
           s = result;
@@ -679,7 +689,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                 updateStep(stepId, { detail: `Run ${run + 1}/${alloc.runs} — Room ${curRoom}` });
               }
 
-              if (battleState.message === "Run Complete") {
+              if (battleState.message === "Run Complete" && !battleState.data?.run?.lootPhase) {
                 complete = true;
                 runResults.push(String(curRoom));
                 log(`${alloc.name} run ${run + 1}: reached room ${curRoom}`);
@@ -691,7 +701,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                 const lootAction = pickBestAction(battleState, g().enemyMoveRecords, g().enemyNames);
                 if (lootAction) {
                   const lootResult = await g().performAction(lootAction);
-                  if (lootResult) { battleState = lootResult; trackLoot(lootResult); }
+                  if (lootResult) {
+                    battleState = lootResult;
+                    trackLoot(lootResult);
+                  } else {
+                    // Token desync — fetch fresh state to recover
+                    log(`Loot action failed, recovering state...`);
+                    const fresh = await g().fetchDungeonState();
+                    if (fresh) { battleState = fresh; trackLoot(fresh); }
+                    else break;
+                  }
                   await delay(150);
                   continue;
                 }
@@ -733,7 +752,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                 g().recordEnemyMove(entity.ENEMY_CID, entity.ROOM_NUM_CID, entity.DUNGEON_ID_CID, entity.LEVEL_CID, enemy.lastMove, roundEst);
               }
 
-              if (result.message === "Run Complete") {
+              if (result.message === "Run Complete" && !result.data?.run?.lootPhase) {
                 complete = true;
                 const room = result.data?.entity?.ROOM_NUM_CID ?? lastRoom;
                 runResults.push(String(room));
@@ -771,7 +790,28 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           detail,
         });
         // Fetch fresh state + token for next dungeon alloc or fishing
-        await g().fetchDungeonState();
+        const interState = await g().fetchDungeonState();
+        // If there's a stuck/active run (e.g. uncollected loot), finish it
+        if (interState?.data?.run) {
+          log(`Cleaning up pending run between allocs (${interState.message}, loot=${interState.data.run.lootPhase})`);
+          let s = interState;
+          for (let i = 0; i < 50 && s?.data?.run; i++) {
+            if (cancelRef.current) break;
+            if (s.message === "Run Complete" && !s.data.run.lootPhase) break;
+            let action = pickBestAction(s, g().enemyMoveRecords, g().enemyNames);
+            if (!action && s.data.run.lootPhase) action = "loot_one";
+            if (!action) break;
+            const result = await g().performAction(action);
+            if (!result) {
+              const fresh = await g().fetchDungeonState();
+              if (fresh) { s = fresh; await delay(150); continue; }
+              break;
+            }
+            s = result;
+            await delay(150);
+          }
+          await g().fetchDungeonState();
+        }
       }
 
       // 7. Fishing casts
@@ -1021,7 +1061,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
         <div className="flex items-center justify-between mb-4">
           <div className="text-[14px] font-bold">Energy Budget</div>
           <div className="text-[13px] font-bold tabular-nums" style={{ color: "var(--orange)" }}>
-            {currentEnergy} / {maxEnergy}
+            {fmt(currentEnergy)} / {fmt(maxEnergy)}
           </div>
         </div>
 
@@ -1031,7 +1071,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             className="h-full rounded-full"
             style={{
               width: `${maxEnergy > 0 ? Math.min(100, (currentEnergy / maxEnergy) * 100) : 0}%`,
-              background: "linear-gradient(90deg, #b45309, #e8863a)",
+              background: "linear-gradient(90deg, var(--orange-dim), var(--orange))",
               transition: "width 0.3s ease",
             }}
           />
@@ -1075,7 +1115,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                 </div>
                 {d.runs > 0 && (
                   <span className="text-[11px] tabular-nums font-medium shrink-0" style={{ color: "var(--orange)", minWidth: 56, textAlign: "right" }}>
-                    {d.runs} = {totalCost}E
+                    {d.runs} = {fmt(totalCost)}E
                   </span>
                 )}
               </div>
@@ -1142,7 +1182,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-[11px] font-bold" style={{ color: "var(--text-faint)" }}>ALLOCATED</span>
             <span className="text-[13px] font-bold tabular-nums" style={{ color: allocatedEnergy > currentEnergy ? "var(--red)" : "var(--orange)" }}>
-              {allocatedEnergy}E / {currentEnergy}E
+              {fmt(allocatedEnergy)}E / {fmt(currentEnergy)}E
             </span>
           </div>
           <div className="rounded-full overflow-hidden" style={{ height: 6, background: "var(--bg)" }}>
@@ -1152,7 +1192,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                 width: `${currentEnergy > 0 ? Math.min(100, (allocatedEnergy / currentEnergy) * 100) : 0}%`,
                 background: allocatedEnergy > currentEnergy
                   ? "var(--red)"
-                  : "linear-gradient(90deg, #b45309, #e8863a)",
+                  : "linear-gradient(90deg, var(--orange-dim), var(--orange))",
                 transition: "width 0.3s ease",
               }}
             />
@@ -1168,12 +1208,12 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           <label className="flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", opacity: (totalRomS === 0 && totalRomD === 0) ? 0.5 : 1 }}>
             <input type="checkbox" checked={freeActions.claimRomResources} disabled={(totalRomS === 0 && totalRomD === 0) || executing} onChange={(e) => setFreeActions((prev) => ({ ...prev, claimRomResources: e.target.checked }))} className="accent-[var(--orange)]" style={{ width: 16, height: 16 }} />
             <div className="flex-1 text-[12px] font-semibold">Claim ROM shards & dust</div>
-            <span className="text-[11px] tabular-nums" style={{ color: "var(--text-dim)" }}>{totalRomS}S / {totalRomD}D</span>
+            <span className="text-[11px] tabular-nums" style={{ color: "var(--text-dim)" }}>{fmt(totalRomS)}S / {fmt(totalRomD)}D</span>
           </label>
 
           {/* ROM Energy — radio group: claim / convert / skip */}
           <div className="px-3 py-2 rounded-lg" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", opacity: totalRomE === 0 ? 0.5 : 1 }}>
-            <div className="text-[12px] font-semibold mb-1.5">ROM Energy ({totalRomE}E available)</div>
+            <div className="text-[12px] font-semibold mb-1.5">ROM Energy ({fmt(totalRomE)}E available)</div>
             <div className="flex gap-3">
               {([
                 { value: "convert" as const, label: "Convert to dust" },
@@ -1199,7 +1239,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           {([
             { key: "openChests" as const, label: "Open chests", info: chestsReady ? [!chestCd.onCooldown && "Chest ready", !juiceChestCd.onCooldown && (eng?.isPlayerJuiced ?? false) && "Juice ready"].filter(Boolean).join(" + ") || "Ready" : `Chest: ${chestCd.text}${(eng?.isPlayerJuiced ?? false) ? `, Juice: ${juiceChestCd.text}` : ""}`, disabled: !chestsReady },
             { key: "breakPots" as const, label: "Break pots", info: (() => { const p: string[] = []; if (!bluePotCd.onCooldown && paperHandsId) p.push("Blue ready"); else if (!bluePotCd.onCooldown) p.push("Blue: no Paper Hands"); else p.push(`Blue: ${bluePotCd.text}`); if (!tanPotCd.onCooldown && rockHandsId) p.push("Tan ready"); else if (!tanPotCd.onCooldown) p.push("Tan: no Rock Hands"); else p.push(`Tan: ${tanPotCd.text}`); return p.join(", "); })(), disabled: !potsActuallyReady },
-            { key: "sellFish" as const, label: "Sell +50% fish", info: fishStallInfo.totalCount > 0 ? `${fishStallInfo.totalCount} fish (~${fishStallInfo.totalSeaweed} seaweed)` : "None available", disabled: fishStallInfo.totalCount === 0 },
+            { key: "sellFish" as const, label: "Sell +50% fish", info: fishStallInfo.totalCount > 0 ? `${fmt(fishStallInfo.totalCount)} fish (~${fmt(fishStallInfo.totalSeaweed)} seaweed)` : "None available", disabled: fishStallInfo.totalCount === 0 },
             { key: "vote" as const, label: "Vote on Abstract Portal", info: hasVoted ? "Voted" : "Not voted", disabled: hasVoted },
           ]).map((item) => (
             <label key={item.key} className="flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", opacity: item.disabled ? 0.5 : 1 }}>
@@ -1245,7 +1285,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               onClick={savePreset}
               disabled={!presetName.trim()}
               className="btn-press text-[11px] font-bold px-4 py-2 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
-              style={{ background: "var(--orange)", border: "none", color: "#fff" }}
+              style={{ background: "var(--orange)", border: "none", color: "var(--text-inverse)" }}
             >
               Save
             </button>
@@ -1302,7 +1342,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             style={{
               background: "linear-gradient(135deg, var(--orange), var(--orange-dim))",
               border: "none",
-              color: "#fff",
+              color: "var(--text-inverse)",
               boxShadow: "0 3px 16px var(--orange-glow)",
               letterSpacing: "0.02em",
             }}
@@ -1314,10 +1354,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             onClick={handleStop}
             className="btn-press w-full text-[16px] font-bold py-4 rounded-xl cursor-pointer"
             style={{
-              background: "linear-gradient(135deg, var(--red), #7f1d1d)",
+              background: "linear-gradient(135deg, var(--red), var(--red-dark))",
               border: "none",
-              color: "#fff",
-              boxShadow: "0 3px 16px rgba(239,68,68,0.25)",
+              color: "var(--text-inverse)",
+              boxShadow: "0 3px 16px var(--red-border)",
               letterSpacing: "0.02em",
             }}
           >
@@ -1395,8 +1435,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
                   lineHeight: 1.6,
                 }}
               >
-                {mcLog.map((entry, i) => (
-                  <div key={i} style={{ color: "var(--text-faint)" }}>{entry}</div>
+                {mcLog.map((entry) => (
+                  <div key={entry.id} style={{ color: "var(--text-faint)" }}>{entry.text}</div>
                 ))}
               </div>
             )}
@@ -1409,7 +1449,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             className="mt-3 px-4 py-3 rounded-lg text-[13px] font-medium"
             style={{
               background: summary.startsWith("Done") ? "var(--green-glow)" : "var(--bg-raised)",
-              border: `1px solid ${summary.startsWith("Done") ? "rgba(74,222,128,0.25)" : "var(--border)"}`,
+              border: `1px solid ${summary.startsWith("Done") ? "var(--green-border)" : "var(--border)"}`,
               color: summary.startsWith("Done") ? "var(--green)" : "var(--text)",
             }}
           >

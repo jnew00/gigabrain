@@ -8,10 +8,10 @@ import { predictEnemyMove } from "./enemy-tracker";
 import type { EnemyMoveRecord } from "./enemy-tracker";
 
 type CombatMove = "rock" | "paper" | "scissor";
-type LootAction = "loot_one" | "loot_two" | "loot_three";
+type LootAction = "loot_one" | "loot_two" | "loot_three" | "loot_four";
 
 const COMBAT_MOVES: CombatMove[] = ["rock", "paper", "scissor"];
-const LOOT_ACTIONS: LootAction[] = ["loot_one", "loot_two", "loot_three"];
+const LOOT_ACTIONS: LootAction[] = ["loot_one", "loot_two", "loot_three", "loot_four"];
 
 export const MOVE_LABELS: Record<string, string> = {
   rock: "Sword",
@@ -383,7 +383,7 @@ export function explainAction(
   const run = state.data?.run;
   if (!run) return "";
 
-  if (action === "loot_one" || action === "loot_two" || action === "loot_three") {
+  if (action === "loot_one" || action === "loot_two" || action === "loot_three" || action === "loot_four") {
     const idx = LOOT_ACTIONS.indexOf(action as LootAction);
     const loot = run.lootOptions?.[idx];
     if (loot) {
