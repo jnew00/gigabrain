@@ -558,7 +558,7 @@ export function useGigaverse() {
   const useRecipe = useCallback(
     async (recipeId: string, gearInstanceId: string = "") => {
       if (!token || !noobId) return null;
-      const result = await proxy<{ success: boolean; message?: string; data?: unknown; entities?: unknown[] }>(
+      const result = await proxy<{ success: boolean; message?: string; data?: unknown; entities?: unknown[]; gameItemBalanceChanges?: { id: number; amount: number }[] }>(
         "/api/offchain/recipes/start",
         token,
         "POST",

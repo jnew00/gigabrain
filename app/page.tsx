@@ -3285,7 +3285,14 @@ function WorldPage({ giga, addLog, eng }: {
     try {
       const r = await giga.useRecipe(item.id, gearId);
       if (r?.success !== false) {
-        const detail = r?.entities ? `Got loot!` : "Success";
+        const lootParts: string[] = [];
+        if (r?.gameItemBalanceChanges) {
+          for (const c of r.gameItemBalanceChanges) {
+            const name = giga.itemInfo[String(c.id)]?.name || giga.itemNames[String(c.id)] || `#${c.id}`;
+            lootParts.push(`${c.amount}x ${name}`);
+          }
+        }
+        const detail = lootParts.length > 0 ? lootParts.join(", ") : "Success";
         setResults((prev) => [...prev, { id: item.id, label: item.label, status: "success", detail }]);
         addLog(`${item.label}: ${detail}`);
       } else {

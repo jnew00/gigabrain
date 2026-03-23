@@ -24,6 +24,22 @@ const RECIPE_ITEMS = {
 const PRESETS_KEY = "giga-daily-presets";
 const LAST_ALLOC_KEY = "giga-daily-last";
 
+/** Extract loot item names from a recipe response */
+function formatRecipeLoot(
+  r: { gameItemBalanceChanges?: { id: number; amount: number }[]; entities?: unknown[] } | null | undefined,
+  itemInfo: Record<string, { name?: string }>,
+  itemNames: Record<string, string>
+): string[] {
+  const parts: string[] = [];
+  if (r?.gameItemBalanceChanges) {
+    for (const c of r.gameItemBalanceChanges) {
+      const name = itemInfo[String(c.id)]?.name || itemNames[String(c.id)] || `#${c.id}`;
+      parts.push(`${c.amount}x ${name}`);
+    }
+  }
+  return parts;
+}
+
 /* ─── Types ────────────────────────────────────────────────── */
 
 export interface MissionControlProps {
@@ -538,16 +554,32 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
         if (!chestCd.onCooldown) {
           try {
             const r = await g().useRecipe(RECIPE_ITEMS.chest);
-            results.push(r?.success !== false ? "Chest opened" : `Chest: ${(r as { message?: string })?.message || "failed"}`);
-            log(results[results.length - 1]);
+            if (r?.success !== false) {
+              const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
+              const msg = loot.length > 0 ? `Chest opened — ${loot.join(", ")}` : "Chest opened";
+              results.push(msg);
+              log(msg);
+            } else {
+              const msg = `Chest: ${(r as { message?: string })?.message || "failed"}`;
+              results.push(msg);
+              log(msg);
+            }
           } catch (e) { results.push(`Chest: ${e instanceof Error ? e.message : "error"}`); }
           await delay(200);
         }
         if (!juiceChestCd.onCooldown && (g().energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false)) {
           try {
             const r = await g().useRecipe(RECIPE_ITEMS.juiceChest);
-            results.push(r?.success !== false ? "Juice Chest opened" : `Juice Chest: ${(r as { message?: string })?.message || "failed"}`);
-            log(results[results.length - 1]);
+            if (r?.success !== false) {
+              const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
+              const msg = loot.length > 0 ? `Juice Chest opened — ${loot.join(", ")}` : "Juice Chest opened";
+              results.push(msg);
+              log(msg);
+            } else {
+              const msg = `Juice Chest: ${(r as { message?: string })?.message || "failed"}`;
+              results.push(msg);
+              log(msg);
+            }
           } catch (e) { results.push(`Juice Chest: ${e instanceof Error ? e.message : "error"}`); }
         }
         updateStep("open-chests", { status: "done", detail: results.join(", ") });
@@ -561,16 +593,32 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
         if (bluePotReady && paperHandsId) {
           try {
             const r = await g().useRecipe(RECIPE_ITEMS.bluePot, paperHandsId);
-            results.push(r?.success !== false ? "Blue Pot broken" : `Blue Pot: ${(r as { message?: string })?.message || "failed"}`);
-            log(results[results.length - 1]);
+            if (r?.success !== false) {
+              const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
+              const msg = loot.length > 0 ? `Blue Pot broken — ${loot.join(", ")}` : "Blue Pot broken";
+              results.push(msg);
+              log(msg);
+            } else {
+              const msg = `Blue Pot: ${(r as { message?: string })?.message || "failed"}`;
+              results.push(msg);
+              log(msg);
+            }
           } catch (e) { results.push(`Blue Pot: ${e instanceof Error ? e.message : "error"}`); }
           await delay(200);
         }
         if (tanPotReady && rockHandsId) {
           try {
             const r = await g().useRecipe(RECIPE_ITEMS.tanPot, rockHandsId);
-            results.push(r?.success !== false ? "Tan Pot broken" : `Tan Pot: ${(r as { message?: string })?.message || "failed"}`);
-            log(results[results.length - 1]);
+            if (r?.success !== false) {
+              const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
+              const msg = loot.length > 0 ? `Tan Pot broken — ${loot.join(", ")}` : "Tan Pot broken";
+              results.push(msg);
+              log(msg);
+            } else {
+              const msg = `Tan Pot: ${(r as { message?: string })?.message || "failed"}`;
+              results.push(msg);
+              log(msg);
+            }
           } catch (e) { results.push(`Tan Pot: ${e instanceof Error ? e.message : "error"}`); }
         }
         updateStep("break-pots", { status: results.length > 0 ? "done" : "skipped", detail: results.join(", ") || "No pots available" });
