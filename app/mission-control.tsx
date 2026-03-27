@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction } from "@/lib/auto-battle";
 import { pickBestCard } from "@/lib/fishing-ai";
+import { Sword, Package, Fish, AlertTriangle, Info } from "lucide-react";
 
 
 /* ─── Constants ────────────────────────────────────────────── */
@@ -187,10 +188,17 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
   const [executing, setExecuting] = useState(false);
   const [steps, setSteps] = useState<ExecutionStep[]>([]);
   const [summary, setSummary] = useState<string | null>(null);
-  const [mcLog, setMcLog] = useState<{ id: number; text: string }[]>([]);
+  const [mcLog, setMcLog] = useState<{ id: number; msg: string; type: "loot" | "dungeon" | "fishing" | "error" | "info"; ts: number }[]>([]);
   const mcLogIdRef = useRef(0);
   const [showLog, setShowLog] = useState(false);
   const mcLogRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll activity feed
+  useEffect(() => {
+    if (mcLogRef.current) {
+      mcLogRef.current.scrollTop = mcLogRef.current.scrollHeight;
+    }
+  }, [mcLog]);
 
   // Presets
   const [presets, setPresets] = useState<Preset[]>([]);
@@ -450,8 +458,13 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
     const log = (msg: string) => {
       addLog(msg);
       const id = ++mcLogIdRef.current;
-      const text = `${new Date().toLocaleTimeString("en", { hour12: false })} ${msg}`;
-      setMcLog((prev) => [...prev, { id, text }]);
+      const type: "loot" | "dungeon" | "fishing" | "error" | "info" =
+        msg.startsWith("Loot:") ? "loot"
+        : /^(Starting |.*run \d|reached room|Stuck run|Active dungeon|Collecting loot|Cannot advance|Cleaning up)/.test(msg) ? "dungeon"
+        : /^(Fishing|Caught|Fish escaped|Sold|Active fishing|Previous catch|Card play)/.test(msg) ? "fishing"
+        : /^(Error:|.*failed|Could not|Sell failed|Cannot)/.test(msg) ? "error"
+        : "info";
+      setMcLog((prev) => [...prev, { id, msg, type, ts: Date.now() }]);
     };
 
     // Build step list
@@ -1459,7 +1472,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           </div>
         )}
 
-        {/* Activity Log */}
+        {/* Activity Feed */}
         {mcLog.length > 0 && (
           <div className="mt-3">
             <button
@@ -1467,25 +1480,44 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
               className="text-[11px] font-bold uppercase tracking-[0.1em] mb-2 cursor-pointer"
               style={{ color: "var(--text-faint)", background: "none", border: "none", padding: 0 }}
             >
-              {showLog ? "Hide" : "Show"} Log ({mcLog.length})
+              {showLog ? "Hide" : "Show"} Feed ({mcLog.length})
             </button>
             {showLog && (
               <div
                 ref={mcLogRef}
-                className="rounded-lg overflow-y-auto"
+                className="rounded-lg overflow-y-auto flex flex-col gap-[2px]"
                 style={{
-                  maxHeight: 200,
+                  maxHeight: 260,
                   background: "var(--bg-inset)",
                   border: "1px solid var(--border)",
-                  padding: "8px 12px",
-                  fontSize: 11,
-                  fontFamily: "monospace",
-                  lineHeight: 1.6,
+                  padding: "6px 8px",
                 }}
               >
-                {mcLog.map((entry) => (
-                  <div key={entry.id} style={{ color: "var(--text-faint)" }}>{entry.text}</div>
-                ))}
+                {mcLog.map((entry) => {
+                  const IconCmp = entry.type === "loot" ? Package
+                    : entry.type === "dungeon" ? Sword
+                    : entry.type === "fishing" ? Fish
+                    : entry.type === "error" ? AlertTriangle
+                    : Info;
+                  const color = entry.type === "loot" ? "var(--yellow, #e2b340)"
+                    : entry.type === "dungeon" ? "var(--text-dim)"
+                    : entry.type === "fishing" ? "var(--blue, #5b9fd6)"
+                    : entry.type === "error" ? "var(--red, #e05252)"
+                    : "var(--text-faint)";
+                  return (
+                    <div
+                      key={entry.id}
+                      className="flex items-start gap-2 rounded px-2 py-[3px] text-[12px]"
+                      style={{ color, background: entry.type === "error" ? "rgba(224,82,82,0.08)" : undefined }}
+                    >
+                      <IconCmp size={13} className="shrink-0 mt-[2px]" />
+                      <span className="flex-1 leading-[18px]">{entry.msg}</span>
+                      <span className="shrink-0 text-[10px] tabular-nums leading-[18px]" style={{ color: "var(--text-faint)", opacity: 0.6 }}>
+                        {new Date(entry.ts).toLocaleTimeString("en", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
