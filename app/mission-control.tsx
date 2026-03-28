@@ -192,7 +192,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   const [summary, setSummary] = useState<string | null>(null);
   const [mcLog, setMcLog] = useState<{ id: number; msg: string; type: "loot" | "dungeon" | "fishing" | "error" | "info"; ts: number }[]>([]);
   const mcLogIdRef = useRef(0);
-
+  const progressRef = useRef<HTMLDivElement>(null);
 
 
   // Presets
@@ -489,6 +489,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     }
 
     setSteps(stepList);
+
+    // Scroll to progress section after render
+    setTimeout(() => progressRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
 
     const summaryStats = { dungeonRuns: 0, dungeonWins: 0, fishCasts: 0, fishCaught: 0, seaweedEarned: 0 };
 
@@ -1434,84 +1437,101 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           </button>
         )}
 
-        {/* Progress tracker */}
-        {steps.length > 0 && (
-          <div className="mt-4 rounded-lg overflow-hidden" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
-            <div className="px-4 py-2.5" style={{ borderBottom: "1px solid var(--border)" }}>
-              <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
-                Progress
-              </span>
-            </div>
-            <div className="divide-y" style={{ borderColor: "var(--border)" }}>
-              {steps.map((step) => (
-                <div
-                  key={step.id}
-                  className="px-4 py-3"
-                  style={{ borderColor: "var(--border)" }}
-                >
-                  <div className="flex items-center gap-3">
-                    <span
-                      className="text-[14px] font-bold shrink-0 w-5 text-center"
-                      style={{
-                        color: statusColor(step.status),
-                        animation: step.status === "running" ? "pulse 1.5s ease-in-out infinite" : "none",
-                      }}
-                    >
-                      {statusIcon(step.status)}
-                    </span>
-                    <span
-                      className="text-[13px] font-medium"
-                      style={{ color: step.status === "pending" ? "var(--text-faint)" : "var(--text)" }}
-                    >
-                      {step.label}
-                    </span>
-                  </div>
-                  {step.detail && (
+        {/* Progress + Activity Feed */}
+        {(steps.length > 0 || mcLog.length > 0) && (
+          <div
+            ref={progressRef}
+            className="mt-4 rounded-lg overflow-hidden"
+            style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
+          >
+            {steps.length > 0 && (
+              <>
+                <div className="px-4 py-2.5" style={{ borderBottom: "1px solid var(--border)" }}>
+                  <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
+                    Progress
+                  </span>
+                </div>
+                <div className="divide-y" style={{ borderColor: "var(--border)" }}>
+                  {steps.map((step) => (
                     <div
-                      className="text-[12px] mt-1 ml-8"
-                      style={{ color: "var(--text-dim)", lineHeight: 1.5 }}
+                      key={step.id}
+                      className="px-4 py-3"
+                      style={{ borderColor: "var(--border)" }}
                     >
-                      {step.detail}
+                      <div className="flex items-center gap-3">
+                        <span
+                          className="text-[14px] font-bold shrink-0 w-5 text-center"
+                          style={{
+                            color: statusColor(step.status),
+                            animation: step.status === "running" ? "pulse 1.5s ease-in-out infinite" : "none",
+                          }}
+                        >
+                          {statusIcon(step.status)}
+                        </span>
+                        <span
+                          className="text-[13px] font-medium"
+                          style={{ color: step.status === "pending" ? "var(--text-faint)" : "var(--text)" }}
+                        >
+                          {step.label}
+                        </span>
+                      </div>
+                      {step.detail && (
+                        <div
+                          className="text-[12px] mt-1 ml-8"
+                          style={{ color: "var(--text-dim)", lineHeight: 1.5 }}
+                        >
+                          {step.detail}
+                        </div>
+                      )}
                     </div>
-                  )}
+                  ))}
                 </div>
-              ))}
-            </div>
-          </div>
-        )}
+              </>
+            )}
 
-        {/* Activity Feed — newest first, no container */}
-        {mcLog.length > 0 && (
-          <div className="mt-4 flex flex-col gap-[2px]">
-            {[...mcLog].reverse().slice(0, 20).map((entry, i) => {
-              const IconCmp = entry.type === "loot" ? Package
-                : entry.type === "dungeon" ? Sword
-                : entry.type === "fishing" ? Fish
-                : entry.type === "error" ? AlertTriangle
-                : Info;
-              const color = i === 0
-                ? (entry.type === "loot" ? "var(--yellow, #e2b340)"
-                  : entry.type === "fishing" ? "var(--blue, #5b9fd6)"
-                  : entry.type === "error" ? "var(--red, #e05252)"
-                  : "var(--text-primary, #e0e0e0)")
-                : entry.type === "loot" ? "var(--yellow, #e2b340)"
-                : entry.type === "error" ? "var(--red, #e05252)"
-                : "var(--text-faint)";
-              return (
-                <div
-                  key={entry.id}
-                  className="flex items-center gap-2 py-[2px] text-[12px]"
-                  style={{
-                    color,
-                    opacity: i === 0 ? 1 : Math.max(0.25, 1 - i * 0.08),
-                    fontWeight: i === 0 ? 500 : 400,
-                  }}
-                >
-                  <IconCmp size={i === 0 ? 14 : 12} className="shrink-0" />
-                  <span className="flex-1 leading-[18px]">{entry.msg}</span>
+            {mcLog.length > 0 && (
+              <>
+                <div className="px-4 py-2.5" style={{ borderTop: steps.length > 0 ? "1px solid var(--border)" : undefined }}>
+                  <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
+                    Activity
+                  </span>
                 </div>
-              );
-            })}
+                <div
+                  className="overflow-y-auto px-4 pb-3 flex flex-col gap-1"
+                  style={{ maxHeight: 300, scrollbarWidth: "none" }}
+                >
+                  {[...mcLog].reverse().map((entry, i) => {
+                    const IconCmp = entry.type === "loot" ? Package
+                      : entry.type === "dungeon" ? Sword
+                      : entry.type === "fishing" ? Fish
+                      : entry.type === "error" ? AlertTriangle
+                      : Info;
+                    const color = i === 0
+                      ? (entry.type === "loot" ? "var(--yellow, #e2b340)"
+                        : entry.type === "fishing" ? "var(--blue, #5b9fd6)"
+                        : entry.type === "error" ? "var(--red, #e05252)"
+                        : "var(--text-primary, #e0e0e0)")
+                      : entry.type === "loot" ? "var(--yellow, #e2b340)"
+                      : entry.type === "error" ? "var(--red, #e05252)"
+                      : "var(--text-faint)";
+                    return (
+                      <div
+                        key={entry.id}
+                        className="flex items-center gap-2 py-[2px] text-[13px]"
+                        style={{
+                          color,
+                          opacity: i === 0 ? 1 : Math.max(0.3, 1 - i * 0.06),
+                          fontWeight: i === 0 ? 500 : 400,
+                        }}
+                      >
+                        <IconCmp size={i === 0 ? 15 : 13} className="shrink-0" />
+                        <span className="flex-1 leading-[20px]">{entry.msg}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
           </div>
         )}
 
