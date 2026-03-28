@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction } from "@/lib/auto-battle";
 import { pickBestCard } from "@/lib/fishing-ai";
-import { Sword, Package, Fish, AlertTriangle, Info, Minimize2 } from "lucide-react";
+import { Sword, Package, Fish, AlertTriangle, Info } from "lucide-react";
 import { recordRunAction } from "./actions";
 
 
@@ -1578,36 +1578,34 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             }}
           >
             {/* Modal header */}
-            <div className="flex items-center justify-between px-5 py-4 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
-              <span className="text-[16px] font-bold" style={{ color: "var(--text)" }}>
+            <div className="flex items-center justify-between px-5 py-3 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
+              <span className="text-[15px] font-bold" style={{ color: "var(--text)" }}>
                 {executing ? "Running..." : summary ? "Run Complete" : "Run"}
               </span>
               <button
                 onClick={() => setShowModal(false)}
-                className="p-1.5 rounded-md cursor-pointer"
-                style={{ color: "var(--text-faint)", background: "none", border: "none" }}
+                className="px-3 py-1.5 rounded-md text-[12px] font-medium cursor-pointer"
+                style={{ color: "var(--text-dim)", background: "var(--bg-inset)", border: "1px solid var(--border)" }}
               >
-                <Minimize2 size={16} />
+                Minimize
               </button>
             </div>
 
             {/* Modal body — scrollable */}
             <div
-              className="flex-1 overflow-y-auto"
+              className="flex-1 min-h-0 overflow-y-auto"
               style={{ scrollbarWidth: "none" }}
             >
-              <div className="overflow-hidden">
-                {progressContent}
-              </div>
+              {progressContent}
               {summaryContent && <div className="px-4 pb-4">{summaryContent}</div>}
             </div>
 
-            {/* Modal footer — stop button */}
-            {executing && (
-              <div className="shrink-0 px-5 py-4" style={{ borderTop: "1px solid var(--border)" }}>
+            {/* Modal footer */}
+            <div className="shrink-0 px-5 py-3 flex gap-3" style={{ borderTop: "1px solid var(--border)" }}>
+              {executing && (
                 <button
                   onClick={() => { cancelRef.current = true; }}
-                  className="w-full py-2.5 rounded-lg text-[13px] font-semibold cursor-pointer"
+                  className="flex-1 py-2 rounded-lg text-[13px] font-semibold cursor-pointer"
                   style={{
                     background: "var(--red-glow)",
                     border: "1px solid var(--red-border)",
@@ -1616,8 +1614,21 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 >
                   Stop
                 </button>
-              </div>
-            )}
+              )}
+              <button
+                onClick={() => setShowModal(false)}
+                className={`${executing ? "" : "flex-1 "}py-2 rounded-lg text-[13px] font-medium cursor-pointer`}
+                style={{
+                  flex: executing ? 1 : undefined,
+                  width: executing ? undefined : "100%",
+                  background: "var(--bg-inset)",
+                  border: "1px solid var(--border)",
+                  color: "var(--text-dim)",
+                }}
+              >
+                {executing ? "Minimize" : "Close"}
+              </button>
+            </div>
           </div>
         </div>
       )}
