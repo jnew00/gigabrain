@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction } from "@/lib/auto-battle";
 import { pickBestCard } from "@/lib/fishing-ai";
-import { Sword, Package, Fish, AlertTriangle, Info } from "lucide-react";
+import { Sword, Package, Fish, AlertTriangle, Info, Minimize2 } from "lucide-react";
 import { recordRunAction } from "./actions";
 
 
@@ -193,6 +193,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   const [mcLog, setMcLog] = useState<{ id: number; msg: string; type: "loot" | "dungeon" | "fishing" | "error" | "info"; ts: number }[]>([]);
   const mcLogIdRef = useRef(0);
   const progressRef = useRef<HTMLDivElement>(null);
+  const [showModal, setShowModal] = useState(false);
 
 
   // Presets
@@ -490,8 +491,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
     setSteps(stepList);
 
-    // Scroll to progress section after render
-    setTimeout(() => progressRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+    setShowModal(true);
 
     const summaryStats = { dungeonRuns: 0, dungeonWins: 0, fishCasts: 0, fishCaught: 0, seaweedEarned: 0 };
 
@@ -1125,6 +1125,112 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
   /* ─── Render ─────────────────────────────────────────────── */
 
+  const progressContent = (steps.length > 0 || mcLog.length > 0) ? (
+    <>
+      {steps.length > 0 && (
+        <>
+          <div className="px-4 py-2.5" style={{ borderBottom: "1px solid var(--border)" }}>
+            <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
+              Progress
+            </span>
+          </div>
+          <div className="divide-y" style={{ borderColor: "var(--border)" }}>
+            {steps.map((step) => (
+              <div
+                key={step.id}
+                className="px-4 py-3"
+                style={{ borderColor: "var(--border)" }}
+              >
+                <div className="flex items-center gap-3">
+                  <span
+                    className="text-[14px] font-bold shrink-0 w-5 text-center"
+                    style={{
+                      color: statusColor(step.status),
+                      animation: step.status === "running" ? "pulse 1.5s ease-in-out infinite" : "none",
+                    }}
+                  >
+                    {statusIcon(step.status)}
+                  </span>
+                  <span
+                    className="text-[13px] font-medium"
+                    style={{ color: step.status === "pending" ? "var(--text-faint)" : "var(--text)" }}
+                  >
+                    {step.label}
+                  </span>
+                </div>
+                {step.detail && (
+                  <div
+                    className="text-[12px] mt-1 ml-8"
+                    style={{ color: "var(--text-dim)", lineHeight: 1.5 }}
+                  >
+                    {step.detail}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {mcLog.length > 0 && (
+        <>
+          <div className="px-4 py-2.5" style={{ borderTop: steps.length > 0 ? "1px solid var(--border)" : undefined }}>
+            <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
+              Activity
+            </span>
+          </div>
+          <div
+            className="overflow-y-auto px-4 pb-3 flex flex-col gap-1"
+            style={{ scrollbarWidth: "none" }}
+          >
+            {[...mcLog].reverse().map((entry, i) => {
+              const IconCmp = entry.type === "loot" ? Package
+                : entry.type === "dungeon" ? Sword
+                : entry.type === "fishing" ? Fish
+                : entry.type === "error" ? AlertTriangle
+                : Info;
+              const color = i === 0
+                ? (entry.type === "loot" ? "var(--yellow, #e2b340)"
+                  : entry.type === "fishing" ? "var(--blue, #5b9fd6)"
+                  : entry.type === "error" ? "var(--red, #e05252)"
+                  : "var(--text-primary, #e0e0e0)")
+                : entry.type === "loot" ? "var(--yellow, #e2b340)"
+                : entry.type === "error" ? "var(--red, #e05252)"
+                : "var(--text-faint)";
+              return (
+                <div
+                  key={entry.id}
+                  className="flex items-center gap-2 py-[2px] text-[13px]"
+                  style={{
+                    color,
+                    opacity: i === 0 ? 1 : Math.max(0.3, 1 - i * 0.06),
+                    fontWeight: i === 0 ? 500 : 400,
+                  }}
+                >
+                  <IconCmp size={i === 0 ? 15 : 13} className="shrink-0" />
+                  <span className="flex-1 leading-[20px]">{entry.msg}</span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </>
+  ) : null;
+
+  const summaryContent = summary ? (
+    <div
+      className="mt-3 px-4 py-3 rounded-lg text-[13px] font-medium"
+      style={{
+        background: summary.startsWith("Done") ? "var(--green-glow)" : "var(--bg-raised)",
+        border: `1px solid ${summary.startsWith("Done") ? "var(--green-border)" : "var(--border)"}`,
+        color: summary.startsWith("Done") ? "var(--green)" : "var(--text)",
+      }}
+    >
+      {summary}
+    </div>
+  ) : null;
+
   return (
     <div className="anim-in space-y-6" style={{ maxWidth: 720 }}>
 
@@ -1394,7 +1500,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         )}
       </section>
 
-      {/* ── Section D: Execute Button + Progress ── */}
+      {/* ── Section D: Run Button + Progress ── */}
       <section>
         {!executing ? (
           <button
@@ -1419,7 +1525,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               letterSpacing: "0.02em",
             }}
           >
-            Execute Daily Plan
+            Run Plan
           </button>
         ) : (
           <button
@@ -1433,122 +1539,88 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               letterSpacing: "0.02em",
             }}
           >
-            Stop Execution
+            Stop
           </button>
         )}
 
-        {/* Progress + Activity Feed */}
-        {(steps.length > 0 || mcLog.length > 0) && (
+        {/* Inline Progress + Activity Feed (visible when modal is closed) */}
+        {!showModal && (steps.length > 0 || mcLog.length > 0) && (
           <div
             ref={progressRef}
-            className="mt-4 rounded-lg overflow-hidden"
+            className="mt-4 rounded-lg overflow-hidden cursor-pointer"
             style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
+            onClick={() => setShowModal(true)}
           >
-            {steps.length > 0 && (
-              <>
-                <div className="px-4 py-2.5" style={{ borderBottom: "1px solid var(--border)" }}>
-                  <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
-                    Progress
-                  </span>
-                </div>
-                <div className="divide-y" style={{ borderColor: "var(--border)" }}>
-                  {steps.map((step) => (
-                    <div
-                      key={step.id}
-                      className="px-4 py-3"
-                      style={{ borderColor: "var(--border)" }}
-                    >
-                      <div className="flex items-center gap-3">
-                        <span
-                          className="text-[14px] font-bold shrink-0 w-5 text-center"
-                          style={{
-                            color: statusColor(step.status),
-                            animation: step.status === "running" ? "pulse 1.5s ease-in-out infinite" : "none",
-                          }}
-                        >
-                          {statusIcon(step.status)}
-                        </span>
-                        <span
-                          className="text-[13px] font-medium"
-                          style={{ color: step.status === "pending" ? "var(--text-faint)" : "var(--text)" }}
-                        >
-                          {step.label}
-                        </span>
-                      </div>
-                      {step.detail && (
-                        <div
-                          className="text-[12px] mt-1 ml-8"
-                          style={{ color: "var(--text-dim)", lineHeight: 1.5 }}
-                        >
-                          {step.detail}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-
-            {mcLog.length > 0 && (
-              <>
-                <div className="px-4 py-2.5" style={{ borderTop: steps.length > 0 ? "1px solid var(--border)" : undefined }}>
-                  <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
-                    Activity
-                  </span>
-                </div>
-                <div
-                  className="overflow-y-auto px-4 pb-3 flex flex-col gap-1"
-                  style={{ maxHeight: 300, scrollbarWidth: "none" }}
-                >
-                  {[...mcLog].reverse().map((entry, i) => {
-                    const IconCmp = entry.type === "loot" ? Package
-                      : entry.type === "dungeon" ? Sword
-                      : entry.type === "fishing" ? Fish
-                      : entry.type === "error" ? AlertTriangle
-                      : Info;
-                    const color = i === 0
-                      ? (entry.type === "loot" ? "var(--yellow, #e2b340)"
-                        : entry.type === "fishing" ? "var(--blue, #5b9fd6)"
-                        : entry.type === "error" ? "var(--red, #e05252)"
-                        : "var(--text-primary, #e0e0e0)")
-                      : entry.type === "loot" ? "var(--yellow, #e2b340)"
-                      : entry.type === "error" ? "var(--red, #e05252)"
-                      : "var(--text-faint)";
-                    return (
-                      <div
-                        key={entry.id}
-                        className="flex items-center gap-2 py-[2px] text-[13px]"
-                        style={{
-                          color,
-                          opacity: i === 0 ? 1 : Math.max(0.3, 1 - i * 0.06),
-                          fontWeight: i === 0 ? 500 : 400,
-                        }}
-                      >
-                        <IconCmp size={i === 0 ? 15 : 13} className="shrink-0" />
-                        <span className="flex-1 leading-[20px]">{entry.msg}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </>
-            )}
+            {progressContent}
+            {summaryContent}
           </div>
         )}
 
-        {/* Summary */}
-        {summary && (
+        {!showModal && summary && !steps.length && !mcLog.length && summaryContent}
+      </section>
+
+      {/* Execution Modal */}
+      {showModal && (
+        <div className="fixed inset-0" style={{ zIndex: 50 }}>
           <div
-            className="mt-3 px-4 py-3 rounded-lg text-[13px] font-medium"
+            className="fixed inset-0"
+            style={{ background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)" }}
+            onClick={() => setShowModal(false)}
+          />
+          <div
+            className="fixed inset-x-4 top-[10%] bottom-[10%] mx-auto flex flex-col rounded-xl overflow-hidden"
             style={{
-              background: summary.startsWith("Done") ? "var(--green-glow)" : "var(--bg-raised)",
-              border: `1px solid ${summary.startsWith("Done") ? "var(--green-border)" : "var(--border)"}`,
-              color: summary.startsWith("Done") ? "var(--green)" : "var(--text)",
+              maxWidth: 520,
+              background: "var(--bg-raised)",
+              border: "1px solid var(--border)",
+              zIndex: 51,
+              boxShadow: "0 24px 48px rgba(0,0,0,0.4)",
             }}
           >
-            {summary}
+            {/* Modal header */}
+            <div className="flex items-center justify-between px-5 py-4 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
+              <span className="text-[16px] font-bold" style={{ color: "var(--text)" }}>
+                {executing ? "Running..." : summary ? "Run Complete" : "Run"}
+              </span>
+              <button
+                onClick={() => setShowModal(false)}
+                className="p-1.5 rounded-md cursor-pointer"
+                style={{ color: "var(--text-faint)", background: "none", border: "none" }}
+              >
+                <Minimize2 size={16} />
+              </button>
+            </div>
+
+            {/* Modal body — scrollable */}
+            <div
+              className="flex-1 overflow-y-auto"
+              style={{ scrollbarWidth: "none" }}
+            >
+              <div className="overflow-hidden">
+                {progressContent}
+              </div>
+              {summaryContent && <div className="px-4 pb-4">{summaryContent}</div>}
+            </div>
+
+            {/* Modal footer — stop button */}
+            {executing && (
+              <div className="shrink-0 px-5 py-4" style={{ borderTop: "1px solid var(--border)" }}>
+                <button
+                  onClick={() => { cancelRef.current = true; }}
+                  className="w-full py-2.5 rounded-lg text-[13px] font-semibold cursor-pointer"
+                  style={{
+                    background: "var(--red-glow)",
+                    border: "1px solid var(--red-border)",
+                    color: "var(--red)",
+                  }}
+                >
+                  Stop
+                </button>
+              </div>
+            )}
           </div>
-        )}
-      </section>
+        </div>
+      )}
     </div>
   );
 }
