@@ -1798,6 +1798,7 @@ export default function Home() {
               handleVote={handleVote}
               hasVoted={hasVoted}
               voting={voting}
+              refreshRunStats={refreshRunStats}
             />
           )}
 

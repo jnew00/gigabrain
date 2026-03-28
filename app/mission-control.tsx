@@ -5,6 +5,7 @@ import type { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction } from "@/lib/auto-battle";
 import { pickBestCard } from "@/lib/fishing-ai";
 import { Sword, Package, Fish, AlertTriangle, Info } from "lucide-react";
+import { recordRunAction } from "./actions";
 
 
 /* ─── Constants ────────────────────────────────────────────── */
@@ -49,6 +50,7 @@ export interface MissionControlProps {
   handleVote: () => Promise<void>;
   hasVoted: boolean;
   voting: boolean;
+  refreshRunStats: () => void;
 }
 
 interface DungeonAlloc {
@@ -180,7 +182,7 @@ function statusColor(status: StepStatus): string {
 
 /* ─── Component ────────────────────────────────────────────── */
 
-export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: MissionControlProps) {
+export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refreshRunStats }: MissionControlProps) {
   const gigaRef = useRef(giga);
   gigaRef.current = giga;
 
@@ -190,15 +192,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
   const [summary, setSummary] = useState<string | null>(null);
   const [mcLog, setMcLog] = useState<{ id: number; msg: string; type: "loot" | "dungeon" | "fishing" | "error" | "info"; ts: number }[]>([]);
   const mcLogIdRef = useRef(0);
-  const [showLog, setShowLog] = useState(false);
-  const mcLogRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll activity feed
-  useEffect(() => {
-    if (mcLogRef.current) {
-      mcLogRef.current.scrollTop = mcLogRef.current.scrollHeight;
-    }
-  }, [mcLog]);
+
 
   // Presets
   const [presets, setPresets] = useState<Preset[]>([]);
@@ -449,7 +444,6 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
     setSummary(null);
     setMcLog([]);
     mcLogIdRef.current = 0;
-    setShowLog(true);
     gigaRef.current.autoBattleRef.current = true;
 
     const g = () => gigaRef.current;
@@ -724,12 +718,15 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
             let iterations = 0;
             let lastRoom = 0;
             const MAX_ITERATIONS = 100;
+            const runItems = new Map<number, { name: string; amount: number }>();
 
             const trackLoot = (resp: typeof battleState) => {
               if (resp?.gameItemBalanceChanges) {
                 for (const c of resp.gameItemBalanceChanges) {
                   lootTotals.set(c.id, (lootTotals.get(c.id) ?? 0) + c.amount);
                   const name = g().itemInfo[String(c.id)]?.name || g().itemNames[String(c.id)] || `#${c.id}`;
+                  const prev = runItems.get(c.id);
+                  runItems.set(c.id, { name, amount: (prev?.amount ?? 0) + c.amount });
                   log(`Loot: ${c.amount}x ${name}`);
                 }
               }
@@ -822,6 +819,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
 
               await delay(150);
             }
+            // Record run to stats DB
+            const finalRoom = Number(runResults[runResults.length - 1]) || lastRoom;
+            const won = finalRoom >= 16;
+            const player = battleState?.data?.run?.players?.[0];
+            const items = Array.from(runItems, ([id, v]) => ({ id, amount: v.amount, name: v.name }));
+            recordRunAction(
+              alloc.name, won, finalRoom,
+              player?.health?.current ?? 0, player?.health?.currentMax ?? 0,
+              items, [], g().address
+            ).catch(() => {});
           } catch (e) {
             log(`Error: ${e instanceof Error ? e.message : "unknown"}`);
             runResults.push("err");
@@ -1103,6 +1110,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
     } finally {
       gigaRef.current.autoBattleRef.current = false;
       setExecuting(false);
+      refreshRunStats();
       await gigaRef.current.refreshAll();
     }
   };
@@ -1472,54 +1480,38 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted }: Missi
           </div>
         )}
 
-        {/* Activity Feed */}
+        {/* Activity Feed — newest first, no container */}
         {mcLog.length > 0 && (
-          <div className="mt-3">
-            <button
-              onClick={() => setShowLog((v) => !v)}
-              className="text-[11px] font-bold uppercase tracking-[0.1em] mb-2 cursor-pointer"
-              style={{ color: "var(--text-faint)", background: "none", border: "none", padding: 0 }}
-            >
-              {showLog ? "Hide" : "Show"} Feed ({mcLog.length})
-            </button>
-            {showLog && (
-              <div
-                ref={mcLogRef}
-                className="rounded-lg overflow-y-auto flex flex-col gap-[2px]"
-                style={{
-                  maxHeight: 260,
-                  background: "var(--bg-inset)",
-                  border: "1px solid var(--border)",
-                  padding: "6px 8px",
-                }}
-              >
-                {mcLog.map((entry) => {
-                  const IconCmp = entry.type === "loot" ? Package
-                    : entry.type === "dungeon" ? Sword
-                    : entry.type === "fishing" ? Fish
-                    : entry.type === "error" ? AlertTriangle
-                    : Info;
-                  const color = entry.type === "loot" ? "var(--yellow, #e2b340)"
-                    : entry.type === "dungeon" ? "var(--text-dim)"
-                    : entry.type === "fishing" ? "var(--blue, #5b9fd6)"
-                    : entry.type === "error" ? "var(--red, #e05252)"
-                    : "var(--text-faint)";
-                  return (
-                    <div
-                      key={entry.id}
-                      className="flex items-start gap-2 rounded px-2 py-[3px] text-[12px]"
-                      style={{ color, background: entry.type === "error" ? "rgba(224,82,82,0.08)" : undefined }}
-                    >
-                      <IconCmp size={13} className="shrink-0 mt-[2px]" />
-                      <span className="flex-1 leading-[18px]">{entry.msg}</span>
-                      <span className="shrink-0 text-[10px] tabular-nums leading-[18px]" style={{ color: "var(--text-faint)", opacity: 0.6 }}>
-                        {new Date(entry.ts).toLocaleTimeString("en", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+          <div className="mt-4 flex flex-col gap-[2px]">
+            {[...mcLog].reverse().slice(0, 20).map((entry, i) => {
+              const IconCmp = entry.type === "loot" ? Package
+                : entry.type === "dungeon" ? Sword
+                : entry.type === "fishing" ? Fish
+                : entry.type === "error" ? AlertTriangle
+                : Info;
+              const color = i === 0
+                ? (entry.type === "loot" ? "var(--yellow, #e2b340)"
+                  : entry.type === "fishing" ? "var(--blue, #5b9fd6)"
+                  : entry.type === "error" ? "var(--red, #e05252)"
+                  : "var(--text-primary, #e0e0e0)")
+                : entry.type === "loot" ? "var(--yellow, #e2b340)"
+                : entry.type === "error" ? "var(--red, #e05252)"
+                : "var(--text-faint)";
+              return (
+                <div
+                  key={entry.id}
+                  className="flex items-center gap-2 py-[2px] text-[12px]"
+                  style={{
+                    color,
+                    opacity: i === 0 ? 1 : Math.max(0.25, 1 - i * 0.08),
+                    fontWeight: i === 0 ? 500 : 400,
+                  }}
+                >
+                  <IconCmp size={i === 0 ? 14 : 12} className="shrink-0" />
+                  <span className="flex-1 leading-[18px]">{entry.msg}</span>
+                </div>
+              );
+            })}
           </div>
         )}
 
