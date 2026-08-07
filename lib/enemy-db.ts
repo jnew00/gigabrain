@@ -175,6 +175,31 @@ export async function insertRun(
   );
 }
 
+export interface DungeonPerformanceRow {
+  dungeon_name: string;
+  total_runs: number;
+  wins: number;
+  avg_rooms: number;
+}
+
+/** Per-dungeon aggregates for the energy advisor (last 30 days) */
+export async function getDungeonPerformance(userAddress: string): Promise<DungeonPerformanceRow[]> {
+  if (!hasDatabase()) return [];
+  await ensureTables();
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const { rows } = await getPool().query(
+    `SELECT dungeon_name,
+            COUNT(*)::int as total_runs,
+            SUM(won)::int as wins,
+            AVG(rooms_cleared)::float as avg_rooms
+     FROM run_history
+     WHERE user_address = $1 AND timestamp > $2
+     GROUP BY dungeon_name`,
+    [userAddress, cutoff]
+  );
+  return rows as DungeonPerformanceRow[];
+}
+
 export async function getRunStats(userAddress: string): Promise<{
   totalRuns: number;
   wins: number;

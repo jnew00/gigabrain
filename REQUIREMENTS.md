@@ -150,9 +150,9 @@ gigaverse-controller/
 - [x] Track fishing stats: catch count, seaweed earned, rare catches
 
 #### 2.2 Fishing Skills
-- [ ] Display fishing skill levels
-- [ ] Recommend skill point allocation
-- [ ] Auto-upgrade fishing skills with seaweed
+- [x] Display fishing skill levels (per-stat rows in Skills flyout)
+- [x] Recommend skill point allocation (`lib/skill-advisor.ts` — ladder tuned to the card AI: Fintuition → Stamina → Weed Dealer; respec flagged when >35% of points sit in low-tier stats)
+- [x] One-click batch upgrade via `POST /api/game/skill/levelup` (combat trees too; deliberate no full-auto)
 
 ### Phase 3 — Economy & Inventory
 

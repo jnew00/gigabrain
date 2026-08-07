@@ -4,7 +4,7 @@ import { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction, evaluateState, explainAction, MOVE_LABELS } from "@/lib/auto-battle";
 import { getTrackerStats, getAllEnemyProfiles } from "@/lib/enemy-tracker";
 import type { EnemyMoveRecord } from "@/lib/enemy-tracker";
-import { authenticateWithSignature, recordRunAction, getRunStatsAction } from "./actions";
+import { authenticateWithSignature, recordRunAction, getRunStatsAction, getDungeonPerformanceAction } from "./actions";
 import { useLoginWithAbstract, useAbstractClient } from "@abstract-foundation/agw-react";
 import { useAccount, useSignMessage, useReadContract } from "wagmi";
 import { ABSTRACT_VOTING_ADDRESS, ABSTRACT_VOTING_ABI, GIGAVERSE_APP_ID } from "@/lib/voting-contract";
@@ -12,7 +12,9 @@ import { Sword, Shield, Sparkles, Skull, BarChart3, HardDrive, Package, Star, Sc
 import { MissionControlPage } from "./mission-control";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import type { Player, DungeonAction, DungeonActionResponse, RomEntity, FishingCard } from "@/lib/types";
-import { pickBestCard, shouldRedraw, predictNextPositions, coordToCell } from "@/lib/fishing-ai";
+import { pickBestCard, shouldRedraw, predictNextPositionsWeighted, scoreHand, coordToCell } from "@/lib/fishing-ai";
+import { FISHING } from "@/lib/game-data";
+import { buildSkillAdvice } from "@/lib/skill-advisor";
 
 const MOVE_ICONS: Record<string, typeof Sword> = {
   rock: Sword,
@@ -759,6 +761,37 @@ export default function Home() {
     []
   );
 
+  // Skill advisor: upgrade queue tuned to how the auto-battler plays.
+  // Normal and Underhaul trees are judged by their own dungeon's clear depth.
+  const [applyingSkills, setApplyingSkills] = useState(false);
+  const [dungeonPerfStats, setDungeonPerfStats] = useState<{ name: string; avgRooms: number; totalRuns: number }[]>([]);
+  const skillAdvice = useMemo(() => {
+    if (giga.skillTrees.length === 0) return null;
+    const avgRooms = runStats && runStats.totalRuns >= 3 ? runStats.avgRooms : null;
+    return buildSkillAdvice(giga.skillTrees, giga.skillProgress, giga.itemBalances, avgRooms, dungeonPerfStats);
+  }, [giga.skillTrees, giga.skillProgress, giga.itemBalances, runStats, dungeonPerfStats]);
+
+  const applySkillUpgrades = useCallback(async (upgrades: { skillId: number; statId: number; statName: string }[]) => {
+    setApplyingSkills(true);
+    let applied = 0;
+    try {
+      for (const u of upgrades) {
+        const r = await giga.levelUpSkill(u.skillId, u.statId);
+        if (!r || r.success === false) {
+          addLog(`skill upgrade failed at ${u.statName}: ${r?.message || giga.lastErrorRef.current || "unknown"}`);
+          break;
+        }
+        applied++;
+        addLog(`upgraded ${u.statName}`);
+        await new Promise((res) => setTimeout(res, 250));
+      }
+    } finally {
+      await giga.refreshSkills();
+      setApplyingSkills(false);
+      if (applied > 0) addLog(`applied ${applied} skill upgrade${applied === 1 ? "" : "s"}`);
+    }
+  }, [giga, addLog]);
+
   // Manual JWT connect
   const handleConnect = async () => {
     const me = await giga.connect(jwtInput);
@@ -833,6 +866,9 @@ export default function Home() {
   const refreshRunStats = useCallback(() => {
     if (!giga.address) return;
     getRunStatsAction(giga.address).then(setRunStats).catch(() => {});
+    getDungeonPerformanceAction(giga.address)
+      .then((rows) => setDungeonPerfStats(rows.map((r) => ({ name: r.dungeon_name, avgRooms: r.avg_rooms, totalRuns: r.total_runs }))))
+      .catch(() => {});
   }, [giga.address]);
   useEffect(() => {
     if (connected) refreshRunStats();
@@ -1704,14 +1740,61 @@ export default function Home() {
                 {flyout === "skills" && (
                   giga.skillTrees.length > 0 ? (
                     <div className="space-y-3">
+
+                      {/* Advisor: recommended upgrade queue */}
+                      {skillAdvice && skillAdvice.upgrades.length > 0 && (
+                        <div className="p-4 rounded-lg" style={{ background: "var(--bg-inset)", border: "1px solid var(--border-accent)" }}>
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-[13px] font-bold" style={{ color: "var(--gold)" }}>Recommended</span>
+                            <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+                              {skillAdvice.upgrades.length} upgrade{skillAdvice.upgrades.length === 1 ? "" : "s"}
+                            </span>
+                          </div>
+                          <div className="space-y-1.5 mb-3">
+                            {skillAdvice.upgrades.map((u, i) => (
+                              <div key={i} className="text-[12px]" style={{ color: "var(--text-dim)", lineHeight: 1.45 }}>
+                                <span className="font-semibold" style={{ color: "var(--text)" }}>
+                                  {u.statName} → Lv{u.fromLevel + 1}
+                                </span>
+                                <span className="tabular-nums" style={{ color: "var(--text-faint)" }}> ({u.cost} {giga.itemInfo[String(u.currencyItemId)]?.name || "currency"})</span>
+                                <div style={{ color: "var(--text-faint)" }}>{u.reason}</div>
+                              </div>
+                            ))}
+                          </div>
+                          <button
+                            onClick={() => applySkillUpgrades(skillAdvice.upgrades)}
+                            disabled={applyingSkills}
+                            className="btn-press w-full text-[12px] font-bold py-2 rounded-lg cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                            style={{ background: "var(--orange-glow)", border: "1px solid var(--border-accent)", color: "var(--orange)" }}
+                          >
+                            {applyingSkills ? "Applying..." : `Apply all (${Object.entries(skillAdvice.totalCostByCurrency).map(([id, c]) => `${c} ${giga.itemInfo[id]?.name || "currency"}`).join(" + ")})`}
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Respec + save-up notes */}
+                      {skillAdvice && (skillAdvice.respec.length > 0 || skillAdvice.nextGoals.length > 0) && (
+                        <div className="space-y-1.5">
+                          {skillAdvice.respec.map((r, i) => (
+                            <div key={`r${i}`} className="p-3 rounded-lg text-[12px]" style={{ background: "var(--red-glow)", border: "1px solid var(--red-border)", color: "var(--red)", lineHeight: 1.45 }}>
+                              <span className="font-bold">{r.treeName} respec: </span>{r.note}
+                            </div>
+                          ))}
+                          {skillAdvice.nextGoals.map((g, i) => (
+                            <div key={`g${i}`} className="text-[12px] px-1" style={{ color: "var(--text-faint)", lineHeight: 1.45 }}>
+                              Next: {g}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
                       {giga.skillTrees.map((tree) => {
                         const prog = giga.skillProgress.find((p) => p.SKILL_CID === Number(tree.docId));
                         const totalLvl = prog?.LEVEL_CID ?? 0;
                         const maxLvl = tree.LEVEL_CID || 100;
                         const nextCost = tree.xpPerLvl?.[totalLvl + 1];
                         const currencyBal = giga.itemBalances[String(tree.GAME_ITEM_ID_CID)] ?? 0;
-                        const canUpgrade = nextCost !== undefined && currencyBal >= nextCost;
-                        const pct = totalLvl >= maxLvl ? 100 : nextCost ? Math.min((currencyBal / nextCost) * 100, 100) : 0;
+                        const canUpgrade = nextCost !== undefined && currencyBal >= nextCost && totalLvl < maxLvl;
                         const currencyName = giga.itemInfo[String(tree.GAME_ITEM_ID_CID)]?.name || `Item#${tree.GAME_ITEM_ID_CID}`;
 
                         return (
@@ -1724,24 +1807,34 @@ export default function Home() {
                                 Lv {totalLvl}/{maxLvl}
                               </span>
                             </div>
-                            <div className="flex items-center gap-2.5 mt-2">
-                              <div className="flex-1 rounded-full overflow-hidden" style={{ height: 6, background: "var(--bg)" }}>
-                                <div className="h-full rounded-full" style={{ width: `${pct}%`, background: canUpgrade ? "var(--green)" : "var(--orange)" }} />
-                              </div>
-                              <span className="text-[12px] tabular-nums" style={{ color: canUpgrade ? "var(--green)" : "var(--text-faint)" }}>
-                                {totalLvl >= maxLvl ? "MAX" : `${currencyBal}/${nextCost}`}
-                              </span>
+                            <div className="text-[11px] tabular-nums mt-0.5 mb-2" style={{ color: "var(--text-faint)" }}>
+                              {totalLvl >= maxLvl ? "MAX" : nextCost !== undefined ? `next level: ${nextCost} · have ${currencyBal} ${currencyName}` : ""}
                             </div>
-                            {canUpgrade && (
-                              <div className="text-[12px] font-semibold mt-1.5" style={{ color: "var(--green)" }}>
-                                Ready to upgrade!
-                              </div>
-                            )}
-                            {!canUpgrade && totalLvl < maxLvl && nextCost !== undefined && (
-                              <div className="text-[12px] mt-1.5" style={{ color: "var(--text-faint)" }}>
-                                {nextCost - currencyBal} {currencyName} needed
-                              </div>
-                            )}
+
+                            {/* Per-stat rows with upgrade buttons */}
+                            <div className="space-y-1">
+                              {tree.stats.map((stat) => {
+                                const lvl = prog?.LEVEL_CID_array?.[stat.id] ?? 0;
+                                const isRecommended = skillAdvice?.upgrades[0]?.skillId === Number(tree.docId) && skillAdvice.upgrades[0]?.statId === stat.id;
+                                return (
+                                  <div key={stat.id} className="flex items-center gap-2">
+                                    <span className="flex-1 text-[12px] truncate" style={{ color: isRecommended ? "var(--gold)" : "var(--text-dim)" }} title={stat.desc}>
+                                      {stat.name}
+                                      {isRecommended && <span className="font-bold"> ★</span>}
+                                    </span>
+                                    <span className="text-[12px] tabular-nums" style={{ color: "var(--text-faint)" }}>Lv {lvl}</span>
+                                    <button
+                                      onClick={() => applySkillUpgrades([{ skillId: Number(tree.docId), statId: stat.id, statName: stat.name }])}
+                                      disabled={!canUpgrade || applyingSkills}
+                                      className="btn-press text-[11px] font-bold px-2 py-0.5 rounded cursor-pointer disabled:opacity-25 disabled:cursor-not-allowed"
+                                      style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", color: canUpgrade ? "var(--green)" : "var(--text-faint)" }}
+                                    >
+                                      +
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
                           </div>
                         );
                       })}
@@ -2478,7 +2571,9 @@ function FishingPage({ giga, addLog }: {
   const isInGame = fs?.gameState && !fs.gameState.COMPLETE_CID;
   const castsToday = fs?.dayDoc?.UINT256_CID ?? 0;
   const fishJuiced = giga.energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false;
-  const maxCasts = fishJuiced ? (fs?.maxPerDayJuiced ?? fs?.maxPerDay ?? 50) : (fs?.maxPerDay ?? 50);
+  const maxCasts = fishJuiced
+    ? (fs?.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
+    : (fs?.maxPerDay ?? FISHING.maxCastsPerDay);
 
   const addFishLog = useCallback((msg: string) => {
     setFishingLog((prev) => [msg, ...prev].slice(0, 100));
@@ -2598,7 +2693,9 @@ function FishingPage({ giga, addLog }: {
         const state = await giga.fetchFishingState();
         if (!state || cancelled) break;
         const today = state.dayDoc?.UINT256_CID ?? 0;
-        const max = fishJuiced ? (state.maxPerDayJuiced ?? state.maxPerDay ?? 50) : (state.maxPerDay ?? 50);
+        const max = fishJuiced
+          ? (state.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
+          : (state.maxPerDay ?? FISHING.maxCastsPerDay);
         if (today >= max) {
           addFishLog(`=== Daily limit reached (${today}/${max}) ===`);
           break;
@@ -2759,11 +2856,13 @@ function FishingPage({ giga, addLog }: {
               const hasFintuition = gameData?.nextPosition && gameData.nextPosition.length === 2;
               const nextCell = hasFintuition ? coordToCell(gameData!.nextPosition!) : 0;
 
-              // Predicted cells — where the fish is GOING
+              // Predicted cells — where the fish is GOING (likely cells only)
               const predicted = hasFintuition
                 ? [nextCell]
                 : gameData
-                ? predictNextPositions(fishCell, prevCell)
+                ? predictNextPositionsWeighted(fishCell, prevCell)
+                    .filter((e) => e.p >= 0.12)
+                    .map((e) => e.cell)
                 : [];
 
               return (
@@ -2908,34 +3007,21 @@ function FishingPage({ giga, addLog }: {
               </div>
               <div className="flex flex-col gap-2">
                 {(() => {
-                  // Convert coordinates to cell IDs, then predict
-                  const fishCell = coordToCell(gameData.fishPosition);
-                  const prevCell = coordToCell(gameData.previousFishPosition);
-                  const hasFintuition = gameData.nextPosition && gameData.nextPosition.length === 2;
-                  const targetPos = hasFintuition
-                    ? [coordToCell(gameData.nextPosition!)]
-                    : predictNextPositions(fishCell, prevCell);
-
-                  // Score each card to find the best one
-                  const scored = handCards.map((card, handIdx) => {
-                    if (!card) return { card: null, handIdx, score: -Infinity, hitsOverlap: false, critOverlap: false, coverageCount: 0 };
-                    const hitsOverlap = card.hitZones.some((z) => targetPos.includes(z));
-                    const critOverlap = hitsOverlap && card.critZones.some((z) => targetPos.includes(z));
-                    const hitDmg = card.hitEffects.reduce((s, e) => s + e.amount, 0);
-                    const missPenalty = card.missEffects.reduce((s, e) => s + Math.abs(e.amount), 0);
-                    const critDmg = card.critEffects.reduce((s, e) => s + e.amount, 0);
-                    const coverageCount = card.hitZones.filter((z) => targetPos.includes(z)).length;
-                    const score = hitsOverlap
-                      ? hitDmg + (critOverlap ? critDmg : 0) + coverageCount * 0.5
-                      : -missPenalty;
-                    return { card, handIdx, score, hitsOverlap, critOverlap, coverageCount, hitDmg, missPenalty, critDmg };
-                  });
-                  const bestIdx = scored.reduce((best, s, i) => s.score > scored[best].score ? i : best, 0);
+                  // Same scoring the auto-player uses — "BEST" here is what
+                  // auto-fish would play
+                  const scored = scoreHand(
+                    gameData.hand, gameData.deckCardData, gameData.fishPosition,
+                    gameData.previousFishPosition, gameData.nextPosition
+                  );
+                  const bestIdx = scored.reduce((best, s, i) => (s.ev > scored[best].ev ? i : best), 0);
 
                   return scored.map((s) => {
                     if (!s.card) return null;
                     const card = s.card;
                     const isBest = s.handIdx === scored[bestIdx].handIdx;
+                    const likelyHit = s.pHit >= 0.5;
+                    const likelyCrit = s.pCrit >= 0.3;
+                    const hitPct = Math.round(s.pHit * 100);
 
                     return (
                       <button
@@ -2944,32 +3030,32 @@ function FishingPage({ giga, addLog }: {
                         disabled={autoFish}
                         className="btn-press rounded-md p-3 cursor-pointer text-left relative"
                         style={{
-                          background: s.critOverlap
+                          background: likelyCrit
                             ? "var(--gold-glow)"
-                            : s.hitsOverlap
+                            : likelyHit
                             ? "var(--green-glow)"
                             : "var(--bg-inset)",
                           border: isBest
-                            ? `2px solid ${s.critOverlap ? "var(--gold)" : s.hitsOverlap ? "var(--green)" : "var(--text-dim)"}`
-                            : `1px solid ${s.critOverlap ? "var(--gold)" : s.hitsOverlap ? "var(--green-dim)" : "var(--border)"}`,
+                            ? `2px solid ${likelyCrit ? "var(--gold)" : likelyHit ? "var(--green)" : "var(--text-dim)"}`
+                            : `1px solid ${likelyCrit ? "var(--gold)" : likelyHit ? "var(--green-dim)" : "var(--border)"}`,
                         }}
                       >
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
                             <span className="text-[13px] font-bold" style={{
-                              color: s.critOverlap ? "var(--gold)" : s.hitsOverlap ? "var(--green)" : "var(--text-dim)",
+                              color: likelyCrit ? "var(--gold)" : likelyHit ? "var(--green)" : "var(--text-dim)",
                             }}>
                               Card #{card.id}
                             </span>
-                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{
+                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded tabular-nums" style={{
                               background: "var(--bg-raised)",
-                              color: s.critOverlap ? "var(--gold)" : s.hitsOverlap ? "var(--green)" : "var(--red)",
+                              color: likelyCrit ? "var(--gold)" : likelyHit ? "var(--green)" : hitPct > 0 ? "var(--text-dim)" : "var(--red)",
                             }}>
-                              {s.critOverlap ? "CRIT" : s.hitsOverlap ? "HIT" : "MISS"}
+                              {hitPct}% hit{likelyCrit ? " CRIT" : ""}
                             </span>
                             {isBest && (
                               <span className="text-[10px] font-bold px-1.5 py-0.5 rounded" style={{
-                                background: s.hitsOverlap ? "var(--green)" : "var(--text-dim)",
+                                background: likelyHit ? "var(--green)" : "var(--text-dim)",
                                 color: "var(--bg)",
                               }}>
                                 BEST
@@ -2987,15 +3073,17 @@ function FishingPage({ giga, addLog }: {
                           <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
                             Miss: <span style={{ color: "var(--red)" }}>+{s.missPenalty}</span>
                           </span>
-                          {(s.critDmg ?? 0) > 0 && (
+                          {s.critDmg > 0 && (
                             <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
                               Crit: <span style={{ color: "var(--gold)" }}>-{s.critDmg}</span>
                             </span>
                           )}
+                          <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+                            EV: <span style={{ color: s.ev > 0 ? "var(--green)" : "var(--red)" }}>{s.ev.toFixed(1)}</span>
+                          </span>
                         </div>
                         <div className="text-[10px] mt-1" style={{ color: "var(--text-faint)" }}>
                           Targets: [{card.hitZones.join(",")}]
-                          {s.hitsOverlap && <span> — covers {s.coverageCount}/{targetPos.length} predicted</span>}
                           {card.critZones.length > 0 && <span> | Crit: [{card.critZones.join(",")}]</span>}
                         </div>
                       </button>

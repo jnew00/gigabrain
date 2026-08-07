@@ -1,6 +1,6 @@
 # Gigaverse Game Systems - Comprehensive Automation Reference
 
-> Researched from https://glhfers.gitbook.io/gigaverse (March 2026)
+> Researched from https://docs.gigaverse.io (updated August 2026; originally March 2026)
 > **IMPORTANT**: Bots and automation are **explicitly allowed** per Fair Play Rules.
 > Multi-accounting is also permitted.
 
@@ -22,7 +22,8 @@
 12. [Skill Systems](#12-skill-systems)
 13. [Gear & Equipment](#13-gear--equipment)
 14. [Abstract Ecosystem (XP & Stubs)](#14-abstract-ecosystem-xp--stubs)
-15. [Automation Priority Matrix](#15-automation-priority-matrix)
+15. [The Awakening (Seasonal Event)](#15-the-awakening-seasonal-event-aug-10---oct-12-2026)
+16. [Automation Priority Matrix](#16-automation-priority-matrix)
 
 ---
 
@@ -50,6 +51,26 @@ Roguelite dungeons with 4 rooms per floor, 4 floors total. Enemies increase in d
 - **Combat**: Same Sword/Shield/Spell system
 - **Rewards**: Giga Shards (soulbound) + random items/materials/skins
 - **Currency**: Giga Shards (used for Underhaul skill upgrades)
+
+#### Dungetron 5000: Gigus (added mid-2026)
+- **Energy cost**: 200 per run ("extreme version of the dungeon")
+- **Daily limit**: 30 runs (same juiced; "subject to change")
+- **Combat**: Identical to Normal dungeon combat
+- **Rewards**: **Gigus materials only** — drops NO scrap; this is the sole
+  source of Gigus materials in the game
+- Flee via ladder after defeating an enemy to bank progress without dying
+
+#### Dungetron: Void (event dungeon, added mid-2026)
+- **Opens only during specific events**; mechanics/rewards vary per event
+- **Entry**: item-based (e.g. gigabit, in-game resources), not energy;
+  requirements change per event. No daily limit currently
+- **Gear and Charms are disabled**; consumables allowed
+- **Void skills** (level with Void essence, reset each event): HP, Armor,
+  Tenacity (1%/lvl), Block (1%/lvl), Evasion (0.5%/lvl), Luck (0.75%/lvl),
+  Intuition (0.5%/lvl) — these map to the `tenacity/block/evasion/lck/intuition`
+  fields on the dungeon Player API object
+- **Rewards**: event items, temporary weapon skill upgrades, gigabit jackpots
+  for defeating player Echoes or final bosses
 
 #### Echo Battles
 - Appear after reaching level 10 in each dungeon
@@ -448,7 +469,29 @@ Two types, each requires 5 energy + specific Hands item:
 
 ## 11. Hatchery / Giglings
 
-### Overview
+### Gigling Racing (added 2026)
+- Each Gigling races **2x/day** (3x juiced); limits reset daily
+- Race stats rolled fresh per race: Start, Speed, Stamina, Finish
+- **Free races**: gas only. **Stakes races**: ETH entry — 85-95% to prize pot,
+  1-3% protocol fee (1% juiced), 1-10% creator fee, 2.5% to jackpot
+- Config: 2-8 players; 500m/1200m/2500m/3000m; Cold/Average/Hot weather
+- Race creation: 5/day (50/day juiced)
+- **Jackpot**: 1st place in stakes races can win 40% of jackpot
+  (~0.005%-2% odds, capped at 0.1 ETH entry; 2x odds juiced)
+- Earns Derby Stubs (more if juiced)
+
+### Gigling Dueling (added 2026)
+- Unlocks after a Gigling completes **40 total races**; requires one male +
+  one female Gigling
+- **3 duels max per lifetime**; 3rd duel the Gigling falls 100%. Loser is
+  burned, challenger receives the Duelborn offspring
+- **Glue** (from burning Giglings) buys up to 3 extra duels:
+  Uncommon 4 / Rare 8 / Epic 12 / Legendary 24 / Relic 32 / Giga 40 yield;
+  4-8 Glue per extra duel by rarity
+- Duelborn inherits gender from fallen parent, rarity centered on the
+  lower-rarity parent, 10% mutation chance per trait
+
+### Hatchery Overview
 Pets system. Eggs hatch into Giglings (mounts/companions).
 
 ### Egg Types
@@ -562,7 +605,26 @@ Head, Body, Charms, Hands, Lures, Rods
 
 ---
 
-## 15. Automation Priority Matrix
+## 15. The Awakening (seasonal event: Aug 10 - Oct 12, 2026)
+
+- Collect **Cores** via the event dungeon + fishing pond, resource conversion
+  (ROMs, Giglings, relic armor), and daily/weekly quests + item turn-ins
+- **Juiced players earn 4x Cores**
+- Separate gear track: only gear crafted in The Awakening zone works in the
+  event dungeon/pond (rods, lures, charms, head/body)
+- **Prize pool**: $20,000 USDC start + 50% of Juice purchases, marketplace
+  fees, and vendor sales during the event; paid via gacha boxes to players
+  above a minimum Core threshold
+- **Hall of Noobs**: Core-count rankings; positioned as long-term player
+  alignment ledger
+- Carries into Gigaverse Online: Giga Juice, GIGABIT, cosmetics, SBTs, Dung,
+  butterflies, Gigacha coins ("eternal" items)
+- **Automation angle**: quest/turn-in completion daily, maximize Core/energy
+  during the window, juiced 4x makes Juice ROI-positive for the event
+
+---
+
+## 16. Automation Priority Matrix
 
 ### Tier 1 - High Value, High Feasibility (Build First)
 | System | Why | Actions/Day |

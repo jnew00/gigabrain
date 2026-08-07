@@ -210,9 +210,10 @@ export interface TodayDungeonData {
   ID_CID: number;
   NAME_CID: string;
   ENERGY_CID: number;
-  UINT256_CID: number;
+  UINT256_CID: number;          // base (non-juiced) max runs per day
   CHECKPOINT_CID: number;
   juicedMaxRunsPerDay: number;
+  maxRunsPerDay?: number;       // some responses expose the base limit explicitly
   entryData?: DungeonEntryTier[];
 }
 
@@ -324,6 +325,28 @@ export interface GearInstance {
 
 export interface GearInstancesResponse {
   entities: GearInstance[];
+}
+
+// ─── Traveling Merchant (Hugis/Munis) ────────────────────────
+// Shape is best-effort — captured GET only; fields probed defensively
+
+export interface VendorListingEntity {
+  docId?: string;
+  ID_CID?: string;
+  NAME_CID?: string;
+  INPUT_ID_CID_array?: number[];
+  INPUT_AMOUNT_CID_array?: number[];
+  LOOT_ID_CID_array?: number[];
+  LOOT_AMOUNT_CID_array?: number[];
+  MAX_COMPLETIONS_CID?: number;
+  COMPLETIONS_CID?: number;
+  DAY_COUNT_CID?: number;
+  WEEK_COUNT_CID?: number;
+  [key: string]: unknown;
+}
+
+export interface VendorListingsResponse {
+  entities?: VendorListingEntity[];
 }
 
 // ─── GigaJuice ────────────────────────────────────────────────

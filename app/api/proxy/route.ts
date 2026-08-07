@@ -5,16 +5,11 @@ const BASE_URL = "https://gigaverse.io";
 
 const ALLOWED_METHODS = new Set(["GET", "POST"]);
 
-// Allowed endpoint prefixes — only these paths can be proxied
-const ALLOWED_ENDPOINTS = [
+// Exact endpoint paths (query string is stripped before matching)
+const ALLOWED_EXACT = new Set([
   "/api/user/me",
-  "/api/account/",
-  "/api/offchain/player/energy/",
-  "/api/offchain/player/activeDungeon/",
   "/api/offchain/skills",
-  "/api/offchain/skills/progress/",
   "/api/offchain/static",
-  "/api/offchain/recipes/player/",
   "/api/offchain/recipes/start",
   "/api/roms/player",
   "/api/roms/factory-claim",
@@ -22,23 +17,35 @@ const ALLOWED_ENDPOINTS = [
   "/api/game/dungeon/state",
   "/api/game/dungeon/today",
   "/api/game/dungeon/action",
+  "/api/game/skill/levelup",
   "/api/indexer/gameitems",
-  "/api/indexer/player/gameitems/",
   "/api/items/balances",
   "/api/gear/items",
+  "/api/fishing/cards",
+  "/api/fishing/action",
+  "/api/fishing/sell",
+  "/api/vendor/listings",
+]);
+
+// Prefixes for endpoints with a path parameter — every entry ends in "/"
+// so "/api/offchain/skills" can never match "/api/offchain/skillsAdmin"
+const ALLOWED_PREFIXES = [
+  "/api/account/",
+  "/api/offchain/player/energy/",
+  "/api/offchain/player/activeDungeon/",
+  "/api/offchain/skills/progress/",
+  "/api/offchain/recipes/player/",
+  "/api/indexer/player/gameitems/",
   "/api/gear/instances/",
   "/api/gigajuice/player/",
   "/api/factions/player/",
   "/api/fishing/state/",
-  "/api/fishing/cards",
-  "/api/fishing/action",
-  "/api/fishing/sell",
 ];
 
 function isEndpointAllowed(endpoint: string): boolean {
-  return ALLOWED_ENDPOINTS.some(
-    (allowed) => endpoint === allowed || endpoint.startsWith(allowed)
-  );
+  const path = endpoint.split("?")[0];
+  if (ALLOWED_EXACT.has(path)) return true;
+  return ALLOWED_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
 export async function POST(req: NextRequest) {

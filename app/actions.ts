@@ -7,6 +7,7 @@ import {
   importBulk,
   insertRun,
   getRunStats as dbGetRunStats,
+  getDungeonPerformance as dbGetDungeonPerformance,
 } from "@/lib/enemy-db";
 import type { EnemyMoveRow } from "@/lib/enemy-db";
 
@@ -112,6 +113,13 @@ export async function getRunStatsAction(userAddress: string) {
     throw new Error("Invalid user address");
   }
   return dbGetRunStats(userAddress);
+}
+
+export async function getDungeonPerformanceAction(userAddress: string) {
+  if (typeof userAddress !== "string") {
+    throw new Error("Invalid user address");
+  }
+  return dbGetDungeonPerformance(userAddress);
 }
 
 /* ─── Auth ────────────────────────────────────────────── */

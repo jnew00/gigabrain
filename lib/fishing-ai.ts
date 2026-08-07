@@ -120,13 +120,16 @@ function detectPatternWeights(
  * Predict where the fish will move next, considering all 3 movement patterns
  * weighted by likelihood from observed movement history.
  *
- * Takes cell IDs (1-9), returns cell IDs sorted by likelihood (most likely first).
+ * Takes cell IDs (1-9), returns cells with NORMALIZED probabilities
+ * (sums to 1), most likely first.
  */
-export function predictNextPositions(
+export function predictNextPositionsWeighted(
   currentCell: number,
   previousCell: number,
-): number[] {
-  if (!currentCell) return [1, 2, 3, 4, 5, 6, 7, 8, 9];
+): { cell: number; p: number }[] {
+  if (!currentCell) {
+    return Array.from({ length: 9 }, (_, i) => ({ cell: i + 1, p: 1 / 9 }));
+  }
 
   const weights = detectPatternWeights(previousCell, currentCell);
 
@@ -159,41 +162,121 @@ export function predictNextPositions(
     }
   }
 
-  // Sort by score descending
+  const total = Array.from(posScores.values()).reduce((s, v) => s + v, 0);
+  if (total <= 0) {
+    return Array.from({ length: 9 }, (_, i) => ({ cell: i + 1, p: 1 / 9 }));
+  }
   return Array.from(posScores.entries())
-    .sort((a, b) => b[1] - a[1])
-    .map(([pos]) => pos);
+    .map(([cell, w]) => ({ cell, p: w / total }))
+    .sort((a, b) => b.p - a.p);
+}
+
+/**
+ * Back-compat wrapper: predicted cells sorted by likelihood (no weights).
+ */
+export function predictNextPositions(
+  currentCell: number,
+  previousCell: number,
+): number[] {
+  return predictNextPositionsWeighted(currentCell, previousCell).map((e) => e.cell);
 }
 
 /* ─── Card Scoring ─────────────────────────────────────────── */
 
+/** Mana is the cast's limiting resource — trade ~this much damage per mana */
+const MANA_WEIGHT = 0.35;
+
+export interface CardScore {
+  handIdx: number;
+  cardId: number;
+  card: FishingCard | null;
+  /** Expected value: pHit*dmg + pCrit*critDmg - pMiss*penalty - mana cost */
+  ev: number;
+  /** Probability the card hits the fish's next cell (0-1) */
+  pHit: number;
+  /** Probability the hit is a crit (0-1) */
+  pCrit: number;
+  hitDmg: number;
+  missPenalty: number;
+  critDmg: number;
+  reason: string;
+}
+
 /**
- * Score a card against TARGET cell IDs (where the fish is expected to be).
+ * Score a card against a probability distribution over the fish's NEXT cell.
  * Cards resolve AFTER the fish moves, so we score against predicted/Fintuition
  * positions, not where the fish currently sits.
  */
-function scoreCard(
+function scoreCardWeighted(
   card: FishingCard,
-  targetCells: number[]
-): { score: number; isHit: boolean; isCrit: boolean; hitDmg: number; missPenalty: number; critDmg: number; coverageCount: number } {
-  const isHit = card.hitZones.some((z) => targetCells.includes(z));
-  const isCrit = isHit && card.critZones.some((z) => targetCells.includes(z));
-
+  targets: { cell: number; p: number }[]
+): { ev: number; pHit: number; pCrit: number; hitDmg: number; missPenalty: number; critDmg: number } {
   const hitDmg = card.hitEffects.reduce((sum, e) => sum + e.amount, 0);
   const missPenalty = card.missEffects.reduce((sum, e) => sum + Math.abs(e.amount), 0);
   const critDmg = card.critEffects.reduce((sum, e) => sum + e.amount, 0);
 
-  const coverageCount = card.hitZones.filter((z) => targetCells.includes(z)).length;
-  const critCount = card.critZones.filter((z) => targetCells.includes(z)).length;
-
-  let score: number;
-  if (isHit) {
-    score = hitDmg + (isCrit ? critDmg : 0) + coverageCount * 0.5 + critCount * 0.3;
-  } else {
-    score = -missPenalty;
+  let pHit = 0;
+  let pCrit = 0;
+  for (const t of targets) {
+    if (card.hitZones.includes(t.cell)) {
+      pHit += t.p;
+      if (card.critZones.includes(t.cell)) pCrit += t.p;
+    }
   }
 
-  return { score, isHit, isCrit, hitDmg, missPenalty, critDmg, coverageCount };
+  const ev =
+    pHit * hitDmg +
+    pCrit * critDmg -
+    (1 - pHit) * missPenalty -
+    card.manaCost * MANA_WEIGHT;
+
+  return { ev, pHit, pCrit, hitDmg, missPenalty, critDmg };
+}
+
+/**
+ * Score every card in hand against the fish's predicted next position.
+ * Shared by the auto-player and the hand UI so "BEST" always matches
+ * what auto-fish would play. Results keep hand order.
+ */
+export function scoreHand(
+  hand: number[],
+  deckCardData: FishingCard[],
+  fishPosition: number[],
+  previousFishPosition?: number[],
+  nextPosition?: number[] | null
+): CardScore[] {
+  const cardLookup = new Map<number, FishingCard>();
+  for (const c of deckCardData) cardLookup.set(c.id, c);
+
+  const currentCell = coordToCell(fishPosition);
+  const prevCell = previousFishPosition ? coordToCell(previousFishPosition) : 0;
+
+  const hasFintuition = nextPosition && nextPosition.length === 2;
+  const targets: { cell: number; p: number }[] = hasFintuition
+    ? [{ cell: coordToCell(nextPosition), p: 1 }]
+    : predictNextPositionsWeighted(currentCell, prevCell);
+
+  const source = hasFintuition ? "Fintuition" : "predicted";
+
+  return hand.map((cardId, handIdx) => {
+    const card = cardLookup.get(cardId);
+    if (!card) {
+      return {
+        handIdx, cardId, card: null, ev: -Infinity,
+        pHit: 0, pCrit: 0, hitDmg: 0, missPenalty: 0, critDmg: 0,
+        reason: "unknown card",
+      };
+    }
+    const s = scoreCardWeighted(card, targets);
+    const pct = Math.round(s.pHit * 100);
+    const reason =
+      s.pHit <= 0
+        ? `MISS #${cardId} (0% hit, -${s.missPenalty} penalty)`
+        : s.pCrit > 0.3
+        ? `${source} CRIT #${cardId} (${pct}% hit, ${s.hitDmg}+${s.critDmg} dmg)`
+        : `${source} #${cardId} (${pct}% hit, ${s.hitDmg} dmg, EV ${s.ev.toFixed(1)})`;
+    return { handIdx, cardId, card, ...s, reason };
+  });
 }
 
 /* ─── Main Exports ─────────────────────────────────────────── */
@@ -223,47 +306,15 @@ export function pickBestCard(
     return { handIndex: 0, reason: "No cards in hand" };
   }
 
-  const cardLookup = new Map<number, FishingCard>();
-  for (const c of deckCardData) {
-    cardLookup.set(c.id, c);
-  }
-
-  // Convert API coordinates to cell IDs
-  const currentCell = coordToCell(fishPosition);
-  const prevCell = previousFishPosition ? coordToCell(previousFishPosition) : 0;
-
-  // Determine target cells — where the fish is GOING
-  const hasFintuition = nextPosition && nextPosition.length === 2;
-  const targetCells = hasFintuition
-    ? [coordToCell(nextPosition)]
-    : predictNextPositions(currentCell, prevCell);
-
-  // Score all cards against target cells
-  const scores = hand.map((cardId, i) => {
-    const card = cardLookup.get(cardId);
-    if (!card) return { index: i, cardId, score: -Infinity, reason: "unknown card", isHit: false };
-
-    const result = scoreCard(card, targetCells);
-    const source = hasFintuition ? "Fintuition" : "predicted";
-    let reason: string;
-    if (result.isCrit) {
-      reason = `${source} CRIT #${cardId} (${result.hitDmg}+${result.critDmg} dmg)`;
-    } else if (result.isHit) {
-      reason = `${source} HIT #${cardId} (${result.hitDmg} dmg, covers ${result.coverageCount}/${targetCells.length})`;
-    } else {
-      reason = `MISS #${cardId} (-${result.missPenalty} mana)`;
-    }
-    return { index: i, cardId, score: result.score, reason, isHit: result.isHit };
-  });
-
-  // Play the highest-scoring card
-  const best = scores.reduce((a, b) => (b.score > a.score ? b : a));
-  return { handIndex: best.index, reason: best.reason };
+  const scores = scoreHand(hand, deckCardData, fishPosition, previousFishPosition, nextPosition);
+  const best = scores.reduce((a, b) => (b.ev > a.ev ? b : a));
+  return { handIndex: best.handIdx, reason: best.reason };
 }
 
 /**
- * Returns true if no card in hand can hit any of the predicted next cells.
- * This means we should redraw the hand (costs 1 mana per card).
+ * Returns true when the hand has no realistic hit — every card's chance of
+ * hitting the fish's next cell is below 20%. Signals a redraw would help
+ * (costs 1 mana per remaining card).
  *
  * All position params are API [col, row] coordinates.
  */
@@ -274,22 +325,8 @@ export function shouldRedraw(
   previousFishPosition?: number[],
   nextPosition?: number[] | null
 ): boolean {
-  const cardLookup = new Map<number, FishingCard>();
-  for (const c of deckCardData) cardLookup.set(c.id, c);
-
-  const currentCell = coordToCell(fishPosition);
-  const prevCell = previousFishPosition ? coordToCell(previousFishPosition) : 0;
-  const hasFintuition = nextPosition && nextPosition.length === 2;
-  const targetCells = hasFintuition
-    ? [coordToCell(nextPosition)]
-    : predictNextPositions(currentCell, prevCell);
-
-  for (const cardId of hand) {
-    const card = cardLookup.get(cardId);
-    if (!card) continue;
-    if (card.hitZones.some((z) => targetCells.includes(z))) return false;
-  }
-  return true;
+  const scores = scoreHand(hand, deckCardData, fishPosition, previousFishPosition, nextPosition);
+  return scores.every((s) => s.pHit < 0.2);
 }
 
 /**

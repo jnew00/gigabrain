@@ -4,17 +4,16 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction } from "@/lib/auto-battle";
 import { pickBestCard } from "@/lib/fishing-ai";
-import { Sword, Package, Fish, AlertTriangle, Info } from "lucide-react";
-import { recordRunAction } from "./actions";
+import { Sword, Package, Fish, AlertTriangle, Info, Lightbulb } from "lucide-react";
+import { recordRunAction, getDungeonPerformanceAction } from "./actions";
+import { getMaxRunsPerDay, findDungeonInfo, FISHING } from "@/lib/game-data";
+import { buildRecommendation } from "@/lib/energy-advisor";
+import type { AdvisorResult } from "@/lib/energy-advisor";
 
 
 /* ─── Constants ────────────────────────────────────────────── */
 
-const CAST_NODES = [
-  { nodeId: "0", label: "Small", cost: 12 },
-  { nodeId: "1", label: "Normal", cost: 16 },
-  { nodeId: "2", label: "Big", cost: 20 },
-] as const;
+const CAST_NODES = FISHING.nodes;
 
 const RECIPE_ITEMS = {
   chest: "Recipe#700000",
@@ -241,7 +240,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     const allocs = dungeons.filter((d) => d.ENERGY_CID > 0).map((d) => {
       const progressEntry = dayProgress.find((p) => p.ID_CID === `Dungeon#${d.ID_CID}`);
       const runsToday = progressEntry?.UINT256_CID ?? 0;
-      const maxRuns = (d.juicedMaxRunsPerDay || 10) - runsToday;
+      const maxRuns = getMaxRunsPerDay(d, eng?.isPlayerJuiced ?? false) - runsToday;
       const saved = last?.dungeonAllocs?.find((a) => a.dungeonId === d.ID_CID);
       // Clamp saved runs by both max runs remaining AND available energy
       let runs = saved ? Math.min(saved.runs, maxRuns) : 0;
@@ -286,12 +285,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   const fs = giga.fishingState;
   const isJuiced = eng?.isPlayerJuiced ?? false;
   const castsToday = fs?.dayDoc?.UINT256_CID ?? 0;
-  const maxCasts = isJuiced ? (fs?.maxPerDayJuiced ?? fs?.maxPerDay ?? 50) : (fs?.maxPerDay ?? 50);
+  const maxCasts = isJuiced
+    ? (fs?.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
+    : (fs?.maxPerDay ?? FISHING.maxCastsPerDay);
   const remainingCasts = Math.max(0, maxCasts - castsToday);
 
   // Recommended cast
   function recommendCast(energy: number, fishState: NonNullable<typeof fs>): string {
-    const maxC = isJuiced ? (fishState.maxPerDayJuiced ?? fishState.maxPerDay ?? 50) : (fishState.maxPerDay ?? 50);
+    const maxC = isJuiced
+      ? (fishState.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
+      : (fishState.maxPerDay ?? FISHING.maxCastsPerDay);
     const remaining = Math.max(0, maxC - (fishState.dayDoc?.UINT256_CID ?? 0));
     if (remaining <= 0) return "0";
     const bigCasts = Math.min(remaining, Math.floor(energy / (fishState.node2Energy || 20)));
@@ -311,6 +314,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   // ROM stats
   const roms = giga.roms?.entities ?? [];
   const totalRomE = roms.reduce((s, r) => s + Math.floor(r.factoryStats.energyCollectable), 0);
+  // Energy the plan can actually spend: pool + ROM energy when it will be
+  // claimed as energy before the runs start
+  const effectiveEnergy = currentEnergy + (freeActions.romEnergyMode === "claim" ? totalRomE : 0);
   const totalRomS = roms.reduce((s, r) => s + Math.floor(r.factoryStats.shardCollectable), 0);
   const totalRomD = roms.reduce((s, r) => s + Math.floor(r.factoryStats.dustCollectable), 0);
 
@@ -361,6 +367,123 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     }
   }, [dungeonAllocs, fishingAlloc, freeActions]);
 
+  /* ─── Energy Advisor ────────────────────────────────────── */
+
+  // Per-dungeon run history (last 30 days) for performance-aware advice
+  const [dungeonPerf, setDungeonPerf] = useState<
+    Record<string, { total_runs: number; wins: number; avg_rooms: number }>
+  >({});
+  useEffect(() => {
+    if (!giga.address) return;
+    getDungeonPerformanceAction(giga.address)
+      .then((rows) => {
+        const map: Record<string, { total_runs: number; wins: number; avg_rooms: number }> = {};
+        for (const r of rows) map[r.dungeon_name] = r;
+        setDungeonPerf(map);
+      })
+      .catch(() => {});
+  }, [giga.address]);
+
+  const recommendation = useMemo<AdvisorResult | null>(() => {
+    if (dungeonAllocs.length === 0 || !eng) return null;
+    return buildRecommendation({
+      currentEnergy,
+      maxEnergy,
+      regenPerHour: eng.regenPerHour || (isJuiced ? 17.5 : 10),
+      isJuiced,
+      romEnergyAvailable: totalRomE,
+      dungeons: dungeonAllocs.map((d) => {
+        const perf = dungeonPerf[d.name];
+        return {
+          dungeonId: d.dungeonId,
+          name: d.name,
+          energyCost: d.energyCost,
+          runsLeft: d.maxRuns,
+          winRate: perf && perf.total_runs > 0 ? perf.wins / perf.total_runs : null,
+          avgRooms: perf?.avg_rooms ?? null,
+          totalRuns: perf?.total_runs ?? 0,
+        };
+      }),
+      fishingCastsLeft: remainingCasts,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dungeonAllocs, currentEnergy, maxEnergy, isJuiced, totalRomE, dungeonPerf, remainingCasts]);
+
+  const applyRecommendation = () => {
+    if (!recommendation) return;
+    setDungeonAllocs((prev) =>
+      prev.map((d) => {
+        const rec = recommendation.dungeonRuns.find((r) => r.dungeonId === d.dungeonId);
+        return { ...d, runs: rec ? Math.min(rec.runs, d.maxRuns) : 0 };
+      })
+    );
+    const node = CAST_NODES.find((n) => n.nodeId === recommendation.fishing.nodeId) ?? CAST_NODES[1];
+    setFishingAlloc({
+      castNodeId: node.nodeId,
+      castCost: node.cost,
+      castLabel: node.label,
+      casts: recommendation.fishing.casts,
+    });
+    if (recommendation.claimRomEnergy) {
+      setFreeActions((prev) => ({ ...prev, romEnergyMode: "claim" }));
+    }
+  };
+
+  // Event dungeons (Void): item-based entry, not part of the energy plan
+  const eventDungeons = dungeons.filter((d) => d.ENERGY_CID === 0 && (d.entryData?.length ?? 0) > 0);
+
+  // Gear that's broken or one use from it — only gear the daily loop needs
+  // (equipped dungeon gear, hands for pots, rods/lures for fishing)
+  const wornGear = useMemo(() => {
+    const out: { name: string; durability: number; equipped: boolean }[] = [];
+    for (const g of giga.gearInstances?.entities ?? []) {
+      const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || `Gear #${g.GAME_ITEM_ID_CID}`;
+      const lower = name.toLowerCase();
+      const relevant =
+        g.EQUIPPED_TO_SLOT_CID >= 0 ||
+        ["hand", "rod", "lure"].some((k) => lower.includes(k));
+      if (!relevant) continue;
+      if (g.DURABILITY_CID <= 1) {
+        out.push({ name, durability: g.DURABILITY_CID, equipped: g.EQUIPPED_TO_SLOT_CID >= 0 });
+      }
+    }
+    return out;
+  }, [giga.gearInstances, giga.itemInfo]);
+
+  // Traveling merchant (Hugis/Munis) deals — read-only until the trade POST
+  // is captured; shape probed defensively since only the GET is verified
+  const merchantDeals = useMemo(() => {
+    const itemName = (id: number) =>
+      giga.itemInfo[String(id)]?.name || giga.itemNames[String(id)] || `#${id}`;
+    return (giga.vendorListings?.entities ?? []).map((e, i) => {
+      const inputs = (e.INPUT_ID_CID_array ?? []).map((id, j) => ({
+        id,
+        name: itemName(id),
+        amount: e.INPUT_AMOUNT_CID_array?.[j] ?? 1,
+      }));
+      const outputs = (e.LOOT_ID_CID_array ?? []).map((id, j) => ({
+        id,
+        name: itemName(id),
+        amount: e.LOOT_AMOUNT_CID_array?.[j] ?? 1,
+      }));
+      const done = e.COMPLETIONS_CID ?? e.DAY_COUNT_CID ?? 0;
+      const max = e.MAX_COMPLETIONS_CID;
+      const affordable =
+        inputs.length > 0 &&
+        inputs.every((inp) => (giga.itemBalances[String(inp.id)] ?? 0) >= inp.amount);
+      return {
+        key: e.docId || e.ID_CID || String(i),
+        name: e.NAME_CID || `Deal ${i + 1}`,
+        inputs,
+        outputs,
+        done,
+        max,
+        affordable,
+        capped: max !== undefined && done >= max,
+      };
+    });
+  }, [giga.vendorListings, giga.itemInfo, giga.itemNames, giga.itemBalances]);
+
   /* ─── Stepper helpers ────────────────────────────────────── */
 
   const adjustDungeon = (idx: number, delta: number) => {
@@ -369,7 +492,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       const d = next[idx];
       const newRuns = Math.max(0, Math.min(d.maxRuns, d.runs + delta));
       const energyDelta = (newRuns - d.runs) * d.energyCost;
-      if (allocatedEnergy + energyDelta > currentEnergy && delta > 0) return prev;
+      if (allocatedEnergy + energyDelta > effectiveEnergy && delta > 0) return prev;
       next[idx] = { ...d, runs: newRuns };
       return next;
     });
@@ -379,7 +502,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     setFishingAlloc((prev) => {
       const newCasts = Math.max(0, Math.min(remainingCasts, prev.casts + delta));
       const energyDelta = (newCasts - prev.casts) * prev.castCost;
-      if (allocatedEnergy + energyDelta > currentEnergy && delta > 0) return prev;
+      if (allocatedEnergy + energyDelta > effectiveEnergy && delta > 0) return prev;
       return { ...prev, casts: newCasts };
     });
   };
@@ -1234,6 +1357,85 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   return (
     <div className="anim-in space-y-6" style={{ maxWidth: 720 }}>
 
+      {/* ── Advisor ── */}
+      {recommendation && (recommendation.notes.length > 0 || recommendation.warnings.length > 0) && (
+        <section
+          className="p-4 rounded-lg"
+          style={{ background: "var(--bg-raised)", border: "1px solid var(--border-accent)" }}
+        >
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Lightbulb size={15} style={{ color: "var(--gold)" }} />
+              <span className="text-[14px] font-bold">Advisor</span>
+            </div>
+            <span className="text-[11px] tabular-nums font-medium" style={{ color: "var(--text-dim)" }}>
+              plan spends {fmt(Math.floor(recommendation.totalSpend))}E &middot; {fmt(recommendation.leftover)}E left
+            </span>
+          </div>
+
+          {recommendation.warnings.length > 0 && (
+            <div className="space-y-1.5 mb-2.5">
+              {recommendation.warnings.map((w, i) => (
+                <div key={i} className="flex items-start gap-2 text-[12px]" style={{ color: "var(--red)" }}>
+                  <AlertTriangle size={13} className="shrink-0 mt-[2px]" />
+                  <span style={{ lineHeight: 1.5 }}>{w}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="space-y-1.5 mb-3">
+            {recommendation.notes.map((n, i) => (
+              <div key={i} className="flex items-start gap-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                <span className="shrink-0 mt-[1px]" style={{ color: "var(--gold)" }}>&bull;</span>
+                <span style={{ lineHeight: 1.5 }}>{n}</span>
+              </div>
+            ))}
+          </div>
+
+          <button
+            onClick={applyRecommendation}
+            disabled={executing}
+            className="btn-press text-[12px] font-bold px-4 py-2 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+            style={{
+              background: "var(--orange-glow)",
+              border: "1px solid var(--border-accent)",
+              color: "var(--orange)",
+            }}
+          >
+            Apply recommendation
+          </button>
+        </section>
+      )}
+
+      {/* ── Gear durability warning ── */}
+      {wornGear.length > 0 && (
+        <section
+          className="p-3.5 rounded-lg"
+          style={{ background: "var(--red-glow)", border: "1px solid var(--red-border)" }}
+        >
+          <div className="flex items-center gap-2 mb-1.5">
+            <AlertTriangle size={14} style={{ color: "var(--red)" }} />
+            <span className="text-[13px] font-bold" style={{ color: "var(--red)" }}>
+              Gear needs repair
+            </span>
+          </div>
+          <div className="space-y-1">
+            {wornGear.map((g, i) => (
+              <div key={i} className="text-[12px]" style={{ color: "var(--text-dim)" }}>
+                <span className="font-semibold" style={{ color: "var(--text)" }}>{g.name}</span>
+                {" — "}
+                {g.durability <= 0 ? "broken" : "1 use left"}
+                {g.equipped && " (equipped)"}
+              </div>
+            ))}
+          </div>
+          <div className="text-[11px] mt-1.5" style={{ color: "var(--text-faint)" }}>
+            Repair at the Gear Station in-game — broken hands block pots, dead rods gut the fishing deck.
+          </div>
+        </section>
+      )}
+
       {/* ── Section A: Energy Budget ── */}
       <section>
         <div className="flex items-center justify-between mb-4">
@@ -1246,11 +1448,12 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         {/* Energy bar */}
         <div className="rounded-full overflow-hidden mb-5" style={{ height: 8, background: "var(--bg-inset)" }}>
           <div
-            className="h-full rounded-full"
+            className="h-full w-full rounded-full"
             style={{
-              width: `${maxEnergy > 0 ? Math.min(100, (currentEnergy / maxEnergy) * 100) : 0}%`,
+              transform: `scaleX(${maxEnergy > 0 ? Math.min(1, currentEnergy / maxEnergy) : 0})`,
+              transformOrigin: "left",
               background: "linear-gradient(90deg, var(--orange-dim), var(--orange))",
-              transition: "width 0.3s ease",
+              transition: "transform 0.3s ease",
             }}
           />
         </div>
@@ -1259,7 +1462,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         <div className="space-y-2 mb-4">
           {dungeonAllocs.map((d, idx) => {
             const totalCost = d.runs * d.energyCost;
-            const canIncrease = d.runs < d.maxRuns && allocatedEnergy + d.energyCost <= currentEnergy;
+            const canIncrease = d.runs < d.maxRuns && allocatedEnergy + d.energyCost <= effectiveEnergy;
+            const info = findDungeonInfo(d.name);
             return (
               <div
                 key={d.dungeonId}
@@ -1267,9 +1471,20 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
               >
                 <div className="flex-1 min-w-0">
-                  <div className="text-[13px] font-semibold truncate">{d.name}</div>
+                  <div className="text-[13px] font-semibold truncate">
+                    {d.name}
+                    {info?.exclusiveSource && (
+                      <span
+                        className="text-[10px] font-bold uppercase tracking-wider ml-2 px-1.5 py-0.5 rounded"
+                        style={{ background: "var(--bg-inset)", color: "var(--gold)", border: "1px solid var(--border)" }}
+                      >
+                        only {info.currency} source
+                      </span>
+                    )}
+                  </div>
                   <div className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
                     {d.energyCost}E per run &middot; {d.maxRuns} remaining
+                    {info && <> &middot; {info.currency}</>}
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
@@ -1299,6 +1514,24 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               </div>
             );
           })}
+
+          {/* Event dungeons (Void) — item entry, run from the Dungeon tab */}
+          {eventDungeons.map((d) => (
+            <div
+              key={d.ID_CID}
+              className="flex items-center gap-3 px-3 py-2.5 rounded-lg"
+              style={{ background: "var(--bg-inset)", border: "1px dashed var(--border)" }}
+            >
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] font-semibold truncate" style={{ color: "var(--text-dim)" }}>
+                  {d.NAME_CID}
+                </div>
+                <div className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+                  Event dungeon &middot; item entry ({d.entryData!.length} tiers), no energy &middot; run it from the Dungeon tab
+                </div>
+              </div>
+            </div>
+          ))}
         </div>
 
         {/* Fishing stepper */}
@@ -1340,7 +1573,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             </button>
             <span className="text-[14px] font-bold tabular-nums w-6 text-center">{fishingAlloc.casts}</span>
             <button
-              disabled={fishingAlloc.casts >= remainingCasts || allocatedEnergy + fishingAlloc.castCost > currentEnergy || executing}
+              disabled={fishingAlloc.casts >= remainingCasts || allocatedEnergy + fishingAlloc.castCost > effectiveEnergy || executing}
               onClick={() => adjustFishing(1)}
               className="btn-press w-7 h-7 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[14px] font-bold"
               style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
@@ -1359,19 +1592,20 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         <div className="px-3 py-2.5 rounded-lg" style={{ background: "var(--bg-inset)", border: "1px solid var(--border)" }}>
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-[11px] font-bold" style={{ color: "var(--text-faint)" }}>ALLOCATED</span>
-            <span className="text-[13px] font-bold tabular-nums" style={{ color: allocatedEnergy > currentEnergy ? "var(--red)" : "var(--orange)" }}>
-              {fmt(allocatedEnergy)}E / {fmt(currentEnergy)}E
+            <span className="text-[13px] font-bold tabular-nums" style={{ color: allocatedEnergy > effectiveEnergy ? "var(--red)" : "var(--orange)" }}>
+              {fmt(allocatedEnergy)}E / {fmt(effectiveEnergy)}E{freeActions.romEnergyMode === "claim" && totalRomE > 0 ? " (incl. ROM)" : ""}
             </span>
           </div>
           <div className="rounded-full overflow-hidden" style={{ height: 6, background: "var(--bg)" }}>
             <div
-              className="h-full rounded-full"
+              className="h-full w-full rounded-full"
               style={{
-                width: `${currentEnergy > 0 ? Math.min(100, (allocatedEnergy / currentEnergy) * 100) : 0}%`,
-                background: allocatedEnergy > currentEnergy
+                transform: `scaleX(${effectiveEnergy > 0 ? Math.min(1, allocatedEnergy / effectiveEnergy) : 0})`,
+                transformOrigin: "left",
+                background: allocatedEnergy > effectiveEnergy
                   ? "var(--red)"
                   : "linear-gradient(90deg, var(--orange-dim), var(--orange))",
-                transition: "width 0.3s ease",
+                transition: "transform 0.3s ease",
               }}
             />
           </div>
@@ -1428,6 +1662,54 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           ))}
         </div>
       </section>
+
+      {/* ── Traveling Merchant (Hugis/Munis) ── */}
+      {merchantDeals.length > 0 && (
+        <section>
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-[14px] font-bold">Traveling Merchant</div>
+            <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+              stubs snapshot Fri 6pm UTC
+            </span>
+          </div>
+          <div className="space-y-1.5">
+            {merchantDeals.map((d) => (
+              <div
+                key={d.key}
+                className="px-3 py-2 rounded-lg"
+                style={{
+                  background: "var(--bg-raised)",
+                  border: `1px solid ${d.affordable && !d.capped ? "var(--border-accent)" : "var(--border)"}`,
+                  opacity: d.capped ? 0.5 : 1,
+                }}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-[12px] font-semibold">{d.name}</span>
+                  {d.max !== undefined && (
+                    <span className="text-[11px] tabular-nums" style={{ color: d.capped ? "var(--text-faint)" : "var(--text-dim)" }}>
+                      {d.done}/{d.max}
+                    </span>
+                  )}
+                </div>
+                {(d.inputs.length > 0 || d.outputs.length > 0) && (
+                  <div className="text-[11px] mt-0.5" style={{ color: "var(--text-faint)" }}>
+                    {d.inputs.map((inp) => `${inp.amount}x ${inp.name}`).join(" + ")}
+                    {d.outputs.length > 0 && (
+                      <> &rarr; {d.outputs.map((o) => `${o.amount}x ${o.name}`).join(" + ")}</>
+                    )}
+                    {d.affordable && !d.capped && (
+                      <span className="font-semibold" style={{ color: "var(--green)" }}> &middot; tradeable now</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div className="text-[11px] mt-2" style={{ color: "var(--text-faint)" }}>
+            Read-only — trade in-game for now. (Auto-trade needs one manual trade captured in the network tab.)
+          </div>
+        </section>
+      )}
 
       {/* ── Section C: Presets ── */}
       <section>
@@ -1507,7 +1789,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             onClick={execute}
             disabled={
               executing ||
-              allocatedEnergy > currentEnergy ||
+              allocatedEnergy > effectiveEnergy ||
               (allocatedEnergy === 0 &&
                 !freeActions.claimRomResources &&
                 freeActions.romEnergyMode === "skip" &&

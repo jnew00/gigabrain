@@ -21,6 +21,7 @@ import type {
   FishingActionResponse,
   GigaJuiceResponse,
   GearInstancesResponse,
+  VendorListingsResponse,
 } from "./types";
 import { loadLocalStorageRecords, clearLocalStorageRecords } from "./enemy-tracker";
 import type { EnemyMoveRecord } from "./enemy-tracker";
@@ -117,6 +118,7 @@ export function useGigaverse() {
   const [fishingState, setFishingState] = useState<FishingGameState | null>(null);
   const [juiceExpiry, setJuiceExpiry] = useState<number | null>(null); // unix timestamp
   const [gearInstances, setGearInstances] = useState<GearInstancesResponse | null>(null);
+  const [vendorListings, setVendorListings] = useState<VendorListingsResponse | null>(null);
   const [fishingActionToken, setFishingActionToken] = useState<number>(Date.now());
   const fishingActionTokenRef = useRef(fishingActionToken);
   fishingActionTokenRef.current = fishingActionToken;
@@ -153,7 +155,7 @@ export function useGigaverse() {
         setAddress(me.address);
 
         // Fetch everything else in parallel
-        const [acc, eng, ds, dt, rm, items, staticData, playerRecipeData, balancesData, juiceData, gearData] = await Promise.all([
+        const [acc, eng, ds, dt, rm, items, staticData, playerRecipeData, balancesData, juiceData, gearData, vendorData] = await Promise.all([
           proxy<AccountResponse>(`/api/account/${me.address}`, jwt),
           proxy<EnergyResponse>(`/api/offchain/player/energy/${me.address}`, jwt),
           proxy<DungeonActionResponse>("/api/game/dungeon/state", jwt),
@@ -165,6 +167,7 @@ export function useGigaverse() {
           proxy<ItemBalancesResponse>("/api/items/balances", jwt),
           proxy<GigaJuiceResponse>(`/api/gigajuice/player/${me.address}`, jwt).catch(() => null),
           proxy<GearInstancesResponse>(`/api/gear/instances/${me.address}`, jwt).catch(() => null),
+          proxy<VendorListingsResponse>(`/api/vendor/listings?wallet=${me.address}`, jwt).catch(() => null),
         ] as const);
 
         setAccount(acc);
@@ -232,6 +235,9 @@ export function useGigaverse() {
 
         // Store gear instances
         if (gearData) setGearInstances(gearData);
+
+        // Store traveling merchant listings
+        if (vendorData) setVendorListings(vendorData);
 
         // Fetch skills + progress (needs noobId)
         const nid = acc.noob?.docId;
@@ -347,18 +353,22 @@ export function useGigaverse() {
       // NEVER fetch /api/game/dungeon/state here — it rotates the actionToken
       // on the Gigaverse server. Dungeon state is only fetched explicitly via
       // fetchDungeonState() or from connect/performAction/startRun responses.
-      const [eng, dt, rm, pr, bal, fs] = await Promise.all([
+      const [eng, dt, rm, pr, bal, fs, gear, vendor] = await Promise.all([
         proxy<EnergyResponse>(`/api/offchain/player/energy/${address}`, token),
         proxy<DungeonTodayResponse>("/api/game/dungeon/today", token),
         proxy<RomsResponse>(`/api/roms/player?id=${address.toLowerCase()}`, token),
         proxy<PlayerRecipesResponse>(`/api/offchain/recipes/player/${address}`, token),
         proxy<ItemBalancesResponse>("/api/items/balances", token),
         proxy<FishingGameState>(`/api/fishing/state/${address}`, token).catch(() => null),
+        proxy<GearInstancesResponse>(`/api/gear/instances/${address}`, token).catch(() => null),
+        proxy<VendorListingsResponse>(`/api/vendor/listings?wallet=${address}`, token).catch(() => null),
       ] as const);
       setEnergy(eng);
       setDungeonToday(dt);
       setRoms(rm);
       setPlayerRecipes(pr);
+      if (gear) setGearInstances(gear);
+      if (vendor) setVendorListings(vendor);
       if (bal?.entities) {
         const bals: Record<string, number> = {};
         for (const b of bal.entities) bals[b.ID_CID] = b.BALANCE_CID;
@@ -554,16 +564,45 @@ export function useGigaverse() {
     [token, withLoading]
   );
 
+  // Mirror of itemBalances readable synchronously inside callbacks
+  const itemBalancesRef = useRef(itemBalances);
+  itemBalancesRef.current = itemBalances;
+
   /** Use a recipe (pots, chests, etc.) */
   const useRecipe = useCallback(
     async (recipeId: string, gearInstanceId: string = "") => {
       if (!token || !noobId) return null;
+      const balancesBefore = itemBalancesRef.current;
       const result = await proxy<{ success: boolean; message?: string; data?: unknown; entities?: unknown[]; gameItemBalanceChanges?: { id: number; amount: number }[] }>(
         "/api/offchain/recipes/start",
         token,
         "POST",
         { recipeId, noobId: Number(noobId), gearInstanceId, nodeIndex: 0, quantity: 1 }
       );
+      // The recipes endpoint doesn't itemize loot — derive it from the
+      // item-balance delta so pot/chest results can show what dropped
+      // (skip when the before-snapshot never loaded — a diff against an empty
+      // map would report the whole inventory as loot)
+      if (result && result.success !== false && !result.gameItemBalanceChanges?.length && Object.keys(balancesBefore).length > 0) {
+        try {
+          await new Promise((r) => setTimeout(r, 600));
+          const bal = await proxy<ItemBalancesResponse>("/api/items/balances", token);
+          if (bal?.entities) {
+            const bals: Record<string, number> = {};
+            for (const b of bal.entities) bals[b.ID_CID] = b.BALANCE_CID;
+            setItemBalances(bals);
+            itemBalancesRef.current = bals;
+            const changes: { id: number; amount: number }[] = [];
+            for (const [id, v] of Object.entries(bals)) {
+              const delta = v - (balancesBefore[id] ?? 0);
+              if (delta > 0) changes.push({ id: Number(id), amount: delta });
+            }
+            if (changes.length > 0) result.gameItemBalanceChanges = changes;
+          }
+        } catch {
+          // Loot itemization is best-effort — the recipe itself succeeded
+        }
+      }
       // Refresh player recipe progress after use
       if (address) {
         proxy<PlayerRecipesResponse>(`/api/offchain/recipes/player/${address}`, token)
@@ -687,6 +726,55 @@ export function useGigaverse() {
     [token, address]
   );
 
+  /** Refetch skill progress + currency balances (after level-ups) */
+  const refreshSkills = useCallback(async () => {
+    if (!token) return;
+    try {
+      const fetches: Promise<void>[] = [
+        proxy<ItemBalancesResponse>("/api/items/balances", token).then((bal) => {
+          if (bal?.entities) {
+            const bals: Record<string, number> = {};
+            for (const b of bal.entities) bals[b.ID_CID] = b.BALANCE_CID;
+            setItemBalances(bals);
+            itemBalancesRef.current = bals;
+          }
+        }),
+      ];
+      if (noobId) {
+        fetches.push(
+          proxy<SkillProgressResponse>(`/api/offchain/skills/progress/${noobId}`, token).then((sp) => {
+            if (sp?.entities) setSkillProgress(sp.entities);
+            else if (Array.isArray(sp)) setSkillProgress(sp as SkillProgressEntity[]);
+          })
+        );
+      }
+      await Promise.all(fetches);
+    } catch {
+      // Non-fatal — UI just shows stale levels until next refresh
+    }
+  }, [token, noobId]);
+
+  /** Level up one skill stat. Costs the tree's currency (scrap/shards/seaweed). */
+  const levelUpSkill = useCallback(
+    async (skillId: number, statId: number) => {
+      if (!token || !noobId) return null;
+      try {
+        return await proxy<{ success?: boolean; message?: string }>(
+          "/api/game/skill/levelup",
+          token,
+          "POST",
+          { skillId, statId, noobId: Number(noobId) }
+        );
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Skill level-up failed";
+        lastErrorRef.current = msg;
+        setError(msg);
+        return null;
+      }
+    },
+    [token, noobId]
+  );
+
   /** Sell fish at the Fish Stall */
   const sellFish = useCallback(
     async (fishId: number, amount: number, expectedValue: number) => {
@@ -732,6 +820,7 @@ export function useGigaverse() {
     fishingState,
     juiceExpiry,
     gearInstances,
+    vendorListings,
     restoringSession,
     // Actions
     connect,
@@ -749,6 +838,8 @@ export function useGigaverse() {
     fetchFishingState,
     fishingAction,
     sellFish,
+    levelUpSkill,
+    refreshSkills,
     setToken,
   };
 }
