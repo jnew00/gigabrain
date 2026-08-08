@@ -11,6 +11,8 @@
   <img src="https://github.com/jnew00/gigabrain/actions/workflows/ci.yml/badge.svg" alt="CI" />
 </p>
 
+<p align="center"><strong><a href="https://gigabrain-eosin.vercel.app">gigabrain-eosin.vercel.app</a></strong> — hosted instance, no setup</p>
+
 ---
 
 Gigaverse's fair play rules [explicitly allow](https://docs.gigaverse.io/general/fair-play-rules) tools and bots: *"You may create tools & bots, or leverage AI agents, to assist in playing the game for you."* GigaBrain is that, with a cockpit UI.
@@ -25,6 +27,8 @@ Gigaverse's fair play rules [explicitly allow](https://docs.gigaverse.io/general
 - **Intel** — enemy move patterns, run history, win rates, and loot totals persisted per wallet.
 
 ## Quickstart
+
+Use the hosted instance — [gigabrain-eosin.vercel.app](https://gigabrain-eosin.vercel.app) — or self-host:
 
 ```bash
 npm install
@@ -54,7 +58,7 @@ Community tool, not affiliated with Gigaverse or GLHF. Automation is permitted u
 
 ## Support
 
-Free forever. The in-app Support panel has donation addresses if it's earning you scrap.
+Free forever. If it's earning you scrap: [ko-fi.com/inceptyon](https://ko-fi.com/inceptyon), or the in-app Support panel has wallet addresses.
 
 ## Contributing
 

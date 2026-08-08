@@ -18,7 +18,7 @@ import { buildSkillAdvice } from "@/lib/skill-advisor";
 
 // Donations — GigaBrain is free; these fund the coffee
 const DONATIONS = {
-  kofi: "", // ko-fi handle (e.g. "jnew00") — button hidden until set
+  kofi: "inceptyon",
   wallets: [
     { label: "Abstract", address: "0x0757C2c5bC42F5aC373903B5DFd85CE2B9201124" },
     { label: "Ethereum", address: "0x42353a7Fc70Eab5C0017733813805313B7b10b8B" },
@@ -1858,7 +1858,7 @@ export default function Home() {
                 {flyout === "support" && (
                   <div className="space-y-4">
                     <p className="text-[13px]" style={{ color: "var(--text-dim)", lineHeight: 1.55 }}>
-                      GigaBrain is free. If it's earning you scrap, a donation keeps it maintained.
+                      GigaBrain is free. If it&apos;s earning you scrap, a donation keeps it maintained.
                     </p>
 
                     {DONATIONS.kofi && (
