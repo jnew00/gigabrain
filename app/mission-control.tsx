@@ -74,6 +74,8 @@ interface FreeActions {
   breakPots: boolean;
   sellFish: boolean;
   vote: boolean;
+  tradeHugis: boolean;          // execute affordable traveling-merchant deals
+  repairGear: boolean;          // repair worn hands/rods/lures/equipped gear first
 }
 
 interface Preset {
@@ -123,6 +125,13 @@ function loadLastAlloc(): { dungeonAllocs?: DungeonAlloc[]; fishingAlloc?: Fishi
         sellFish: old.sellFish ?? true,
         vote: old.vote ?? true,
       };
+    }
+    // Saved allocs from before Hugis auto-trade / auto-repair existed
+    if (data?.freeActions && !("tradeHugis" in data.freeActions)) {
+      data.freeActions.tradeHugis = true;
+    }
+    if (data?.freeActions && !("repairGear" in data.freeActions)) {
+      data.freeActions.repairGear = true;
     }
     return data;
   } catch {
@@ -226,6 +235,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     breakPots: true,
     sellFish: true,
     vote: true,
+    tradeHugis: true,
+    repairGear: true,
   });
 
   // Initialize dungeon allocs when data arrives
@@ -435,7 +446,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   // Gear that's broken or one use from it — only gear the daily loop needs
   // (equipped dungeon gear, hands for pots, rods/lures for fishing)
   const wornGear = useMemo(() => {
-    const out: { name: string; durability: number; equipped: boolean }[] = [];
+    const out: { docId: string; name: string; durability: number; equipped: boolean }[] = [];
     for (const g of giga.gearInstances?.entities ?? []) {
       const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || `Gear #${g.GAME_ITEM_ID_CID}`;
       const lower = name.toLowerCase();
@@ -444,11 +455,33 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         ["hand", "rod", "lure"].some((k) => lower.includes(k));
       if (!relevant) continue;
       if (g.DURABILITY_CID <= 1) {
-        out.push({ name, durability: g.DURABILITY_CID, equipped: g.EQUIPPED_TO_SLOT_CID >= 0 });
+        out.push({ docId: g.docId, name, durability: g.DURABILITY_CID, equipped: g.EQUIPPED_TO_SLOT_CID >= 0 });
       }
     }
     return out;
   }, [giga.gearInstances, giga.itemInfo]);
+
+  const [repairing, setRepairing] = useState(false);
+  const repairWorn = useCallback(async (items: { docId: string; name: string }[], log?: (m: string) => void) => {
+    const emit = log ?? addLog;
+    setRepairing(true);
+    let repaired = 0;
+    try {
+      for (const item of items) {
+        const r = await gigaRef.current.repairGear(item.docId);
+        if (r?.success === false) {
+          emit(`Repair ${item.name}: ${r.message || "failed (out of repairs?)"}`);
+        } else {
+          repaired++;
+          emit(`Repaired ${item.name}`);
+        }
+        await delay(300);
+      }
+    } finally {
+      setRepairing(false);
+    }
+    return repaired;
+  }, [addLog]);
 
   // Traveling merchant (Hugis/Munis) deals — read-only until the trade POST
   // is captured; shape probed defensively since only the GET is verified
@@ -471,8 +504,17 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       const affordable =
         inputs.length > 0 &&
         inputs.every((inp) => (giga.itemBalances[String(inp.id)] ?? 0) >= inp.amount);
+      // Trades execute via /api/offchain/recipes/start with a Recipe#9xxxx id
+      // (captured Aug 2026) — only offer the button when the id looks right
+      const recipeId =
+        typeof e.ID_CID === "string" && e.ID_CID.startsWith("Recipe#")
+          ? e.ID_CID
+          : typeof e.docId === "string" && e.docId.startsWith("Recipe#")
+          ? e.docId
+          : null;
       return {
         key: e.docId || e.ID_CID || String(i),
+        recipeId,
         name: e.NAME_CID || `Deal ${i + 1}`,
         inputs,
         outputs,
@@ -587,6 +629,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
     // Build step list
     const stepList: ExecutionStep[] = [];
+    const gearToRepair = [...wornGear];
+    if (freeActions.repairGear && gearToRepair.length > 0)
+      stepList.push({ id: "repair-gear", label: "Repair worn gear", status: "pending", detail: gearToRepair.map((g) => g.name).join(", ") });
     if (freeActions.claimRomResources && (totalRomS > 0 || totalRomD > 0))
       stepList.push({ id: "claim-roms", label: "Claim ROM shards & dust", status: "pending", detail: `${fmt(totalRomS)}S / ${fmt(totalRomD)}D` });
     if (freeActions.romEnergyMode === "convert" && totalRomE > 0)
@@ -599,6 +644,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       stepList.push({ id: "break-pots", label: "Break pots", status: "pending", detail: "" });
     if (freeActions.vote && !hasVoted)
       stepList.push({ id: "vote", label: "Vote on Abstract Portal", status: "pending", detail: "" });
+    const hugisDeals = merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped);
+    if (freeActions.tradeHugis && hugisDeals.length > 0)
+      stepList.push({ id: "hugis", label: "Traveling merchant trades", status: "pending", detail: `${hugisDeals.length} deal${hugisDeals.length === 1 ? "" : "s"}` });
 
     for (const d of dungeonAllocs) {
       if (d.runs > 0) {
@@ -619,6 +667,17 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     const summaryStats = { dungeonRuns: 0, dungeonWins: 0, fishCasts: 0, fishCaught: 0, seaweedEarned: 0 };
 
     try {
+      // 0. Repair worn gear — before anything that needs hands/rods/equipped gear
+      if (stepList.find((s) => s.id === "repair-gear")) {
+        if (cancelRef.current) throw new Error("cancelled");
+        updateStep("repair-gear", { status: "running" });
+        const repaired = await repairWorn(gearToRepair, log);
+        updateStep("repair-gear", {
+          status: cancelRef.current ? "skipped" : "done",
+          detail: `${repaired}/${gearToRepair.length} repaired`,
+        });
+      }
+
       // 1. Claim ROMs
       if (stepList.find((s) => s.id === "claim-roms")) {
         if (cancelRef.current) throw new Error("cancelled");
@@ -767,6 +826,48 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         } catch (e) {
           updateStep("vote", { status: "failed", detail: e instanceof Error ? e.message : "failed" });
         }
+      }
+
+      // 5b. Traveling merchant trades (each deal to its cap while affordable)
+      if (stepList.find((s) => s.id === "hugis")) {
+        if (cancelRef.current) throw new Error("cancelled");
+        updateStep("hugis", { status: "running" });
+        let trades = 0;
+        const results: string[] = [];
+        for (const deal of hugisDeals) {
+          if (cancelRef.current) break;
+          const remaining = deal.max !== undefined ? Math.max(1, deal.max - deal.done) : 1;
+          for (let t = 0; t < remaining; t++) {
+            if (cancelRef.current) break;
+            // Re-check affordability against live balances (earlier trades spend them)
+            const canAfford = deal.inputs.every(
+              (inp) => (g().itemBalances[String(inp.id)] ?? 0) >= inp.amount
+            );
+            if (!canAfford) break;
+            try {
+              const r = await g().useRecipe(deal.recipeId!);
+              if (r?.success === false) {
+                const msg = `${deal.name}: ${(r as { message?: string })?.message || "failed"}`;
+                results.push(msg);
+                log(msg);
+                break;
+              }
+              trades++;
+              const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
+              const msg = loot.length > 0 ? `${deal.name} — ${loot.join(", ")}` : `${deal.name} traded`;
+              results.push(msg);
+              log(msg);
+            } catch (e) {
+              results.push(`${deal.name}: ${e instanceof Error ? e.message : "error"}`);
+              break;
+            }
+            await delay(300);
+          }
+        }
+        updateStep("hugis", {
+          status: cancelRef.current ? "skipped" : "done",
+          detail: trades > 0 ? `${trades} trades — ${results[results.length - 1] ?? ""}` : "nothing affordable",
+        });
       }
 
       // Refresh before energy-consuming steps
@@ -1414,24 +1515,43 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           className="p-3.5 rounded-lg"
           style={{ background: "var(--red-glow)", border: "1px solid var(--red-border)" }}
         >
-          <div className="flex items-center gap-2 mb-1.5">
-            <AlertTriangle size={14} style={{ color: "var(--red)" }} />
-            <span className="text-[13px] font-bold" style={{ color: "var(--red)" }}>
-              Gear needs repair
-            </span>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-2">
+              <AlertTriangle size={14} style={{ color: "var(--red)" }} />
+              <span className="text-[13px] font-bold" style={{ color: "var(--red)" }}>
+                Gear needs repair
+              </span>
+            </div>
+            {wornGear.length > 1 && (
+              <button
+                onClick={() => repairWorn(wornGear)}
+                disabled={repairing || executing}
+                className="btn-press text-[11px] font-bold px-2.5 py-1 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{ background: "var(--bg-raised)", border: "1px solid var(--red-border)", color: "var(--red)" }}
+              >
+                {repairing ? "Repairing..." : "Repair all"}
+              </button>
+            )}
           </div>
           <div className="space-y-1">
-            {wornGear.map((g, i) => (
-              <div key={i} className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-                <span className="font-semibold" style={{ color: "var(--text)" }}>{g.name}</span>
-                {" — "}
-                {g.durability <= 0 ? "broken" : "1 use left"}
-                {g.equipped && " (equipped)"}
+            {wornGear.map((g) => (
+              <div key={g.docId} className="flex items-center gap-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                <span className="flex-1">
+                  <span className="font-semibold" style={{ color: "var(--text)" }}>{g.name}</span>
+                  {" — "}
+                  {g.durability <= 0 ? "broken" : "1 use left"}
+                  {g.equipped && " (equipped)"}
+                </span>
+                <button
+                  onClick={() => repairWorn([g])}
+                  disabled={repairing || executing}
+                  className="btn-press text-[11px] font-bold px-2 py-0.5 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                  style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", color: "var(--text)" }}
+                >
+                  Repair
+                </button>
               </div>
             ))}
-          </div>
-          <div className="text-[11px] mt-1.5" style={{ color: "var(--text-faint)" }}>
-            Repair at the Gear Station in-game — broken hands block pots, dead rods gut the fishing deck.
           </div>
         </section>
       )}
@@ -1652,6 +1772,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             { key: "openChests" as const, label: "Open chests", info: chestsReady ? [!chestCd.onCooldown && "Chest ready", !juiceChestCd.onCooldown && (eng?.isPlayerJuiced ?? false) && "Juice ready"].filter(Boolean).join(" + ") || "Ready" : `Chest: ${chestCd.text}${(eng?.isPlayerJuiced ?? false) ? `, Juice: ${juiceChestCd.text}` : ""}`, disabled: !chestsReady },
             { key: "breakPots" as const, label: "Break pots", info: (() => { const p: string[] = []; if (!bluePotCd.onCooldown && paperHandsId) p.push("Blue ready"); else if (!bluePotCd.onCooldown) p.push("Blue: no Paper Hands"); else p.push(`Blue: ${bluePotCd.text}`); if (!tanPotCd.onCooldown && rockHandsId) p.push("Tan ready"); else if (!tanPotCd.onCooldown) p.push("Tan: no Rock Hands"); else p.push(`Tan: ${tanPotCd.text}`); return p.join(", "); })(), disabled: !potsActuallyReady },
             { key: "sellFish" as const, label: "Sell +50% fish", info: fishStallInfo.totalCount > 0 ? `${fmt(fishStallInfo.totalCount)} fish (~${fmt(fishStallInfo.totalSeaweed)} seaweed)` : "None available", disabled: fishStallInfo.totalCount === 0 },
+            { key: "tradeHugis" as const, label: "Traveling merchant trades", info: (() => { const n = merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped).length; return n > 0 ? `${n} affordable deal${n === 1 ? "" : "s"}` : "None affordable"; })(), disabled: merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped).length === 0 },
+            { key: "repairGear" as const, label: "Repair worn gear", info: wornGear.length > 0 ? `${wornGear.length} item${wornGear.length === 1 ? "" : "s"} worn` : "All gear healthy", disabled: wornGear.length === 0 },
             { key: "vote" as const, label: "Vote on Abstract Portal", info: hasVoted ? "Voted" : "Not voted", disabled: hasVoted },
           ]).map((item) => (
             <label key={item.key} className="flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", opacity: item.disabled ? 0.5 : 1 }}>
@@ -1683,13 +1805,35 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   opacity: d.capped ? 0.5 : 1,
                 }}
               >
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <span className="text-[12px] font-semibold">{d.name}</span>
-                  {d.max !== undefined && (
-                    <span className="text-[11px] tabular-nums" style={{ color: d.capped ? "var(--text-faint)" : "var(--text-dim)" }}>
-                      {d.done}/{d.max}
-                    </span>
-                  )}
+                  <span className="flex items-center gap-2 shrink-0">
+                    {d.max !== undefined && (
+                      <span className="text-[11px] tabular-nums" style={{ color: d.capped ? "var(--text-faint)" : "var(--text-dim)" }}>
+                        {d.done}/{d.max}
+                      </span>
+                    )}
+                    {d.recipeId && !d.capped && (
+                      <button
+                        onClick={async () => {
+                          addLog(`Trading ${d.name}...`);
+                          const r = await giga.useRecipe(d.recipeId!);
+                          if (r?.success !== false) {
+                            const loot = formatRecipeLoot(r, giga.itemInfo, giga.itemNames);
+                            addLog(loot.length > 0 ? `${d.name} — ${loot.join(", ")}` : `${d.name} traded`);
+                          } else {
+                            addLog(`${d.name}: ${(r as { message?: string })?.message || "failed"}`);
+                          }
+                          giga.refreshAll();
+                        }}
+                        disabled={!d.affordable || executing}
+                        className="btn-press text-[11px] font-bold px-2.5 py-0.5 rounded cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                        style={{ background: "var(--bg-inset)", border: "1px solid var(--border-accent)", color: "var(--orange)" }}
+                      >
+                        Trade
+                      </button>
+                    )}
+                  </span>
                 </div>
                 {(d.inputs.length > 0 || d.outputs.length > 0) && (
                   <div className="text-[11px] mt-0.5" style={{ color: "var(--text-faint)" }}>
@@ -1706,7 +1850,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             ))}
           </div>
           <div className="text-[11px] mt-2" style={{ color: "var(--text-faint)" }}>
-            Read-only — trade in-game for now. (Auto-trade needs one manual trade captured in the network tab.)
+            Run Plan trades every affordable deal to its cap when the free action is checked.
           </div>
         </section>
       )}
@@ -1796,7 +1940,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 !freeActions.openChests &&
                 !freeActions.breakPots &&
                 !freeActions.sellFish &&
-                !freeActions.vote)
+                !freeActions.vote &&
+                !freeActions.tradeHugis &&
+                !freeActions.repairGear)
             }
             className="btn-press w-full text-[16px] font-bold py-4 rounded-xl cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             style={{

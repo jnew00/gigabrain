@@ -726,6 +726,34 @@ export function useGigaverse() {
     [token, address]
   );
 
+  /** Repair a gear instance at the Gear Station (POST captured Aug 2026) */
+  const repairGear = useCallback(
+    async (gearInstanceId: string) => {
+      if (!token) return null;
+      try {
+        const result = await proxy<{ success?: boolean; message?: string }>(
+          "/api/gear/repair",
+          token,
+          "POST",
+          { gearInstanceId }
+        );
+        // Refresh gear so durability warnings clear immediately
+        if (address) {
+          proxy<GearInstancesResponse>(`/api/gear/instances/${address}`, token)
+            .then((gear) => { if (gear) setGearInstances(gear); })
+            .catch(() => {});
+        }
+        return result;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Repair failed";
+        lastErrorRef.current = msg;
+        setError(msg);
+        return null;
+      }
+    },
+    [token, address]
+  );
+
   /** Refetch skill progress + currency balances (after level-ups) */
   const refreshSkills = useCallback(async () => {
     if (!token) return;
@@ -840,6 +868,7 @@ export function useGigaverse() {
     sellFish,
     levelUpSkill,
     refreshSkills,
+    repairGear,
     setToken,
   };
 }

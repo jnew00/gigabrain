@@ -21,6 +21,7 @@ const ALLOWED_EXACT = new Set([
   "/api/indexer/gameitems",
   "/api/items/balances",
   "/api/gear/items",
+  "/api/gear/repair",
   "/api/fishing/cards",
   "/api/fishing/action",
   "/api/fishing/sell",

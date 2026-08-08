@@ -77,7 +77,8 @@ See `GAME_SYSTEMS.md` and `memory/project_gigaverse_api.md` for full reference.
 - `/api/game/skill/levelup` — level up a skill stat
 
 **POST** (verified):
-- `/api/offchain/recipes/start` — pots, chests, crafting (Recipe#700000=Chest, #700001=Blue Pot, #700002=Tan Pot, #700003=Juice Chest)
+- `/api/offchain/recipes/start` — pots, chests, crafting (Recipe#700000=Chest, #700001=Blue Pot, #700002=Tan Pot, #700003=Juice Chest). Also Hugis/Munis trades (captured Aug 2026: `{recipeId: "Recipe#90217", noobId, gearInstanceId: "", nodeIndex: 0, quantity: 1}`) — vendor listings are recipe entities.
+- `/api/gear/repair` — repair gear (captured Aug 2026: `{gearInstanceId: "GearInstance#336_..."}`)
 - `/api/roms/factory-claim` — claim ROM resources + convert energy to dust (claimId: "gigusDust")
 
 **POST** (unverified, need traffic capture):

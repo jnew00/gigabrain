@@ -8,13 +8,22 @@ import { authenticateWithSignature, recordRunAction, getRunStatsAction, getDunge
 import { useLoginWithAbstract, useAbstractClient } from "@abstract-foundation/agw-react";
 import { useAccount, useSignMessage, useReadContract } from "wagmi";
 import { ABSTRACT_VOTING_ADDRESS, ABSTRACT_VOTING_ABI, GIGAVERSE_APP_ID } from "@/lib/voting-contract";
-import { Sword, Shield, Sparkles, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote, Fish, Rocket } from "lucide-react";
+import { Sword, Shield, Sparkles, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote, Fish, Rocket, Heart, Copy } from "lucide-react";
 import { MissionControlPage } from "./mission-control";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import type { Player, DungeonAction, DungeonActionResponse, RomEntity, FishingCard } from "@/lib/types";
 import { pickBestCard, shouldRedraw, predictNextPositionsWeighted, scoreHand, coordToCell } from "@/lib/fishing-ai";
 import { FISHING } from "@/lib/game-data";
 import { buildSkillAdvice } from "@/lib/skill-advisor";
+
+// Donations — GigaBrain is free; these fund the coffee
+const DONATIONS = {
+  kofi: "", // ko-fi handle (e.g. "jnew00") — button hidden until set
+  wallets: [
+    { label: "Abstract", address: "0x0757C2c5bC42F5aC373903B5DFd85CE2B9201124" },
+    { label: "Ethereum", address: "0x42353a7Fc70Eab5C0017733813805313B7b10b8B" },
+  ],
+};
 
 const MOVE_ICONS: Record<string, typeof Sword> = {
   rock: Sword,
@@ -657,7 +666,7 @@ export default function Home() {
   const [log, setLog] = useState<{ id: number; text: string }[]>([]);
   const logIdRef = useRef(0);
   const [activePage, setActivePage] = useState<"mission" | "dungeon" | "stats" | "roms" | "fishing" | "world">("mission");
-  const [flyout, setFlyout] = useState<"skills" | "log" | null>(null);
+  const [flyout, setFlyout] = useState<"skills" | "log" | "support" | null>(null);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [railExpanded, setRailExpanded] = useState(false);
 
@@ -1607,6 +1616,7 @@ export default function Home() {
           {([
               { id: "skills" as const, icon: Star, label: "Skills", badge: upgradableBadge },
               { id: "log" as const, icon: ScrollText, label: "Activity Log", badge: 0 },
+              { id: "support" as const, icon: Heart, label: "Support", badge: 0 },
             ] as const).map((item) => {
               const Icon = item.icon;
               const active = flyout === item.id;
@@ -1704,7 +1714,7 @@ export default function Home() {
             {/* Panel */}
             <div
               role="dialog"
-              aria-label={flyout === "skills" ? "Skills" : "Activity Log"}
+              aria-label={flyout === "skills" ? "Skills" : flyout === "support" ? "Support" : "Activity Log"}
               className="fixed top-[72px] bottom-0 flyout-panel"
               style={{
                 left: railExpanded ? 180 : 56,
@@ -1720,7 +1730,7 @@ export default function Home() {
               {/* Flyout header */}
               <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: "1px solid var(--border)" }}>
                 <span className="text-[18px] font-bold">
-                  {flyout === "skills" ? "Skills" : "Activity Log"}
+                  {flyout === "skills" ? "Skills" : flyout === "support" ? "Support GigaBrain" : "Activity Log"}
                 </span>
                 <button
                   onClick={() => setFlyout(null)}
@@ -1842,6 +1852,49 @@ export default function Home() {
                   ) : (
                     <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>No skill trees available.</p>
                   )
+                )}
+
+                {/* Support flyout */}
+                {flyout === "support" && (
+                  <div className="space-y-4">
+                    <p className="text-[13px]" style={{ color: "var(--text-dim)", lineHeight: 1.55 }}>
+                      GigaBrain is free. If it's earning you scrap, a donation keeps it maintained.
+                    </p>
+
+                    {DONATIONS.kofi && (
+                      <a
+                        href={`https://ko-fi.com/${DONATIONS.kofi}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="btn-press flex items-center justify-center gap-2 w-full py-2.5 rounded-lg text-[13px] font-bold"
+                        style={{ background: "linear-gradient(135deg, var(--orange), var(--orange-dim))", color: "var(--text-inverse)", textDecoration: "none" }}
+                      >
+                        <Heart size={15} /> Ko-fi
+                      </a>
+                    )}
+
+                    {DONATIONS.wallets.map((w) => (
+                      <div key={w.label} className="p-3 rounded-lg" style={{ background: "var(--bg-inset)", border: "1px solid var(--border)" }}>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>{w.label}</span>
+                          <button
+                            onClick={() => { navigator.clipboard.writeText(w.address); addLog(`${w.label} address copied`); }}
+                            className="btn-press flex items-center gap-1 text-[11px] font-semibold px-2 py-1 rounded cursor-pointer"
+                            style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", color: "var(--text-dim)" }}
+                          >
+                            <Copy size={11} /> Copy
+                          </button>
+                        </div>
+                        <div className="text-[11px] break-all tabular-nums" style={{ color: "var(--text-dim)", fontFamily: "monospace" }}>
+                          {w.address}
+                        </div>
+                      </div>
+                    ))}
+
+                    <p className="text-[11px]" style={{ color: "var(--text-faint)", lineHeight: 1.5 }}>
+                      Never send private keys or seed phrases to anyone — this panel only ever shows receive addresses.
+                    </p>
+                  </div>
                 )}
 
                 {/* Activity Log flyout */}
