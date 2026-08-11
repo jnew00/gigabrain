@@ -2,8 +2,10 @@
 
 import {
   insertRun,
+  insertCast,
   getRunStats as dbGetRunStats,
   getDungeonPerformance as dbGetDungeonPerformance,
+  getPondYields as dbGetPondYields,
 } from "@/lib/run-db";
 
 /* ─── Validation helpers ─────────────────────────────── */
@@ -46,11 +48,60 @@ export async function getRunStatsAction(userAddress: string) {
   return dbGetRunStats(userAddress);
 }
 
-export async function getDungeonPerformanceAction(userAddress: string) {
+export async function getDungeonPerformanceAction(userAddress: string, yieldItemId?: number) {
   if (typeof userAddress !== "string") {
     throw new Error("Invalid user address");
   }
-  return dbGetDungeonPerformance(userAddress);
+  if (yieldItemId !== undefined && !isPositiveInt(yieldItemId)) {
+    throw new Error("Invalid yield item id");
+  }
+  return dbGetDungeonPerformance(userAddress, yieldItemId);
+}
+
+/* ─── Cast History ────────────────────────────────────── */
+
+/**
+ * Record one cast and what it paid out.
+ *
+ * The pond is required and unvalidated against a default on purpose — a cast
+ * filed under the wrong pond is worse than one not filed at all, because it
+ * silently corrupts the yield the advisor then ranks ponds by.
+ */
+export async function recordCastAction(
+  pondId: number,
+  nodeId: string,
+  energyCost: number,
+  entryMultiplier: number,
+  caught: boolean,
+  items: { id: number; amount: number; name: string }[],
+  userAddress: string
+) {
+  if (!isPositiveInt(pondId) || pondId <= 0) {
+    throw new Error("Invalid pond id");
+  }
+  if (typeof nodeId !== "string" || nodeId.length === 0 || nodeId.length > 20) {
+    throw new Error("Invalid node id");
+  }
+  if (!isPositiveInt(energyCost) || !isPositiveInt(entryMultiplier)) {
+    throw new Error("Invalid numeric parameter");
+  }
+  if (!Array.isArray(items)) {
+    throw new Error("Invalid items");
+  }
+  if (typeof userAddress !== "string") {
+    throw new Error("Invalid user address");
+  }
+  await insertCast(pondId, nodeId, energyCost, entryMultiplier, caught, items, userAddress);
+}
+
+export async function getPondYieldsAction(userAddress: string, yieldItemId?: number) {
+  if (typeof userAddress !== "string") {
+    throw new Error("Invalid user address");
+  }
+  if (yieldItemId !== undefined && !isPositiveInt(yieldItemId)) {
+    throw new Error("Invalid yield item id");
+  }
+  return dbGetPondYields(userAddress, yieldItemId);
 }
 
 /* ─── Auth ────────────────────────────────────────────── */

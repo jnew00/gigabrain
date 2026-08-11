@@ -121,6 +121,11 @@ export function coordToCell(coord: number[], grid: GridDims = DEFAULT_GRID): num
   return (row - 1) * grid.cols + col;
 }
 
+/** Inverse of coordToCell: a cell ID back to a 1-based [row, col]. */
+export function cellToCoord(cell: number, grid: GridDims): number[] {
+  return [Math.floor((cell - 1) / grid.cols) + 1, ((cell - 1) % grid.cols) + 1];
+}
+
 /** Zero-based row of a cell */
 function cellRow(cell: number, grid: GridDims): number {
   return Math.floor((cell - 1) / grid.cols);
@@ -577,15 +582,22 @@ export interface GroveMove {
   reason: string;
 }
 
-/**
- * Choose a card and a lure position together.
- *
- * They cannot be decided separately: a card is only worth playing if the lure
- * puts the fish inside its stamp, and the lure is only worth moving if a card
- * covers where the fish is going. So every affordable lure position is scored
- * against every card in hand.
- */
-export function pickGroveMove(gd: {
+export interface GroveCardScore {
+  handIndex: number;
+  cardId: number;
+  card: FishingCard | null;
+  /** Best lure position for this card, of the ones the focus meter can reach */
+  focusPoint: number[];
+  focusCost: number;
+  ev: number;
+  pHit: number;
+  pCrit: number;
+  /** False when the card costs more mana than is left */
+  playable: boolean;
+  reason: string;
+}
+
+export interface GroveState {
   hand: number[];
   deckCardData: FishingCard[];
   fishPosition: number[];
@@ -595,28 +607,51 @@ export function pickGroveMove(gd: {
   focusMeter?: number;
   gridSize?: number;
   playerHp?: number;
-}): GroveMove | null {
-  if (!gd.hand?.length) return null;
+}
 
-  const gridSize = gd.gridSize ?? 4;
-  const focus = gd.focusPoint ?? [2, 2];
+/**
+ * Score every card in hand the way the Grove actually resolves them.
+ *
+ * Shared by the auto-player and the hand UI, so the "BEST" badge names the card
+ * auto-fish would play. It previously used the classic board-address scorer
+ * here, which reads a card's hitZones as cells on the pond — in the Grove they
+ * are offsets from the lure, so the badge and the bot disagreed on every hand.
+ *
+ * Each card is scored at its own best affordable lure position, because the
+ * lure can only be in one place and which place is best depends on the card.
+ */
+export function scoreGroveHand(gd: GroveState): GroveCardScore[] {
+  const gridSize = gd.gridSize;
+  const focus = gd.focusPoint;
+  if (typeof gridSize !== "number" || gridSize < 1) return [];
+  if (!Array.isArray(focus) || focus.length !== 2) return [];
+
   const budget = gd.focusMeter ?? 0;
   const mana = gd.playerHp ?? 0;
-  const targets = predictGroveCoords(gd.fishPosition, gd.previousFishPosition, gridSize, gd.nextPosition);
-
+  const targets = predictGroveCoords(
+    gd.fishPosition, gd.previousFishPosition, gridSize, gd.nextPosition
+  );
   const cards = new Map(gd.deckCardData.map((c) => [c.id, c]));
 
-  let best: GroveMove | null = null;
-  for (let row = 1; row <= gridSize; row++) {
-    for (let col = 1; col <= gridSize; col++) {
-      const cost = Math.abs(row - focus[0]) + Math.abs(col - focus[1]);
-      if (cost > budget) continue;
-      const lure = [row, col];
+  return (gd.hand ?? []).map((cardId, handIndex) => {
+    const card = cards.get(cardId);
+    if (!card) {
+      return {
+        handIndex, cardId, card: null, focusPoint: focus, focusCost: 0,
+        ev: -Infinity, pHit: 0, pCrit: 0, playable: false, reason: "unknown card",
+      };
+    }
 
-      for (let handIndex = 0; handIndex < gd.hand.length; handIndex++) {
-        const card = cards.get(gd.hand[handIndex]);
-        if (!card) continue;
-        if (card.manaCost > mana) continue;
+    const hitDmg = card.hitEffects.reduce((s, e) => s + e.amount, 0);
+    const critDmg = card.critEffects.reduce((s, e) => s + e.amount, 0);
+    const missPenalty = card.missEffects.reduce((s, e) => s + Math.abs(e.amount), 0);
+
+    let best: { ev: number; pHit: number; pCrit: number; lure: number[]; cost: number } | null = null;
+    for (let row = 1; row <= gridSize; row++) {
+      for (let col = 1; col <= gridSize; col++) {
+        const cost = Math.abs(row - focus[0]) + Math.abs(col - focus[1]);
+        if (cost > budget) continue;
+        const lure = [row, col];
 
         let pHit = 0;
         let pCrit = 0;
@@ -628,10 +663,6 @@ export function pickGroveMove(gd: {
             if (card.critZones.includes(zone)) pCrit += t.p;
           }
         }
-
-        const hitDmg = card.hitEffects.reduce((s, e) => s + e.amount, 0);
-        const critDmg = card.critEffects.reduce((s, e) => s + e.amount, 0);
-        const missPenalty = card.missEffects.reduce((s, e) => s + Math.abs(e.amount), 0);
         const ev =
           pHit * hitDmg + pCrit * critDmg - (1 - pHit) * missPenalty - card.manaCost * MANA_WEIGHT;
 
@@ -640,21 +671,72 @@ export function pickGroveMove(gd: {
         // chase the fish later, and the fish moves every single turn. Without
         // this the first-found option won and quietly burned the meter.
         const better =
-          !best ||
-          ev > best.ev + 1e-9 ||
-          (Math.abs(ev - best.ev) <= 1e-9 && cost < best.focusCost);
-        if (better) {
-          const moved = cost > 0 ? `lure ${focus.join(",")}->${lure.join(",")} (-${cost} focus), ` : "";
-          best = {
-            handIndex, focusPoint: lure, focusCost: cost, ev, pHit, redraw: false,
-            reason: `${moved}card #${card.id} ${Math.round(pHit * 100)}% hit, EV ${ev.toFixed(1)}`,
-          };
-        }
+          !best || ev > best.ev + 1e-9 || (Math.abs(ev - best.ev) <= 1e-9 && cost < best.cost);
+        if (better) best = { ev, pHit, pCrit, lure, cost };
       }
     }
-  }
 
-  if (!best) return null;
+    if (!best) {
+      return {
+        handIndex, cardId, card, focusPoint: focus, focusCost: 0,
+        ev: -Infinity, pHit: 0, pCrit: 0, playable: false, reason: "no reachable lure position",
+      };
+    }
+
+    const playable = card.manaCost <= mana;
+    const moved =
+      best.cost > 0 ? `lure ${focus.join(",")}->${best.lure.join(",")} (-${best.cost} focus), ` : "";
+    return {
+      handIndex,
+      cardId,
+      card,
+      focusPoint: best.lure,
+      focusCost: best.cost,
+      ev: best.ev,
+      pHit: best.pHit,
+      pCrit: best.pCrit,
+      playable,
+      reason: playable
+        ? `${moved}card #${card.id} ${Math.round(best.pHit * 100)}% hit, EV ${best.ev.toFixed(1)}`
+        : `card #${card.id} needs ${card.manaCost} mana, ${mana} left`,
+    };
+  });
+}
+
+/**
+ * Choose a card and a lure position together.
+ *
+ * They cannot be decided separately: a card is only worth playing if the lure
+ * puts the fish inside its stamp, and the lure is only worth moving if a card
+ * covers where the fish is going. So every affordable lure position is scored
+ * against every card in hand.
+ */
+export function pickGroveMove(gd: GroveState): GroveMove | null {
+  if (!gd.hand?.length) return null;
+
+  // No board, no move. This used to default to 4, which is the Grove's size and
+  // nothing else's — on any other lure-anchored pond it would silently score
+  // every card against the wrong board and still return a confident answer.
+  // gridSize is on every live game state, so an absent one means the caller
+  // passed the wrong object, not that the pond is 4x4. Likewise the lure:
+  // [2,2] is the centre of a 3x3 and off-centre on a 4x4, and the server always
+  // states where the lure is. scoreGroveHand returns nothing without both.
+  const scores = scoreGroveHand(gd).filter((s) => s.playable && s.card);
+  if (!scores.length) return null;
+
+  const mana = gd.playerHp ?? 0;
+  const top = scores.reduce((a, b) =>
+    b.ev > a.ev + 1e-9 || (Math.abs(b.ev - a.ev) <= 1e-9 && b.focusCost < a.focusCost) ? b : a
+  );
+  const best: GroveMove = {
+    handIndex: top.handIndex,
+    focusPoint: top.focusPoint,
+    focusCost: top.focusCost,
+    ev: top.ev,
+    pHit: top.pHit,
+    redraw: false,
+    reason: top.reason,
+  };
 
   // The best available play is barely better than a coin toss on the fish
   // deviating. Since the prediction is hedged rather than absolute, a "dead"

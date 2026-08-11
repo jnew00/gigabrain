@@ -1,5 +1,7 @@
 // Gigaverse API type definitions - reverse-engineered March 2026
 
+import type { PondEntryTier } from "./ponds";
+
 // ─── Player / Combat ───────────────────────────────────────────
 
 export interface MoveStats {
@@ -368,6 +370,11 @@ export interface OffchainStaticResponse {
   gameItems: OffchainGameItem[];
   checkpoints: unknown[];
   constants: Record<string, unknown>;
+  /**
+   * Server day number. The unit `pondEntryTiers` states its `startDay` and
+   * `endDay` in, so an offering's window can only be honoured with this.
+   */
+  currentDay?: number;
 }
 
 // ─── Gear ─────────────────────────────────────────────────────
@@ -486,6 +493,29 @@ export interface FishingCard {
   earnable: boolean;
 }
 
+export interface CaughtFish {
+  gameItemId: number;
+  name: string;
+  rarity: number;
+  quality: number;
+  size: string;
+  sizes: { weight: number; length: number; girth: number };
+  /**
+   * Stall payout for this catch, in the currency of the pond it came out of.
+   *
+   * Renamed from the wire's `seaweedEarned`, which stopped meaning seaweed the
+   * day the Grove opened — a Grove catch reports Infused Sediment through the
+   * same field. The old name survives only in `WireCaughtFish`, so nothing
+   * downstream can read it and assume a currency.
+   */
+  currencyEarned: number;
+}
+
+/** Exactly what the API sends. Normalised into `CaughtFish` at the boundary. */
+export interface WireCaughtFish extends Omit<CaughtFish, "currencyEarned"> {
+  seaweedEarned: number;
+}
+
 export interface FishingGameData {
   deckCardData: FishingCard[];
   playerMaxHp: number;       // mana capacity
@@ -508,26 +538,58 @@ export interface FishingGameData {
   nextCardIndex: number;
   cardInDrawPile: number;
   nextPosition: number[] | null;  // Fintuition skill: where fish will move next
-  caughtFish?: {
-    gameItemId: number;
-    name: string;
-    rarity: number;
-    quality: number;
-    size: string;
-    sizes: { weight: number; length: number; girth: number };
-    seaweedEarned: number;
-  };
+  caughtFish?: CaughtFish;
   cardsToAdd?: FishingCard[];
 }
 
+export interface WireFishingGameData extends Omit<FishingGameData, "caughtFish"> {
+  caughtFish?: WireCaughtFish;
+}
+
+export interface FishingGameDoc {
+  docId: string;
+  COMPLETE_CID: boolean;
+  SUCCESS_CID: boolean;     // true = caught, false = escaped
+  LEVEL_CID: number;
+  /**
+   * The cast node this game is being played on — "0"/"1"/"2" classic, "5" the
+   * Grove. This is how a game states its pond: `focusMechanicEnabled` only
+   * says the Grove plays differently, which stops distinguishing anything the
+   * moment a third pond shares the mechanic.
+   */
+  ID_CID: string;
+  /** Cores multiplier from the entry offering paid for this cast (1, 2 or 4) */
+  MULTIPLIER_CID?: number;
+  IS_JUICED_CID?: boolean;
+  /** Server day number the cast was started on */
+  DAY_CID?: number;
+  data: FishingGameData;
+}
+
+export interface WireFishingGameDoc extends Omit<FishingGameDoc, "data"> {
+  data: WireFishingGameData;
+}
+
+/** Sell value per fish item. `pondId` says which stall buys it. */
+export interface FishExchangeRate {
+  id: number;
+  tier: number;
+  baseVal: number;
+  value: number;
+  pondId: number;
+}
+
+/**
+ * `pondId` is optional on the wire only so a malformed row can be detected and
+ * dropped rather than silently attributed to pond 1. Every row the live API
+ * returned on 2026-08-11 had one (63 of 63, across both ponds).
+ */
+export interface WireFishExchangeRate extends Omit<FishExchangeRate, "pondId"> {
+  pondId?: number;
+}
+
 export interface FishingGameState {
-  gameState: {
-    docId: string;
-    COMPLETE_CID: boolean;
-    SUCCESS_CID: boolean;     // true = caught, false = escaped
-    LEVEL_CID: number;
-    data: FishingGameData;
-  };
+  gameState: FishingGameDoc;
   /**
    * Only the FIRST pond's counter. Do not read this for "casts used today" —
    * the daily cap is shared across ponds and this omits every other one. Use
@@ -541,8 +603,15 @@ export interface FishingGameState {
   node0Energy: number;   // 12
   node1Energy: number;   // 16
   node2Energy: number;   // 20
-  exchangeRates?: { id: number; tier: number; baseVal: number; value: number }[];
+  exchangeRates?: FishExchangeRate[];
+  /** Per-pond offering tiers. See PondEntryTier in lib/ponds.ts. */
+  pondEntryTiers?: PondEntryTier[];
   actionToken?: number;
+}
+
+export interface WireFishingGameState extends Omit<FishingGameState, "gameState" | "exchangeRates"> {
+  gameState: WireFishingGameDoc;
+  exchangeRates?: WireFishExchangeRate[];
 }
 
 export type FishingAction = "start_run" | "play_cards" | "loot";
@@ -566,11 +635,23 @@ export interface FishingActionResponse {
   success: boolean;
   message?: string;
   data: {
-    doc: FishingGameState["gameState"];
+    doc: FishingGameDoc;
     events?: { type: string; value?: number; playerId?: number; batch?: number; data?: Record<string, unknown> }[];
   };
+  /**
+   * What the action actually paid out. The only place the app can see Cores
+   * arriving from a cast, so it is what pond yield is measured from.
+   */
   gameItemBalanceChanges?: { id: number; amount: number }[];
   actionToken?: number;
+}
+
+/** The un-normalised form of the above, straight off the wire. */
+export interface WireFishingActionResponse extends Omit<FishingActionResponse, "data"> {
+  data: {
+    doc: WireFishingGameDoc;
+    events?: { type: string; value?: number; playerId?: number; batch?: number; data?: Record<string, unknown> }[];
+  };
 }
 
 // ─── Marketplace ──────────────────────────────────────────────

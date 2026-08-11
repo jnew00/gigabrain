@@ -7,8 +7,12 @@
 // - Bigger fishing casts give better fish for the same capped cast count.
 // - Gigus (200E) is the only source of Gigus materials but is brutal —
 //   only worth it when you clear deep rooms reliably.
+//
+// Casts are ONE pool shared by every pond. The advisor therefore allocates
+// casts, then decides which pond each one is spent in — it never treats a pond
+// as having an allowance of its own.
 
-import { findDungeonInfo, isAwakeningActive, AWAKENING, FISHING } from "./game-data";
+import { findDungeonInfo, isAwakeningActive, AWAKENING } from "./game-data";
 
 export interface AdvisorDungeon {
   dungeonId: number;
@@ -23,6 +27,22 @@ export interface AdvisorDungeon {
   totalRuns: number;
   /** Drops Hard Cores — funded before permanent currencies during the event */
   eventPriority?: boolean;
+  /**
+   * Hard Cores per run, averaged over recorded runs. Null when never measured.
+   * This is what decides whether the dungeon or the pond gets the energy.
+   */
+  coresPerRun?: number | null;
+}
+
+export interface AdvisorPond {
+  pondId: number;
+  name: string;
+  /** Cast nodes on this pond, any order */
+  nodes: { nodeId: string; label: string; cost: number }[];
+  /** Pays the expiring event currency, so it competes for the same energy */
+  eventPriority?: boolean;
+  /** Hard Cores per cast, averaged over recorded casts. Null when unmeasured. */
+  coresPerCast?: number | null;
 }
 
 export interface AdvisorInput {
@@ -33,22 +53,31 @@ export interface AdvisorInput {
   /** Claimable energy sitting on ROMs */
   romEnergyAvailable: number;
   dungeons: AdvisorDungeon[];
-  fishingCastsLeft: number;
   /**
-   * The Dendren Grove pond, when the event is running. The Grove draws from
-   * the same daily cast pool as the classic ponds, so this is not an extra
-   * budget — supplying it means those casts go to the Grove instead.
+   * Casts left in the single shared daily pool, across all ponds together.
    */
-  eventFishingNode?: { nodeId: string; label: string; cost: number };
+  fishingCastsLeft: number;
+  /** Every pond castable right now. Order does not matter. */
+  ponds: AdvisorPond[];
   /** Unix seconds, injectable so the event window can be tested */
   now?: number;
 }
 
+/** One pond's share of the shared cast pool. */
+export interface AdvisorCastPlan {
+  pondId: number;
+  nodeId: string;
+  casts: number;
+}
+
 export interface AdvisorResult {
   dungeonRuns: { dungeonId: number; runs: number }[];
-  fishing: { nodeId: string; casts: number };
-  /** Grove casts, when the caller supplied a pond to plan for */
-  eventFishing?: { nodeId: string; casts: number };
+  /**
+   * Casts to spend, per pond. A list rather than one node because the pool is
+   * shared: "6 Grove casts and 4 Big classic casts" is a thing the plan has to
+   * be able to say, and a single {nodeId, casts} could not say it.
+   */
+  fishing: AdvisorCastPlan[];
   /** Advisor thinks ROM energy should be claimed into the pool (not dusted) */
   claimRomEnergy: boolean;
   notes: string[];
@@ -63,13 +92,68 @@ function depthScore(d: AdvisorDungeon): number {
   return Math.max(0.1, Math.min(1, d.avgRooms / 16));
 }
 
+/**
+ * A candidate for event energy: either a dungeon run or a pond cast.
+ *
+ * Both yield Hard Cores and both are paid for in energy, so they are ranked
+ * against each other on one number — Cores per energy — rather than by a rule
+ * about which kind of activity comes first.
+ */
+interface EventSpend {
+  kind: "dungeon" | "pond";
+  id: number;
+  name: string;
+  energyPerUnit: number;
+  unitsLeft: number;
+  coresPerUnit: number | null;
+  nodeId?: string;
+  nodeLabel?: string;
+}
+
+function coresPerEnergy(s: EventSpend): number | null {
+  if (s.coresPerUnit == null || s.energyPerUnit <= 0) return null;
+  return s.coresPerUnit / s.energyPerUnit;
+}
+
+/**
+ * Rank event spends by measured yield, cheapest-first among the unmeasured.
+ *
+ * Measured always outranks unmeasured. That is deliberately not the same as
+ * "measured is better": it means the advisor spends where it can justify the
+ * spend, and says out loud that the rest is unranked. Guessing an order between
+ * two unmeasured sources and presenting it as advice is the thing to avoid.
+ */
+function rankEventSpends(spends: EventSpend[]): EventSpend[] {
+  const measured = spends.filter((s) => coresPerEnergy(s) != null);
+  const unmeasured = spends.filter((s) => coresPerEnergy(s) == null);
+  measured.sort((a, b) => (coresPerEnergy(b) ?? 0) - (coresPerEnergy(a) ?? 0));
+  unmeasured.sort((a, b) => a.energyPerUnit - b.energyPerUnit);
+  return [...measured, ...unmeasured];
+}
+
+function rate(s: EventSpend): string {
+  const r = coresPerEnergy(s);
+  return r == null
+    ? "yield never measured"
+    : `${r.toFixed(1)} Cores/E measured`;
+}
+
 export function buildRecommendation(input: AdvisorInput): AdvisorResult {
   const notes: string[] = [];
   const warnings: string[] = [];
   const dungeonRuns: { dungeonId: number; runs: number }[] = [];
+  const fishing: AdvisorCastPlan[] = [];
 
   let budget = input.currentEnergy;
+  let castsLeft = input.fishingCastsLeft;
   let claimRomEnergy = false;
+
+  const ponds = input.ponds ?? [];
+  const cheapestNode = (p: AdvisorPond) =>
+    [...p.nodes].sort((a, b) => a.cost - b.cost)[0];
+  const cheapestCastCost = ponds.length
+    ? Math.min(...ponds.map((p) => cheapestNode(p)?.cost ?? Infinity))
+    : 0;
 
   // ── Regen waste check ──
   if (input.maxEnergy > 0 && input.currentEnergy >= input.maxEnergy * 0.9) {
@@ -79,12 +163,10 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
   }
 
   // ── What would it cost to fill every daily cap? ──
-  const fishNodes = FISHING.nodes;
-  const eventNode = input.eventFishingNode;
-  // Casts are a single shared pool, so the cap costs whatever node they land on
-  const castCost = eventNode ? eventNode.cost : fishNodes[2].cost;
+  // Casts are one pool, so their cost is the pool size times whatever node they
+  // end up on. The cheapest node across all ponds is the floor on that.
   const capCost =
-    input.fishingCastsLeft * castCost +
+    castsLeft * (Number.isFinite(cheapestCastCost) ? cheapestCastCost : 0) +
     input.dungeons
       .filter((d) => d.energyCost > 0)
       .reduce((s, d) => s + d.runsLeft * d.energyCost, 0);
@@ -115,19 +197,18 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
   }
 
   // ── 1. The Awakening: Hard Cores first while the window is open ──
-  // Scrap and Giga Shards are farmable forever; Hard Cores stop existing on
-  // the event's end date and pay out of a real prize pot. So for the duration
-  // every Core-yielding action outranks the permanent grind, and event
-  // dungeons are exempt from the depth ranking below (a dungeon nobody has
-  // run yet always loses that comparison to one with history).
+  // Scrap and Giga Shards are farmable forever; Hard Cores stop existing on the
+  // event's end date and pay out of a real prize pot. So for the duration every
+  // Core-yielding action outranks the permanent grind, and event dungeons are
+  // exempt from the depth ranking below (a dungeon nobody has run yet always
+  // loses that comparison to one with history).
   const eventActive = isAwakeningActive(input.now);
   const eventDungeons = eventActive
     ? input.dungeons.filter((d) => d.eventPriority && d.runsLeft > 0)
     : [];
-  let eventFishing: { nodeId: string; casts: number } | undefined;
-  const groveActive = eventActive && !!eventNode && input.fishingCastsLeft > 0;
+  const eventPonds = eventActive ? ponds.filter((p) => p.eventPriority) : [];
 
-  if (eventActive && (eventDungeons.length > 0 || groveActive)) {
+  if (eventActive && (eventDungeons.length > 0 || eventPonds.length > 0)) {
     notes.push(
       `${AWAKENING.name} is live — Hard Cores are funded before scrap and shards because they expire when the event ends.` +
         (input.isJuiced
@@ -136,70 +217,107 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
     );
   }
 
-  if (groveActive && eventNode) {
-    // Every cast goes to the Grove during the event. It shares the daily cast
-    // pool with the classic ponds, and at 12E it is both the cheapest node and
-    // the only one paying a currency that expires — so there is nothing to
-    // trade off. Seaweed keeps; Cores don't.
-    const casts = Math.min(input.fishingCastsLeft, Math.floor(budget / eventNode.cost));
-    if (casts > 0) {
-      eventFishing = { nodeId: eventNode.nodeId, casts };
-      budget -= casts * eventNode.cost;
-      notes.push(
-        `Dendren Grove: ${casts}x ${eventNode.label} cast (${eventNode.cost}E) for Hard Cores — the classic ponds share this cast pool and are skipped while the event runs.` +
-          (casts < input.fishingCastsLeft
-            ? ` ${input.fishingCastsLeft - casts} casts left unfunded.`
-            : "")
-      );
-    } else {
-      warnings.push(
-        `${input.fishingCastsLeft} casts are available but there isn't ${eventNode.cost}E for even one Grove cast.`
-      );
-    }
-  }
+  const eventSpends: EventSpend[] = [
+    ...eventDungeons.map<EventSpend>((d) => ({
+      kind: "dungeon",
+      id: d.dungeonId,
+      name: d.name,
+      energyPerUnit: d.energyCost,
+      unitsLeft: d.runsLeft,
+      coresPerUnit: d.coresPerRun ?? null,
+    })),
+    ...eventPonds.flatMap<EventSpend>((p) => {
+      const node = cheapestNode(p);
+      if (!node) return [];
+      return [
+        {
+          kind: "pond",
+          id: p.pondId,
+          name: p.name,
+          energyPerUnit: node.cost,
+          unitsLeft: castsLeft,
+          coresPerUnit: p.coresPerCast ?? null,
+          nodeId: node.nodeId,
+          nodeLabel: node.label,
+        },
+      ];
+    }),
+  ];
 
-  // Cheapest first so the most Core-yielding runs get funded
-  for (const d of [...eventDungeons].sort((a, b) => a.energyCost - b.energyCost)) {
-    if (d.energyCost <= 0) {
-      notes.push(`${d.name}: item entry, no energy — run it from the Dungeon tab, it costs the plan nothing.`);
-      continue;
-    }
-    const runs = Math.min(d.runsLeft, Math.floor(budget / d.energyCost));
-    if (runs <= 0) {
-      warnings.push(
-        `${d.name} drops Hard Cores and has ${d.runsLeft} runs left, but there isn't ${d.energyCost}E for a run. This is the spend that expires — consider skipping a regular dungeon.`
-      );
-      continue;
-    }
-    dungeonRuns.push({ dungeonId: d.dungeonId, runs });
-    budget -= runs * d.energyCost;
+  const ranked = rankEventSpends(eventSpends);
+  const unmeasured = ranked.filter((s) => coresPerEnergy(s) == null);
+  if (ranked.length > 1 && unmeasured.length > 0) {
     notes.push(
-      `${d.name}: ${runs}x run for Hard Cores — funded ahead of scrap and shards.` +
-        (runs < d.runsLeft ? ` ${d.runsLeft - runs} capped runs left unfunded.` : "")
+      unmeasured.length === ranked.length
+        ? `No Core yields have been recorded yet, so the event spends below are ordered by cost, not by return. Run a few and the order will be measured instead.`
+        : `${unmeasured.map((s) => s.name).join(" and ")} ${unmeasured.length === 1 ? "has" : "have"} no recorded Core yield, so ${unmeasured.length === 1 ? "it is" : "they are"} funded after the sources that do. That ordering is a placeholder until it's measured, not a judgement.`
     );
   }
 
-  // ── 2. Fishing: cheapest capped action, fill first ──
-  // Pick the biggest cast size the budget supports across ALL remaining casts;
-  // the cast cap binds before energy does, so maximize reward per cast.
-  let fishing = { nodeId: "0", casts: 0 };
-  if (input.fishingCastsLeft > 0 && !eventFishing) {
-    // Reserve nothing yet — fishing gets first claim, then dungeons
-    const node =
-      [...fishNodes].reverse().find((n) => n.cost * input.fishingCastsLeft <= budget * 0.6) ??
-      fishNodes[0];
-    const casts = Math.min(input.fishingCastsLeft, Math.floor(budget / node.cost));
-    if (casts > 0) {
-      fishing = { nodeId: node.nodeId, casts };
-      budget -= casts * node.cost;
+  for (const spend of ranked) {
+    if (spend.energyPerUnit <= 0) {
       notes.push(
-        `Fishing: ${casts}x ${node.label} cast (${node.cost}E). Casts expire daily — ${
-          node.nodeId === "2"
-            ? "Big casts give the best fish per capped cast."
-            : "bigger casts were skipped to leave energy for dungeon runs."
-        }`
+        `${spend.name}: item entry, no energy — run it from the Dungeon tab, it costs the plan nothing.`
+      );
+      continue;
+    }
+    // A pond's units are the shared pool as it stands now, not as it stood when
+    // the list was built — an earlier pond may already have taken from it.
+    const available = spend.kind === "pond" ? Math.min(spend.unitsLeft, castsLeft) : spend.unitsLeft;
+    const units = Math.min(available, Math.floor(budget / spend.energyPerUnit));
+
+    if (units <= 0) {
+      if (available <= 0) continue;
+      warnings.push(
+        spend.kind === "dungeon"
+          ? `${spend.name} drops Hard Cores and has ${available} runs left, but there isn't ${spend.energyPerUnit}E for a run. This is the spend that expires — consider skipping a regular dungeon.`
+          : `${available} casts are available but there isn't ${spend.energyPerUnit}E for even one ${spend.name} cast.`
+      );
+      continue;
+    }
+
+    budget -= units * spend.energyPerUnit;
+    const shortfall =
+      units < available ? ` ${available - units} left unfunded.` : "";
+
+    if (spend.kind === "dungeon") {
+      dungeonRuns.push({ dungeonId: spend.id, runs: units });
+      notes.push(
+        `${spend.name}: ${units}x run for Hard Cores (${rate(spend)}) — funded ahead of scrap and shards.${shortfall}`
+      );
+    } else {
+      castsLeft -= units;
+      fishing.push({ pondId: spend.id, nodeId: spend.nodeId!, casts: units });
+      notes.push(
+        `${spend.name}: ${units}x ${spend.nodeLabel} cast (${spend.energyPerUnit}E, ${rate(spend)}) for Hard Cores. Casts are one shared pool — ${castsLeft} left for other ponds.${shortfall}`
       );
     }
+  }
+
+  // ── 2. Fishing: whatever casts the event didn't claim ──
+  // The cast cap binds before energy does, so spend the remaining pool on the
+  // biggest node the budget supports.
+  const plainPonds = ponds.filter((p) => !(eventActive && p.eventPriority));
+  for (const pond of plainPonds) {
+    if (castsLeft <= 0) break;
+    const byCost = [...pond.nodes].sort((a, b) => a.cost - b.cost);
+    if (!byCost.length) continue;
+    // Reserve nothing yet — fishing gets first claim, then dungeons
+    const node =
+      [...byCost].reverse().find((n) => n.cost * castsLeft <= budget * 0.6) ?? byCost[0];
+    const casts = Math.min(castsLeft, Math.floor(budget / node.cost));
+    if (casts <= 0) continue;
+    fishing.push({ pondId: pond.pondId, nodeId: node.nodeId, casts });
+    budget -= casts * node.cost;
+    castsLeft -= casts;
+    const biggest = byCost[byCost.length - 1];
+    notes.push(
+      `${pond.name}: ${casts}x ${node.label} cast (${node.cost}E). Casts expire daily — ${
+        node.nodeId === biggest.nodeId
+          ? `${node.label} casts give the best fish per capped cast.`
+          : "bigger casts were skipped to leave energy for dungeon runs."
+      }`
+    );
   }
 
   // ── 3. Dungeons: rank by performance-adjusted value per energy ──
@@ -287,9 +405,7 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
         (d) =>
           d.energyCost > 0 &&
           d.runsLeft > (dungeonRuns.find((r) => r.dungeonId === d.dungeonId)?.runs ?? 0)
-      ) ||
-      // One shared cast pool, so whichever pond claimed it answers for it
-      (fishing.casts + (eventFishing?.casts ?? 0)) < input.fishingCastsLeft;
+      ) || castsLeft > 0;
     if (!anyCapLeft) {
       notes.push(
         `${Math.floor(budget)}E left with all daily caps filled — it banks toward tomorrow as long as you stay under the ${input.maxEnergy}E cap.`
@@ -300,7 +416,6 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
   return {
     dungeonRuns,
     fishing,
-    eventFishing,
     claimRomEnergy,
     notes,
     warnings,

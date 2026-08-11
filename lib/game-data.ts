@@ -118,11 +118,11 @@ export const AWAKENING = {
   /** NAME_CID substrings that identify the event's dungeon */
   dungeonMatches: ["forbidden", "woods", "grove", "dendren", "awakening"],
   /**
-   * The Dendren Grove pond. Verified from a live cast on 2026-08-10: it is a
-   * single node at 12E, and it draws from the SAME daily cast pool as the
-   * classic ponds — 20 juiced, shared, not a separate allowance.
+   * The pond the event opened. Its nodes, currency and board live in
+   * lib/ponds.ts with every other pond's — this is only the cross-reference,
+   * so event code can find it without knowing the number.
    */
-  pond: { nodeId: "5", label: "Grove", cost: 12, pondId: 2 },
+  pondId: 2,
 } as const;
 
 /** True while the event window is open — everything event-specific gates on this */
@@ -134,15 +134,6 @@ export function isAwakeningActive(nowSeconds: number = Date.now() / 1000): boole
 export function isEventDungeon(name: string): boolean {
   const lower = name.toLowerCase();
   return AWAKENING.dungeonMatches.some((m) => lower.includes(m));
-}
-
-/**
- * Offering tier to send when starting a cast on a node. The Grove charges a
- * faction ring for tiers 2 and 3 (2x and 4x Cores); tier 1 is free, and is the
- * only one reachable without ring inventory. Classic ponds take 0.
- */
-export function castTierForNode(nodeId: string): number {
-  return nodeId === AWAKENING.pond.nodeId ? 1 : 0;
 }
 
 /**
@@ -179,34 +170,17 @@ export function pickEntryTier(
   return best;
 }
 
+/**
+ * The daily cast allowance. One shared pool across every pond — the cap is on
+ * casts, not on any particular water. Per-pond nodes live in lib/ponds.ts.
+ *
+ * Confirmed against /api/fishing/state on 2026-08-11: maxPerDay 10,
+ * maxPerDayJuiced 20, and the live values there outrank these fallbacks.
+ */
 export const FISHING = {
   maxCastsPerDay: 10,
   juicedMaxCastsPerDay: 20,
-  nodes: [
-    { nodeId: "0", label: "Small", cost: 12 },
-    { nodeId: "1", label: "Normal", cost: 16 },
-    { nodeId: "2", label: "Big", cost: 20 },
-  ],
 } as const;
-
-/**
- * Casts spent today across every pond.
- *
- * The daily cap is one shared pool but the server counts per pond, and
- * `dayDoc` reports only the first. Reading that alone under-counted by the
- * entire Grove — 19 casts invisible — so the plan believed a full allowance
- * remained while the server refused every start_run.
- */
-export function castsUsedToday(state: {
-  dayDoc?: { UINT256_CID: number };
-  dayDocs?: { pondId: number; doc: { UINT256_CID: number } }[];
-} | null | undefined): number {
-  if (!state) return 0;
-  if (state.dayDocs?.length) {
-    return state.dayDocs.reduce((sum, d) => sum + (d.doc?.UINT256_CID ?? 0), 0);
-  }
-  return state.dayDoc?.UINT256_CID ?? 0;
-}
 
 /**
  * Cheapest available unit price, in ETH, from a marketplace listing set.

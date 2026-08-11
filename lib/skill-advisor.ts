@@ -13,10 +13,21 @@
 //
 // Fishing: Fintuition reveals the fish's next cell — the card AI hits
 // near-100% when it fires, so it's the single biggest catch-rate lever.
-// Stamina = more plays per cast. Weed Dealer compounds seaweed income into
+// Stamina = more plays per cast. Weed Dealer compounds sale income into
 // further upgrades. Bait/crit skills are last.
+//
+// There is now more than one fishing tree, and they are NOT the same tree with
+// a different name. Verified against /api/offchain/skills on 2026-08-11:
+// "Fishing Skills" (currency 333, max level 100) and "Dendren Fishing"
+// (currency 935, max level 80) carry identical stat names, but Fintuition pays
+// 2.5%/upgrade in the first and 1.5% in the second, and the XP curves are not
+// remotely comparable — level 5 costs 161 in one and 8 in the other. A ladder
+// written as "Fintuition to 5" therefore means two completely different things
+// depending on which tree it lands on. So the fishing ladder is built per tree
+// from that tree's own published rates.
 
-import type { SkillTree, SkillProgressEntity } from "./types";
+import type { SkillTree, SkillProgressEntity, SkillStat } from "./types";
+import { pondForCurrencyItem, type PondDef } from "./ponds";
 
 export interface SkillUpgradeRec {
   skillId: number;
@@ -100,18 +111,72 @@ const PROC_LADDER: LadderStep[] = [
   { match: ["luck"], target: 5, reason: "Crits only pay on exchanges you were winning anyway" },
 ];
 
-const FISHING_LADDER: LadderStep[] = [
-  { match: ["fintuition"], target: 5, reason: "Reveals the fish's next cell — card AI hits ~100% when it fires" },
+/**
+ * The fishing ladder, built from one tree's own numbers.
+ *
+ * Targets are expressed as the effect wanted, not as a level count, then
+ * converted through the tree's published per-upgrade rate. Buying "Fintuition
+ * to 5" in both trees would buy 12.5% in one and 7.5% in the other while
+ * looking identical in the UI; buying "about 12.5% prediction" buys the same
+ * thing in both and costs whatever that tree charges for it.
+ *
+ * The one genuine ordering difference between the ponds is mana. On a
+ * lure-anchored pond a redraw costs one mana per card held, so mana is not just
+ * how many cards get played — it is the only way out of a hand that cannot
+ * reach the fish. On the classic board a dead hand still gets its swing. So
+ * Stamana leads there and Fintuition leads on the classic pond.
+ */
+function buildFishingLadder(tree: SkillTree, pond: PondDef | undefined): LadderStep[] {
+  const statFor = (parts: string[]): SkillStat | undefined =>
+    tree.stats.find((s) => statMatches(s.name, parts));
+  const rateOf = (parts: string[]): number => statFor(parts)?.increaseValue ?? 0;
+
+  /** Upgrades this tree needs to reach `pct`, at its own rate. */
+  const upgradesFor = (parts: string[], pct: number, fallback: number): number => {
+    const r = rateOf(parts);
+    return r > 0 ? Math.max(1, Math.ceil(pct / r)) : fallback;
+  };
+
+  const pctStep = (parts: string[], pct: number, why: string, fallback: number): LadderStep => {
+    const r = rateOf(parts);
+    const n = upgradesFor(parts, pct, fallback);
+    return {
+      match: parts,
+      target: n,
+      reason: r > 0 ? `${why} — ${r}%/upgrade here, so ${n} upgrades buys ~${pct}%` : why,
+    };
+  };
+
   // "stam" not "stamina": the game spells the stat "Stamana", so the longer
-  // match silently never fired and this step has never been recommended.
-  { match: ["stam"], target: 5, reason: "More starting mana = more card plays per cast" },
-  { match: ["weed"], target: 5, reason: "Better sell prices compound into faster upgrades" },
-  { match: ["luck"], target: 3, reason: "Rarity bumps = more seaweed per catch" },
-  { match: ["taste"], target: 3, reason: "Quality bumps = 40-60% bonus seaweed per star" },
-  { match: ["dual"], target: 3, reason: "Two fish on one capped cast" },
-  { match: ["fintuition"], target: 10, reason: "Keep the prediction rate climbing" },
-  { match: ["stam"], target: 10, reason: "Longer casts close out tanky fish" },
-];
+  // match silently never fired and this step was never recommended.
+  const manaWhy = pond?.lureAnchored
+    ? "Mana is both card plays and redraws on this pond — a dead hand costs mana to escape"
+    : "More starting mana = more card plays per cast";
+  const mana = (target: number): LadderStep => ({
+    match: ["stam"],
+    target,
+    reason: `${manaWhy} (+${rateOf(["stam"]) || 1} per upgrade)`,
+  });
+
+  const fintuitionEarly = pctStep(
+    ["fintuition"],
+    12.5,
+    "Reveals the fish's next cell — the card AI hits near-100% when it fires",
+    5
+  );
+  const fintuitionLate = pctStep(["fintuition"], 25, "Keep the prediction rate climbing", 10);
+
+  const rest: LadderStep[] = [
+    pctStep(["weed"], 25, "Better sell prices compound into faster upgrades", 5),
+    pctStep(["luck"], 4, "Rarity bumps pay more per catch", 3),
+    pctStep(["taste"], 6, "Quality bumps are worth 40-60% more per star", 3),
+    pctStep(["dual"], 6, "Two fish on one capped cast", 3),
+  ];
+
+  return pond?.lureAnchored
+    ? [mana(5), fintuitionEarly, ...rest, mana(10), fintuitionLate]
+    : [fintuitionEarly, mana(5), ...rest, fintuitionLate, mana(10)];
+}
 
 // Stats the ladders deliberately leave for last — used for respec detection
 const COMBAT_LOW_TIER = [["sword", "def"], ["shield", "def"], ["spell", "def"]];
@@ -125,6 +190,45 @@ function statMatches(statName: string, parts: string[]): boolean {
 function isFishingTree(tree: SkillTree): boolean {
   const names = tree.stats.map((s) => s.name.toLowerCase()).join(" ");
   return names.includes("stam") || names.includes("fintuition") || tree.name.toLowerCase().includes("fish");
+}
+
+/**
+ * The pond a fishing tree belongs to, matched on the currency it spends.
+ *
+ * Currency rather than name: the tree's `GAME_ITEM_ID_CID` is the same number
+ * the pond's stall pays out, so the pairing comes from data both sides already
+ * agree on. Matching "dendren" in the tree name would pair the right tree today
+ * and quietly pair nothing the day a pond ships with an unrelated name.
+ */
+function pondForTree(tree: SkillTree): PondDef | undefined {
+  return pondForCurrencyItem(tree.GAME_ITEM_ID_CID);
+}
+
+/**
+ * Currency cost of raising one stat by a single upgrade, and how many tree
+ * levels it consumes.
+ *
+ * An upgrade is not one tree level. `levelsPerPoint` says how many levels the
+ * next upgrade of that stat costs, and it climbs — Stamana runs 1,2,2,2,3,3,…
+ * so the ninth upgrade costs four levels, each priced separately off
+ * `xpPerLvl`. Charging one level per upgrade under-priced every ladder past the
+ * third step, which mattered far more once a second fishing tree existed with a
+ * completely different curve.
+ */
+function upgradeCost(
+  tree: SkillTree,
+  stat: SkillStat,
+  statLevel: number,
+  totalLvl: number
+): { cost: number; levels: number } | null {
+  const levels = stat.levelsPerPoint?.[statLevel] ?? 1;
+  let cost = 0;
+  for (let i = 1; i <= levels; i++) {
+    const step = tree.xpPerLvl?.[totalLvl + i];
+    if (step === undefined) return null;
+    cost += step;
+  }
+  return { cost, levels };
 }
 
 /**
@@ -211,10 +315,21 @@ export function buildSkillAdvice(
     const currentTotalLvl = totalLvl;
 
     const fishing = isFishingTree(tree);
+    const pond = fishing ? pondForTree(tree) : undefined;
+    if (fishing && !pond) {
+      // A fishing tree whose currency is in no pond means a pond shipped that
+      // lib/ponds.ts has not been told about. The ladder still works off the
+      // tree's own rates, but nothing pond-specific can be applied — say so
+      // rather than silently treating it as the classic pond.
+      nextGoals.push(
+        `${tree.name}: spends item ${tree.GAME_ITEM_ID_CID}, which belongs to no pond in lib/ponds.ts. ` +
+          `Advice is generic until that pond is declared.`
+      );
+    }
     const proc = !fishing && isProcTree(tree);
     const treeAvgRooms = fishing ? null : avgRoomsForTree(tree, dungeonPerf, avgRooms);
     const ladder = fishing
-      ? FISHING_LADDER
+      ? buildFishingLadder(tree, pond)
       : proc
       ? PROC_LADDER
       : treeAvgRooms != null && treeAvgRooms < 6
@@ -231,15 +346,17 @@ export function buildSkillAdvice(
       if (!stat) continue;
 
       while ((statLevel.get(stat.id) ?? 0) < step.target && totalLvl < maxLvl && queued < 12) {
-        const cost = tree.xpPerLvl?.[totalLvl + 1];
-        if (cost === undefined) break;
+        const fromLevel = statLevel.get(stat.id) ?? 0;
+        const next = upgradeCost(tree, stat, fromLevel, totalLvl);
+        if (!next) break;
+        const { cost, levels } = next;
+        if (totalLvl + levels > maxLvl) break;
         if (cost > budget) {
           if (!firstUnaffordable) {
-            firstUnaffordable = `${tree.name}: save ${cost} for ${stat.name} → Lv${(statLevel.get(stat.id) ?? 0) + 1} (${step.reason})`;
+            firstUnaffordable = `${tree.name}: save ${cost} for ${stat.name} → Lv${fromLevel + 1} (${step.reason})`;
           }
           break;
         }
-        const fromLevel = statLevel.get(stat.id) ?? 0;
         upgrades.push({
           skillId,
           statId: stat.id,
@@ -253,7 +370,7 @@ export function buildSkillAdvice(
         totalCostByCurrency[tree.GAME_ITEM_ID_CID] = (totalCostByCurrency[tree.GAME_ITEM_ID_CID] ?? 0) + cost;
         budget -= cost;
         statLevel.set(stat.id, fromLevel + 1);
-        totalLvl++;
+        totalLvl += levels;
         queued++;
       }
       if (firstUnaffordable || queued >= 12) break;

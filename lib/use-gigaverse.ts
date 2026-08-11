@@ -19,10 +19,14 @@ import type {
   ItemBalancesResponse,
   FishingGameState,
   FishingActionResponse,
+  WireFishingGameState,
+  WireFishingActionResponse,
   GigaJuiceResponse,
   GearInstancesResponse,
   VendorListingsResponse,
 } from "./types";
+import { normalizeFishingState, normalizeActionResponse } from "./fishing-state";
+import { pondById } from "./ponds";
 const STORAGE_KEY = "giga-auth";
 
 interface StoredAuth {
@@ -148,6 +152,8 @@ export function useGigaverse() {
   const [itemInfo, setItemInfo] = useState<Record<string, { name: string; rarity?: number; rarityName?: string; icon?: string }>>({});
   const [enemyNames, setEnemyNames] = useState<Record<string, { name: string; stats?: number[] }>>({});
   const [worldRecipes, setWorldRecipes] = useState<RecipeEntity[]>([]);
+  /** Server day number, for anything with a day-bounded window. */
+  const [currentDay, setCurrentDay] = useState<number | undefined>(undefined);
   const [playerRecipes, setPlayerRecipes] = useState<PlayerRecipesResponse | null>(null);
   const [skillTrees, setSkillTrees] = useState<SkillTree[]>([]);
   const [skillProgress, setSkillProgress] = useState<SkillProgressEntity[]>([]);
@@ -255,6 +261,9 @@ export function useGigaverse() {
         // Store world recipes (pots, chests, crafting) + player recipe progress
         if (staticData?.recipes) {
           setWorldRecipes(staticData.recipes);
+        }
+        if (typeof staticData?.currentDay === "number") {
+          setCurrentDay(staticData.currentDay);
         }
         setPlayerRecipes(playerRecipeData);
 
@@ -674,10 +683,18 @@ export function useGigaverse() {
   const fetchFishingState = useCallback(async () => {
     if (!token || !address) return null;
     try {
-      const state = await proxy<FishingGameState>(
+      const wire = await proxy<WireFishingGameState>(
         `/api/fishing/state/${address}`,
         token
       );
+      const state = normalizeFishingState(wire, (dropped) => {
+        // A fish whose pond is unknown cannot be sold — /api/fishing/sell needs
+        // the pondId — so say so rather than letting it vanish from the stall.
+        setError(
+          `Fishing state returned ${dropped.length} exchange rate(s) with no pondId ` +
+            `(items ${dropped.map((d) => d.id).join(", ")}). Those fish can't be sold until the pond is known.`
+        );
+      });
       setFishingState(state);
       if (state.actionToken) {
         setFishingActionToken(state.actionToken);
@@ -695,7 +712,14 @@ export function useGigaverse() {
     }
   }, [token, address]);
 
-  /** Perform a fishing action (start_run or play_cards) */
+  /**
+   * Perform a fishing action.
+   *
+   * Redraw is not its own action: it is `play_cards` with an empty `cards`
+   * array. Verified from a live cast on 2026-08-11 — hand [6,10,9] became
+   * [7,5,4], the draw pile fell by three and mana by three, i.e. one per card
+   * held. That is why no redraw verb exists in the client's ACTIONS table.
+   */
   const fishingAction = useCallback(
     async (
       action: "start_run" | "play_cards" | "loot",
@@ -714,7 +738,7 @@ export function useGigaverse() {
       if (!token || !address) return null;
 
       const doRequest = async (a: string, tkn: string, d: typeof data) => {
-        const result = await proxy<FishingActionResponse>(
+        const wire = await proxy<WireFishingActionResponse>(
           "/api/fishing/action",
           token,
           "POST",
@@ -733,6 +757,8 @@ export function useGigaverse() {
             },
           }
         );
+        // Rename `seaweedEarned` before anything downstream can read it.
+        const result = wire ? normalizeActionResponse(wire) : wire;
         if (result) {
           const gd = result.data.doc.data;
           if (gd) {
@@ -777,8 +803,8 @@ export function useGigaverse() {
         // If start_run failed, check if there's a completed game needing loot
         if (action === "start_run") {
           try {
-            const state = await proxy<FishingGameState>(
-              `/api/fishing/state/${address}`, token
+            const state = normalizeFishingState(
+              await proxy<WireFishingGameState>(`/api/fishing/state/${address}`, token)
             );
             if (state?.gameState?.COMPLETE_CID && state.gameState.data?.cardsToAdd?.length) {
               // Use loot action: pick first card + start next cast
@@ -903,16 +929,28 @@ export function useGigaverse() {
     [token, noobId]
   );
 
-  /** Sell fish at the Fish Stall */
+  /**
+   * Sell fish at the Fish Stall.
+   *
+   * `pondId` became required when the Awakening added the Dendren Grove — with
+   * two stalls the server can no longer infer which one buys a given fish, and
+   * omitting it fails with MissingPondId. The pond for each fish is on its
+   * `exchangeRates` entry in the fishing state.
+   *
+   * It has no default on purpose. A default of 1 would send a third pond's fish
+   * to the classic stall, which either fails or pays the wrong currency — and
+   * `pondById` throws first, before any request goes out.
+   */
   const sellFish = useCallback(
-    async (fishId: number, amount: number, expectedValue: number) => {
+    async (fishId: number, amount: number, expectedValue: number, pondId: number) => {
       if (!token) return null;
+      pondById(pondId);
       try {
         return await proxy<{ success: boolean; message?: string; data?: { value: number; boost: number }; gameItemBalanceChanges?: { id: number; amount: number }[] }>(
           "/api/fishing/sell",
           token,
           "POST",
-          { fishId, amount, expectedValue }
+          { fishId, amount, expectedValue, pondId }
         );
       } catch (e) {
         setError(e instanceof Error ? e.message : "Fish sell failed");
@@ -940,6 +978,7 @@ export function useGigaverse() {
     itemInfo,
     enemyNames,
     worldRecipes,
+    currentDay,
     playerRecipes,
     skillTrees,
     skillProgress,

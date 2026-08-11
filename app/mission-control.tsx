@@ -8,23 +8,28 @@ import { pickBestCard, pickGroveMove, resolveGrid } from "@/lib/fishing-ai";
 import { beginHaulCapture, endHaulCapture } from "@/lib/use-gigaverse";
 import { probeFishMove } from "@/lib/fishing-probe";
 import { Sword, Package, Fish, AlertTriangle, Info, Lightbulb } from "lucide-react";
-import { recordRunAction, getDungeonPerformanceAction } from "./actions";
-import { getMaxRunsPerDay, findDungeonInfo, isEventDungeon, isAwakeningActive, castTierForNode, castsUsedToday, pickEntryTier, CLAIM_RECIPES, CLAIM_RECIPE_IDS, AWAKENING, FISHING } from "@/lib/game-data";
+import { recordRunAction, recordCastAction, getDungeonPerformanceAction, getPondYieldsAction } from "./actions";
+import { getMaxRunsPerDay, findDungeonInfo, isEventDungeon, isAwakeningActive, pickEntryTier, CLAIM_RECIPES, CLAIM_RECIPE_IDS, AWAKENING, FISHING } from "@/lib/game-data";
+import {
+  openCastNodes, openPonds, pondById, pondCurrencyLabel, castsUsedToday, pondEntryOptions,
+} from "@/lib/ponds";
 import { buildRecommendation } from "@/lib/energy-advisor";
 import type { AdvisorResult } from "@/lib/energy-advisor";
 
 
 /* ─── Constants ────────────────────────────────────────────── */
 
-// The Grove is a node like any other, so the stepper and every nodeId lookup
-// need it in the list while the event is running.
-const CAST_NODES = isAwakeningActive()
-  ? [...FISHING.nodes, AWAKENING.pond]
-  : [...FISHING.nodes];
+// Every castable node across every open pond. Event ponds fall out of this on
+// their own end date, so nothing here needs an isAwakeningActive() check.
+const CAST_NODES = openCastNodes();
 
 // Recipe ids come from the shared claim table in game-data so this file and
 // the Pots & Chests panel cannot drift apart again.
 const RECIPE_ITEMS = CLAIM_RECIPE_IDS;
+
+// Mana falls by one per card on every redraw so the loop terminates anyway;
+// the cap stops a stubborn hand from spending a whole cast reshuffling.
+const MAX_REDRAWS_PER_CAST = 3;
 
 /** Item rarity palette, matching the one the rest of the app uses */
 const RARITY_COLORS = ["var(--text-faint)", "var(--green)", "var(--blue)", "var(--gold)", "var(--orange)"];
@@ -67,7 +72,18 @@ interface DungeonAlloc {
   maxRuns: number;
 }
 
+/**
+ * Casts planned on one node.
+ *
+ * There is a list of these rather than a single one because the daily cast
+ * allowance is a single pool shared by every pond: "6 Grove casts and 4 Big
+ * classic casts" is a legitimate plan, and a lone {castNodeId, casts} could not
+ * express it. That limitation is why the advisor used to route the entire pool
+ * to the Grove during the event — not because that was optimal, but because it
+ * was the only thing the plan could say.
+ */
 interface FishingAlloc {
+  pondId: number;
   castNodeId: string;
   castCost: number;
   castLabel: string;
@@ -83,12 +99,24 @@ interface FreeActions {
   vote: boolean;
   tradeHugis: boolean;          // execute affordable traveling-merchant deals
   repairGear: boolean;          // repair worn hands/rods/lures/equipped gear first
+  /**
+   * Pay a pond's higher entry offering when one is affordable.
+   *
+   * Off by default and never inferred. The Grove's tier 2 and 3 offerings
+   * multiply Cores by 2x and 4x, but they are bought with faction rings —
+   * Legendary collectables — and whether a ring is worth 4x Cores on a single
+   * cast is a market question, not something the planner should answer on its
+   * own. Tier 1 is free and is what gets sent unless this is on.
+   */
+  spendEntryOfferings: boolean;
 }
 
 interface Preset {
   name: string;
   dungeonAllocs: DungeonAlloc[];
-  fishingAlloc: FishingAlloc;
+  fishingAllocs: FishingAlloc[];
+  /** Presets saved before the plan supported more than one pond */
+  fishingAlloc?: LegacyFishingAlloc;
   freeActions: FreeActions;
 }
 
@@ -131,7 +159,56 @@ function savePresets(presets: Preset[]) {
   localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
 }
 
-function loadLastAlloc(): { dungeonAllocs?: DungeonAlloc[]; fishingAlloc?: FishingAlloc; freeActions?: FreeActions } | null {
+/**
+ * A saved allocation from before the plan could hold more than one pond.
+ *
+ * Kept only so `migrateFishingAllocs` can read it — nothing else should know
+ * the single-node shape ever existed.
+ */
+interface LegacyFishingAlloc {
+  castNodeId: string;
+  castCost: number;
+  castLabel: string;
+  casts: number;
+}
+
+/**
+ * Turn whatever was in localStorage into a list of per-pond allocations.
+ *
+ * A saved single alloc names a node, and the node names the pond — so the
+ * migration is lossless. An unrecognised node (one from a pond that has since
+ * closed, or a node that never existed) is dropped rather than filed under
+ * pond 1.
+ */
+function migrateFishingAllocs(
+  saved: FishingAlloc[] | LegacyFishingAlloc | undefined
+): FishingAlloc[] {
+  if (!saved) return [];
+  const list = Array.isArray(saved) ? saved : [saved];
+  const out: FishingAlloc[] = [];
+  for (const a of list) {
+    if (!a || typeof a.castNodeId !== "string") continue;
+    const pond = openPonds().find((p) => p.nodes.some((n) => n.nodeId === a.castNodeId));
+    if (!pond) continue;
+    const node = pond.nodes.find((n) => n.nodeId === a.castNodeId)!;
+    out.push({
+      pondId: pond.pondId,
+      castNodeId: node.nodeId,
+      castCost: node.cost,
+      castLabel: node.label,
+      casts: Math.max(0, a.casts ?? 0),
+    });
+  }
+  return out;
+}
+
+function loadLastAlloc(): {
+  dungeonAllocs?: DungeonAlloc[];
+  fishingAllocs?: FishingAlloc[];
+  /** Pre-multi-pond saves */
+  fishingAlloc?: LegacyFishingAlloc;
+  freeActions?: FreeActions;
+} | null {
   try {
     const raw = localStorage.getItem(LAST_ALLOC_KEY);
     if (!raw) return null;
@@ -155,13 +232,18 @@ function loadLastAlloc(): { dungeonAllocs?: DungeonAlloc[]; fishingAlloc?: Fishi
     if (data?.freeActions && !("repairGear" in data.freeActions)) {
       data.freeActions.repairGear = true;
     }
+    // Offering rings are Legendary collectables, so a save from before the
+    // toggle existed must not start spending them.
+    if (data?.freeActions && !("spendEntryOfferings" in data.freeActions)) {
+      data.freeActions.spendEntryOfferings = false;
+    }
     return data;
   } catch {
     return null;
   }
 }
 
-function saveLastAlloc(data: { dungeonAllocs: DungeonAlloc[]; fishingAlloc: FishingAlloc; freeActions: FreeActions }) {
+function saveLastAlloc(data: { dungeonAllocs: DungeonAlloc[]; fishingAllocs: FishingAlloc[]; freeActions: FreeActions }) {
   localStorage.setItem(LAST_ALLOC_KEY, JSON.stringify(data));
 }
 
@@ -358,15 +440,22 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   const currentEnergy = Math.floor(eng?.energyValue ?? 0);
   const maxEnergy = eng?.maxEnergy ?? 240;
 
-  // Dungeon data
-  const dungeons = giga.dungeonToday?.dungeonDataEntities ?? [];
-  const dayProgress = giga.dungeonToday?.dayProgressEntities ?? [];
+  // Dungeon data. Memoised because the `?? []` fallbacks allocate a fresh array
+  // every render, which would make anything depending on them recompute
+  // constantly — including the runs-remaining derivation below.
+  const dungeons = useMemo(
+    () => giga.dungeonToday?.dungeonDataEntities ?? [],
+    [giga.dungeonToday]
+  );
+  const dayProgress = useMemo(
+    () => giga.dungeonToday?.dayProgressEntities ?? [],
+    [giga.dungeonToday]
+  );
 
   // Initialize dungeon allocations
   const [dungeonAllocs, setDungeonAllocs] = useState<DungeonAlloc[]>([]);
-  const [fishingAlloc, setFishingAlloc] = useState<FishingAlloc>({
-    castNodeId: "1", castCost: 16, castLabel: "Normal", casts: 0,
-  });
+  // One entry per node the plan spends casts on. Empty means no fishing today.
+  const [fishingAllocs, setFishingAllocs] = useState<FishingAlloc[]>([]);
   const [freeActions, setFreeActions] = useState<FreeActions>({
     claimRomResources: true,
     romEnergyMode: "convert",
@@ -376,7 +465,32 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     vote: true,
     tradeHugis: true,
     repairGear: true,
+    spendEntryOfferings: false,
   });
+
+  /**
+   * Runs still available today, per dungeon.
+   *
+   * Derived, never stored: the allocation table is initialised once when the
+   * dungeon list loads, so a `maxRuns` captured there goes stale the moment a
+   * run completes. That is how the advisor came to warn about 7 Forbidden
+   * Woods runs when only 2 remained, and would have planned runs the server
+   * refuses. Only the user's chosen `runs` belongs in state; the cap is a fact
+   * about the day and is read fresh.
+   */
+  const runsRemaining = useMemo(() => {
+    const out: Record<number, number> = {};
+    for (const d of dungeons) {
+      const used = dayProgress.find((p) => p.ID_CID === `Dungeon#${d.ID_CID}`)?.UINT256_CID ?? 0;
+      out[d.ID_CID] = Math.max(0, getMaxRunsPerDay(d, eng?.isPlayerJuiced ?? false) - used);
+    }
+    return out;
+  }, [dungeons, dayProgress, eng?.isPlayerJuiced]);
+
+  const remainingFor = useCallback(
+    (alloc: { dungeonId: number; maxRuns: number }) => runsRemaining[alloc.dungeonId] ?? alloc.maxRuns,
+    [runsRemaining]
+  );
 
   // Initialize dungeon allocs when data arrives
   useEffect(() => {
@@ -409,21 +523,20 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     });
     setDungeonAllocs(allocs);
 
-    if (last?.fishingAlloc) {
-      // Clamp saved fishing casts by remaining energy
-      const maxCasts = last.fishingAlloc.castCost > 0
-        ? Math.floor(energyBudget / last.fishingAlloc.castCost)
-        : 0;
-      setFishingAlloc({ ...last.fishingAlloc, casts: Math.min(last.fishingAlloc.casts, maxCasts) });
-    } else {
-      // Auto-determine best cast type
-      const fs = giga.fishingState;
-      if (fs) {
-        const castNode = recommendCast(currentEnergy, fs);
-        const node = CAST_NODES.find((n) => n.nodeId === castNode) ?? CAST_NODES[1];
-        setFishingAlloc({ castNodeId: node.nodeId, castCost: node.cost, castLabel: node.label, casts: 0 });
-      }
-    }
+    // Saved casts, clamped by the energy actually available. The clamp walks the
+    // list rather than dividing once, because the entries can be on different
+    // nodes at different prices and the budget is shared between them.
+    const savedCasts = migrateFishingAllocs(last?.fishingAllocs ?? last?.fishingAlloc);
+    let castBudget = energyBudget;
+    const restoredCasts = savedCasts
+      .map((a) => {
+        const affordable = a.castCost > 0 ? Math.floor(castBudget / a.castCost) : 0;
+        const casts = Math.min(a.casts, affordable);
+        castBudget -= casts * a.castCost;
+        return { ...a, casts };
+      })
+      .filter((a) => a.casts > 0);
+    setFishingAllocs(restoredCasts);
 
     if (last?.freeActions) {
       setFreeActions(last.freeActions);
@@ -431,7 +544,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
     // Plan-first: if nothing was restored, the advisor's plan fills in once it's ready
     restoredEmptyRef.current =
-      allocs.every((a) => a.runs === 0) && !(last?.fishingAlloc && last.fishingAlloc.casts > 0);
+      allocs.every((a) => a.runs === 0) && restoredCasts.length === 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dungeons.length]);
 
@@ -444,21 +557,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     : (fs?.maxPerDay ?? FISHING.maxCastsPerDay);
   const remainingCasts = Math.max(0, maxCasts - castsToday);
 
-  // Recommended cast
-  function recommendCast(energy: number, fishState: NonNullable<typeof fs>): string {
-    const maxC = isJuiced
-      ? (fishState.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
-      : (fishState.maxPerDay ?? FISHING.maxCastsPerDay);
-    const remaining = Math.max(0, maxC - castsUsedToday(fishState));
-    if (remaining <= 0) return "0";
-    const bigCasts = Math.min(remaining, Math.floor(energy / (fishState.node2Energy || 20)));
-    const normalCasts = Math.min(remaining, Math.floor(energy / (fishState.node1Energy || 16)));
-    if (bigCasts >= remaining) return "2";
-    if (normalCasts >= remaining) return "1";
-    if (bigCasts >= remaining * 0.8) return "2";
-    if (normalCasts >= remaining * 0.8) return "1";
-    return "0";
-  }
+  // Casts already planned, which the steppers cap against. One number because
+  // the allowance is one pool — a pond does not have casts of its own.
+  const plannedCasts = fishingAllocs.reduce((s, a) => s + a.casts, 0);
+  const unplannedCasts = Math.max(0, remainingCasts - plannedCasts);
 
   // Execution order. During The Awakening, Core-yielding dungeons run first:
   // if a run fails or energy comes up short, the spend that survives should be
@@ -474,7 +576,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
   // Allocated energy
   const dungeonEnergy = dungeonAllocs.reduce((s, d) => s + d.runs * d.energyCost, 0);
-  const fishingEnergy = fishingAlloc.casts * fishingAlloc.castCost;
+  const fishingEnergy = fishingAllocs.reduce((s, a) => s + a.casts * a.castCost, 0);
   const allocatedEnergy = dungeonEnergy + fishingEnergy;
 
   // ROM stats
@@ -526,37 +628,91 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         const qty = balMap[String(r.id)] ?? 0;
         if (qty <= 0) return null;
         const pct = Math.round(((r.value - r.baseVal) / r.baseVal) * 100);
-        return { id: r.id, qty, value: r.value, pct };
+        // pondId identifies which stall buys this fish; the sell call is
+        // rejected without it now that the Grove added a second one.
+        return { id: r.id, qty, value: r.value, pct, pondId: r.pondId };
       })
       .filter((f): f is NonNullable<typeof f> => f !== null && f.pct >= 50);
     const totalCount = fish.reduce((s, f) => s + f.qty, 0);
-    const totalSeaweed = fish.reduce((s, f) => s + f.value * f.qty, 0);
-    return { fish, totalCount, totalSeaweed };
+    // Split by pond: the two stalls pay different currencies, so one total
+    // would be adding Seaweed to Infused Sediment.
+    const byPond = new Map<number, number>();
+    for (const f of fish) byPond.set(f.pondId, (byPond.get(f.pondId) ?? 0) + f.value * f.qty);
+    const proceeds = Array.from(byPond, ([pondId, amount]) => ({
+      pondId, amount, label: pondCurrencyLabel(pondId),
+    }));
+    return { fish, totalCount, proceeds };
   }, [fs?.exchangeRates, giga.itemBalances]);
+
+  /**
+   * Ponds where a better entry offering is currently affordable.
+   *
+   * Reported, not taken. The offering multiplies a cast's Cores by 2x or 4x but
+   * costs a faction ring, and rings are Legendary collectables — trading one
+   * for a single cast's Cores is a call the planner should surface rather than
+   * make. Until the Grove shipped, tier 1 was the only tier ever sent.
+   */
+  const entryOfferings = useMemo(() => {
+    const tiers = fs?.pondEntryTiers;
+    return openPonds()
+      .map((p) => ({ pond: p, ...pondEntryOptions(tiers, p.pondId, giga.itemBalances, giga.currentDay) }))
+      // With no free tier at all, any payable tier is worth surfacing — it is
+      // the only way to cast that pond.
+      .filter((o) => o.payable != null && o.payable.dropMultiplier > (o.free?.dropMultiplier ?? 0));
+  }, [fs?.pondEntryTiers, giga.itemBalances, giga.currentDay]);
 
   // Save current allocation to localStorage when it changes
   useEffect(() => {
     if (dungeonAllocs.length > 0) {
-      saveLastAlloc({ dungeonAllocs, fishingAlloc, freeActions });
+      saveLastAlloc({ dungeonAllocs, fishingAllocs, freeActions });
     }
-  }, [dungeonAllocs, fishingAlloc, freeActions]);
+  }, [dungeonAllocs, fishingAllocs, freeActions]);
 
   /* ─── Energy Advisor ────────────────────────────────────── */
 
-  // Per-dungeon run history (last 30 days) for performance-aware advice
+  // Per-dungeon run history (last 30 days) for performance-aware advice.
+  // `avg_item_amount` is the event Core drop per run, which is what lets the
+  // advisor rank a dungeon run against a pond cast on measured return.
   const [dungeonPerf, setDungeonPerf] = useState<
-    Record<string, { total_runs: number; wins: number; avg_rooms: number }>
+    Record<string, { total_runs: number; wins: number; avg_rooms: number; avg_item_amount?: number | null }>
   >({});
   useEffect(() => {
     if (!giga.address) return;
-    getDungeonPerformanceAction(giga.address)
+    getDungeonPerformanceAction(giga.address, AWAKENING.coreItemId)
       .then((rows) => {
-        const map: Record<string, { total_runs: number; wins: number; avg_rooms: number }> = {};
+        const map: Record<string, { total_runs: number; wins: number; avg_rooms: number; avg_item_amount?: number | null }> = {};
         for (const r of rows) map[r.dungeon_name] = r;
         setDungeonPerf(map);
       })
       .catch(() => {});
   }, [giga.address]);
+
+  // Measured Cores per cast, per pond. Empty until casts have been recorded —
+  // the advisor treats an absent entry as "unmeasured", never as zero.
+  const [pondYields, setPondYields] = useState<Record<number, number | null>>({});
+  useEffect(() => {
+    if (!giga.address) return;
+    getPondYieldsAction(giga.address, AWAKENING.coreItemId)
+      .then((rows) => {
+        const map: Record<number, number | null> = {};
+        for (const r of rows) map[r.pond_id] = r.avg_item_amount;
+        setPondYields(map);
+      })
+      .catch(() => {});
+  }, [giga.address]);
+
+  /** Ponds castable right now, with whatever yield history exists for each. */
+  const advisorPonds = useMemo(
+    () =>
+      openPonds().map((p) => ({
+        pondId: p.pondId,
+        name: p.name,
+        nodes: p.nodes.map((n) => ({ ...n })),
+        eventPriority: p.pondId === AWAKENING.pondId,
+        coresPerCast: pondYields[p.pondId] ?? null,
+      })),
+    [pondYields]
+  );
 
   const recommendation = useMemo<AdvisorResult | null>(() => {
     if (dungeonAllocs.length === 0 || !eng) return null;
@@ -572,36 +728,53 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           dungeonId: d.dungeonId,
           name: d.name,
           energyCost: d.energyCost,
-          runsLeft: d.maxRuns,
+          runsLeft: remainingFor(d),
           winRate: perf && perf.total_runs > 0 ? perf.wins / perf.total_runs : null,
           avgRooms: perf?.avg_rooms ?? null,
           totalRuns: perf?.total_runs ?? 0,
           eventPriority: isEventDungeon(d.name),
+          coresPerRun: perf?.avg_item_amount ?? null,
         };
       }),
+      // One shared pool. Which pond each cast lands in is the advisor's call.
       fishingCastsLeft: remainingCasts,
-      // The Grove shares the daily cast pool, so this redirects casts rather
-      // than adding any. Gated on the event so it lapses on its own end date.
-      eventFishingNode: isAwakeningActive() ? { ...AWAKENING.pond } : undefined,
+      ponds: advisorPonds,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dungeonAllocs, currentEnergy, maxEnergy, isJuiced, totalRomE, dungeonPerf, remainingCasts]);
+  }, [dungeonAllocs, currentEnergy, maxEnergy, isJuiced, totalRomE, dungeonPerf, remainingCasts, advisorPonds]);
 
   const applyRecommendation = () => {
     if (!recommendation) return;
     setDungeonAllocs((prev) =>
       prev.map((d) => {
         const rec = recommendation.dungeonRuns.find((r) => r.dungeonId === d.dungeonId);
-        return { ...d, runs: rec ? Math.min(rec.runs, d.maxRuns) : 0 };
+        return { ...d, runs: rec ? Math.min(rec.runs, remainingFor(d)) : 0 };
       })
     );
-    const node = CAST_NODES.find((n) => n.nodeId === recommendation.fishing.nodeId) ?? CAST_NODES[1];
-    setFishingAlloc({
-      castNodeId: node.nodeId,
-      castCost: node.cost,
-      castLabel: node.label,
-      casts: recommendation.fishing.casts,
-    });
+    // The advisor returns one entry per pond it wants casts in. Reading a
+    // single one used to drop every Grove cast on the floor — the advisor said
+    // "10x Grove cast, 120E" while the plan allocated none, so a run spent a
+    // fraction of the pool and the rest had to be run again.
+    setFishingAllocs(
+      recommendation.fishing
+        .filter((f) => f.casts > 0)
+        .flatMap((f) => {
+          const node = CAST_NODES.find(
+            (n) => n.nodeId === f.nodeId && n.pondId === f.pondId
+          );
+          // A recommendation for a node this build does not know about is not
+          // something to approximate — drop it and let the plan come up short
+          // visibly rather than casting somewhere else.
+          if (!node) return [];
+          return [{
+            pondId: node.pondId,
+            castNodeId: node.nodeId,
+            castCost: node.cost,
+            castLabel: node.label,
+            casts: f.casts,
+          }];
+        })
+    );
     if (recommendation.claimRomEnergy) {
       setFreeActions((prev) => ({ ...prev, romEnergyMode: "claim" }));
     }
@@ -740,7 +913,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     setDungeonAllocs((prev) => {
       const next = [...prev];
       const d = next[idx];
-      const newRuns = Math.max(0, Math.min(d.maxRuns, d.runs + delta));
+      const newRuns = Math.max(0, Math.min(remainingFor(d), d.runs + delta));
       const energyDelta = (newRuns - d.runs) * d.energyCost;
       if (allocatedEnergy + energyDelta > effectiveEnergy && delta > 0) return prev;
       next[idx] = { ...d, runs: newRuns };
@@ -748,25 +921,54 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     });
   };
 
-  const adjustFishing = (delta: number) => {
-    setFishingAlloc((prev) => {
-      const newCasts = Math.max(0, Math.min(remainingCasts, prev.casts + delta));
-      const energyDelta = (newCasts - prev.casts) * prev.castCost;
-      if (allocatedEnergy + energyDelta > effectiveEnergy && delta > 0) return prev;
-      return { ...prev, casts: newCasts };
+  /** Casts currently planned on one node. */
+  const castsForNode = (nodeId: string) =>
+    fishingAllocs.find((a) => a.castNodeId === nodeId)?.casts ?? 0;
+
+  /**
+   * Move casts on or off one node.
+   *
+   * Two ceilings apply and they are different things: energy, and the shared
+   * daily cast pool. Adding a Grove cast has to be refused when the pool is
+   * spoken for even if there is plenty of energy, because the pool is what the
+   * server actually counts.
+   */
+  const adjustFishingNode = (nodeId: string, delta: number) => {
+    const node = CAST_NODES.find((n) => n.nodeId === nodeId);
+    if (!node) return;
+    setFishingAllocs((prev) => {
+      const current = prev.find((a) => a.castNodeId === nodeId)?.casts ?? 0;
+      const plannedElsewhere = prev.reduce(
+        (s, a) => s + (a.castNodeId === nodeId ? 0 : a.casts),
+        0
+      );
+      const poolCeiling = Math.max(0, remainingCasts - plannedElsewhere);
+      const next = Math.max(0, Math.min(poolCeiling, current + delta));
+      if (next === current) return prev;
+      const energyDelta = (next - current) * node.cost;
+      if (delta > 0 && allocatedEnergy + energyDelta > effectiveEnergy) return prev;
+      return upsertCasts(prev, node, next);
     });
   };
 
-  const changeCastNode = (nodeId: string) => {
-    const node = CAST_NODES.find((n) => n.nodeId === nodeId);
-    if (!node) return;
-    setFishingAlloc((prev) => ({
-      ...prev,
-      castNodeId: node.nodeId,
-      castCost: node.cost,
-      castLabel: node.label,
-      casts: Math.min(prev.casts, Math.floor(currentEnergy / node.cost)),
-    }));
+  /** Put `casts` on a node, adding or removing its row as needed. */
+  const upsertCasts = (
+    allocs: FishingAlloc[],
+    node: (typeof CAST_NODES)[number],
+    casts: number
+  ): FishingAlloc[] => {
+    const without = allocs.filter((a) => a.castNodeId !== node.nodeId);
+    if (casts <= 0) return without;
+    return [
+      ...without,
+      {
+        pondId: node.pondId,
+        castNodeId: node.nodeId,
+        castCost: node.cost,
+        castLabel: node.label,
+        casts,
+      },
+    ];
   };
 
   const maxDungeon = (idx: number) => {
@@ -775,16 +977,24 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       const d = next[idx];
       const spare = effectiveEnergy - allocatedEnergy;
       const affordable = d.runs + Math.floor(spare / d.energyCost);
-      next[idx] = { ...d, runs: Math.max(0, Math.min(d.maxRuns, affordable)) };
+      next[idx] = { ...d, runs: Math.max(0, Math.min(remainingFor(d), affordable)) };
       return next;
     });
   };
 
-  const maxFishing = () => {
-    setFishingAlloc((prev) => {
+  const maxFishingNode = (nodeId: string) => {
+    const node = CAST_NODES.find((n) => n.nodeId === nodeId);
+    if (!node) return;
+    setFishingAllocs((prev) => {
+      const current = prev.find((a) => a.castNodeId === nodeId)?.casts ?? 0;
+      const plannedElsewhere = prev.reduce(
+        (s, a) => s + (a.castNodeId === nodeId ? 0 : a.casts),
+        0
+      );
       const spare = effectiveEnergy - allocatedEnergy;
-      const affordable = prev.casts + Math.floor(spare / prev.castCost);
-      return { ...prev, casts: Math.max(0, Math.min(remainingCasts, affordable)) };
+      const affordable = current + Math.floor(spare / node.cost);
+      const poolCeiling = Math.max(0, remainingCasts - plannedElsewhere);
+      return upsertCasts(prev, node, Math.max(0, Math.min(poolCeiling, affordable)));
     });
   };
 
@@ -795,7 +1005,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     const preset: Preset = {
       name: presetName.trim(),
       dungeonAllocs,
-      fishingAlloc,
+      fishingAllocs,
       freeActions,
     };
     const updated = [...presets.filter((p) => p.name !== preset.name), preset];
@@ -809,13 +1019,22 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     // Apply preset allocs, capping to current limits
     const newAllocs = dungeonAllocs.map((d) => {
       const saved = preset.dungeonAllocs.find((a) => a.dungeonId === d.dungeonId);
-      return { ...d, runs: saved ? Math.min(saved.runs, d.maxRuns) : 0 };
+      return { ...d, runs: saved ? Math.min(saved.runs, remainingFor(d)) : 0 };
     });
     setDungeonAllocs(newAllocs);
-    setFishingAlloc({
-      ...preset.fishingAlloc,
-      casts: Math.min(preset.fishingAlloc.casts, remainingCasts),
-    });
+    // Presets predating multi-pond hold a single alloc; migrate on read. Casts
+    // are then trimmed against the shared pool in order, since the preset may
+    // have been saved on a day with a fuller allowance.
+    let poolLeft = remainingCasts;
+    setFishingAllocs(
+      migrateFishingAllocs(preset.fishingAllocs ?? preset.fishingAlloc)
+        .map((a) => {
+          const casts = Math.min(a.casts, poolLeft);
+          poolLeft -= casts;
+          return { ...a, casts };
+        })
+        .filter((a) => a.casts > 0)
+    );
     setFreeActions(preset.freeActions);
   };
 
@@ -843,19 +1062,33 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     });
   }, []);
 
+  interface RunSummaryStats {
+    dungeonRuns: number;
+    dungeonWins: number;
+    fishCasts: number;
+    fishCaught: number;
+    /** Stall proceeds per pond. Separate currencies, so never one figure. */
+    currencyByPond: Map<number, number>;
+  }
+
   // The summary has to report what actually happened, including steps that
   // failed or never ran. Reading the live step list from a ref keeps that
   // honest without waiting for a state flush.
   const finishRun = useCallback(
     (
       outcome: "done" | "cancelled" | "error",
-      stats: { dungeonRuns: number; dungeonWins: number; fishCasts: number; fishCaught: number; seaweedEarned: number },
+      stats: RunSummaryStats,
       errorMessage?: string
     ) => {
       const parts: string[] = [];
       if (stats.dungeonRuns > 0) parts.push(`${stats.dungeonRuns} dungeon runs (${stats.dungeonWins}W)`);
       if (stats.fishCasts > 0) parts.push(`${stats.fishCasts} casts, ${stats.fishCaught} fish caught`);
-      if (stats.seaweedEarned > 0) parts.push(`${fmt(stats.seaweedEarned)} seaweed earned`);
+      // Named per pond, never totalled: Seaweed and Infused Sediment are
+      // different items feeding different skill trees, and one combined number
+      // is not a quantity of anything.
+      for (const [pondId, amount] of stats.currencyByPond) {
+        if (amount > 0) parts.push(`${fmt(amount)} ${pondCurrencyLabel(pondId)}`);
+      }
 
       const failed = stepsRef.current.filter((s) => s.status === "failed").length;
       const notRun = stepsRef.current.filter((s) => s.status === "not-run").length;
@@ -938,8 +1171,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         stepList.push({ id: `dungeon-${d.dungeonId}`, label: `${d.name} x${d.runs}`, status: "pending", detail: `${d.runs * d.energyCost}E` });
       }
     }
-    if (fishingAlloc.casts > 0) {
-      stepList.push({ id: "fishing", label: `Fishing ${fishingAlloc.castLabel} x${fishingAlloc.casts}`, status: "pending", detail: `${fishingAlloc.casts * fishingAlloc.castCost}E` });
+    // One step per node, so a plan that splits the pool between ponds shows
+    // both halves and the executor has something to attach status to for each.
+    for (const a of fishingAllocs) {
+      if (a.casts <= 0) continue;
+      stepList.push({
+        id: `fishing-${a.castNodeId}`,
+        label: `${pondById(a.pondId).name} ${a.castLabel} x${a.casts}`,
+        status: "pending",
+        detail: `${a.casts * a.castCost}E`,
+      });
     }
     if (freeActions.sellFish && fishStallInfo.totalCount > 0) {
       const byFish = fishStallInfo.fish
@@ -953,8 +1194,8 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         label: "Sell +50% fish",
         status: "pending",
         // Liquidating inventory — name every fish, not just the count.
-        detail: `${byFish}\n${fmt(fishStallInfo.totalCount)} fish → ~${fmt(fishStallInfo.totalSeaweed)} seaweed`,
-        brief: `${fmt(fishStallInfo.totalCount)} fish → ~${fmt(fishStallInfo.totalSeaweed)} seaweed`,
+        detail: `${byFish}\n${fmt(fishStallInfo.totalCount)} fish → ~${fishStallInfo.proceeds.map((p) => `${fmt(p.amount)} ${p.label}`).join(" + ")}`,
+        brief: `${fmt(fishStallInfo.totalCount)} fish → ~${fishStallInfo.proceeds.map((p) => `${fmt(p.amount)} ${p.label}`).join(" + ")}`,
       });
     }
     return stepList;
@@ -995,7 +1236,75 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
     setShowModal(true);
 
-    const summaryStats = { dungeonRuns: 0, dungeonWins: 0, fishCasts: 0, fishCaught: 0, seaweedEarned: 0 };
+    const summaryStats: RunSummaryStats = {
+      dungeonRuns: 0, dungeonWins: 0, fishCasts: 0, fishCaught: 0,
+      currencyByPond: new Map(),
+    };
+    const addCurrency = (pondId: number, amount: number) => {
+      if (amount <= 0) return;
+      summaryStats.currencyByPond.set(
+        pondId, (summaryStats.currencyByPond.get(pondId) ?? 0) + amount
+      );
+    };
+
+    // Cast bookkeeping lives out here, alongside summaryStats, so the `finally`
+    // can flush a finished cast even when the run dies partway through. A cast
+    // that completed still happened, and its yield is what the advisor ranks
+    // ponds by.
+    //
+    // Carried across allocations, because the server's fishing state is global
+    // rather than per-pond: a catch waiting to be looted was made in whichever
+    // pond was last cast in, and the loot call that collects it is also what
+    // starts the next cast — possibly in a different pond.
+    let pendingCardsToAdd: { id: number }[] | null = null;
+
+    /**
+     * A finished cast whose payout has not all arrived yet.
+     *
+     * The `loot` action both collects the previous catch and opens the next
+     * cast, so the Cores on that response belong to the cast that just ended,
+     * not the one just started. Holding the record open until loot lands is
+     * what keeps measured pond yield attributed to the right pond.
+     */
+    let pendingCastRecord:
+      | { pondId: number; nodeId: string; energyCost: number; multiplier: number; caught: boolean; gains: Map<number, number> }
+      | null = null;
+
+    const mergeGains = (into: Map<number, number>, changes?: { id: number; amount: number }[]) => {
+      for (const c of changes ?? []) into.set(c.id, (into.get(c.id) ?? 0) + c.amount);
+    };
+
+    /**
+     * Records the open cast, if any. Idempotent — clears before it writes.
+     *
+     * A cast whose catch is still waiting to be collected is DISCARDED rather
+     * than recorded. The `loot` call is what delivers the payout, so filing the
+     * cast before it lands writes a real cast down as a zero-yield one — and
+     * every run's final cast ends in exactly that state, which would bias every
+     * pond's measured rate downward by one cast per run, permanently. An
+     * unmeasured cast is honest; a falsely empty one corrupts the ordering the
+     * advisor spends real energy on.
+     */
+    const flushCastRecord = () => {
+      const rec = pendingCastRecord;
+      pendingCastRecord = null;
+      if (!rec) return;
+      if (pendingCardsToAdd && pendingCardsToAdd.length > 0) {
+        log(
+          `${pondCurrencyLabel(rec.pondId)} cast not recorded — its catch is still uncollected, so the payout hasn't arrived yet.`,
+          "info"
+        );
+        return;
+      }
+      const items = Array.from(rec.gains, ([id, amount]) => ({
+        id,
+        amount,
+        name: g().itemInfo[String(id)]?.name || g().itemNames[String(id)] || `#${id}`,
+      }));
+      recordCastAction(
+        rec.pondId, rec.nodeId, rec.energyCost, rec.multiplier, rec.caught, items, g().address
+      ).catch(() => {});
+    };
 
     try {
       // 0. Repair worn gear — before anything that needs hands/rods/equipped gear
@@ -1470,25 +1779,21 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         }
       }
 
-      // 7. Fishing casts
-      if (fishingAlloc.casts > 0 && stepList.find((s) => s.id === "fishing")) {
-        const stepId = "fishing";
-        if (cancelRef.current) { updateStep(stepId, { status: "skipped" }); }
-        else {
-          updateStep(stepId, { status: "running", detail: "starting..." });
-          let caught = 0;
-          let escaped = 0;
+      // 7. Fishing casts, one block per pond the plan spends casts in.
+      const plannedFishing = fishingAllocs.filter(
+        (a) => a.casts > 0 && stepList.find((s) => s.id === `fishing-${a.castNodeId}`)
+      );
 
-          // Check if there's a completed game needing loot (card pick + collect)
-          const preFish = await g().fetchFishingState();
-          // Track pending cardsToAdd from completed games
-          let pendingCardsToAdd: { id: number }[] | null = null;
-          if (preFish?.gameState?.COMPLETE_CID && preFish.gameState.SUCCESS_CID) {
-            pendingCardsToAdd = preFish.gameState.data?.cardsToAdd ?? null;
-            log(`Previous catch pending, cards to pick: ${pendingCardsToAdd?.map(c => c.id).join(", ") ?? "none"}`, "fishing");
-          } else if (preFish?.gameState?.data && !preFish.gameState.COMPLETE_CID) {
+      if (plannedFishing.length > 0) {
+        // Check if there's a completed game needing loot (card pick + collect)
+        const preFish = await g().fetchFishingState();
+        if (preFish?.gameState?.COMPLETE_CID && preFish.gameState.SUCCESS_CID) {
+          pendingCardsToAdd = preFish.gameState.data?.cardsToAdd ?? null;
+          log(`Previous catch pending, cards to pick: ${pendingCardsToAdd?.map(c => c.id).join(", ") ?? "none"}`, "fishing");
+        } else if (preFish?.gameState?.data && !preFish.gameState.COMPLETE_CID) {
             // Active in-progress game — play through it first
             log(`Active fishing game found, finishing it...`, "fishing");
+            let redrawsThisCast = 0;
             for (let i = 0; i < 50; i++) {
               if (cancelRef.current) break;
               const fs = await g().fetchFishingState();
@@ -1504,6 +1809,17 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               // board-cell path.
               const grove = gd.focusMechanicEnabled ? pickGroveMove(gd) : null;
               if (gd.focusMechanicEnabled && !grove) break;
+              // Redraw is play_cards with an empty hand: discards and refills
+              // for one mana per card held.
+              if (grove?.redraw && redrawsThisCast < MAX_REDRAWS_PER_CAST) {
+                redrawsThisCast++;
+                log(grove.reason, "info");
+                await g().fishingAction("play_cards", {
+                  cards: [], nodeId: "", focusPoint: gd.focusPoint ?? [],
+                });
+                await delay(300);
+                continue;
+              }
               const best = grove
                 ? { handIndex: grove.handIndex }
                 : pickBestCard(
@@ -1526,8 +1842,43 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             }
           }
 
+      }
+
+      for (const alloc of plannedFishing) {
+        const stepId = `fishing-${alloc.castNodeId}`;
+        if (cancelRef.current) { updateStep(stepId, { status: "skipped" }); continue; }
+
+        const pond = pondById(alloc.pondId);
+        updateStep(stepId, { status: "running", detail: "starting..." });
+        let caught = 0;
+        let escaped = 0;
+
+        // Entry offering for this pond. Tier 1 is free; anything above it costs
+        // a faction ring, so it is only reached when the plan explicitly opted
+        // in. A pond with no offering system resolves to tier 0.
+        const entry = pondEntryOptions(
+          g().fishingState?.pondEntryTiers, pond.pondId, g().itemBalances, g().currentDay
+        );
+        const offering =
+          freeActions.spendEntryOfferings && entry.payable ? entry.payable : entry.free;
+        if (!offering) {
+          // Every tier on this pond costs an item and the plan did not opt in
+          // to paying. Skipping is the only honest option: casting anyway would
+          // spend a faction ring per cast on a decision nobody made.
+          const why = `${pond.name} has no free entry offering and "Pay pond entry offerings" is off — skipped ${alloc.casts} cast${alloc.casts === 1 ? "" : "s"}.`;
+          log(why, "error");
+          updateStep(stepId, { status: "skipped", detail: why });
+          continue;
+        }
+        if (offering.dropMultiplier > 1) {
+          log(
+            `${pond.name}: paying the tier ${offering.tier} offering for ${offering.dropMultiplier}x Cores — this spends a faction ring per cast`,
+            "fishing"
+          );
+        }
+
           let stoppedShort = "";
-          for (let cast = 0; cast < fishingAlloc.casts; cast++) {
+          for (let cast = 0; cast < alloc.casts; cast++) {
             if (cancelRef.current) break;
 
             // The plan's energy budget was computed before the run started;
@@ -1537,14 +1888,18 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             const liveEnergy = Math.floor(
               g().energy?.entities?.[0]?.parsedData?.energyValue ?? 0
             );
-            if (liveEnergy < fishingAlloc.castCost) {
-              stoppedShort = `out of energy after ${cast} of ${fishingAlloc.casts} casts (${liveEnergy}E left, need ${fishingAlloc.castCost}E)`;
+            if (liveEnergy < alloc.castCost) {
+              stoppedShort = `out of energy after ${cast} of ${alloc.casts} casts (${liveEnergy}E left, need ${alloc.castCost}E)`;
               log(`Fishing stopped: ${stoppedShort}`, "fishing");
               break;
             }
 
-            updateStep(stepId, { detail: `cast ${cast + 1}/${fishingAlloc.casts}...` });
-            log(`Fishing cast ${cast + 1}/${fishingAlloc.casts} (${fishingAlloc.castLabel})`, "fishing");
+            updateStep(stepId, { detail: `cast ${cast + 1}/${alloc.casts}...` });
+            log(`${pond.name} cast ${cast + 1}/${alloc.casts} (${alloc.castLabel})`, "fishing");
+
+            // Everything this cast pays out, so the pond's measured yield comes
+            // from what actually arrived rather than from an assumed rate.
+            const gains = new Map<number, number>();
 
             try {
               let startResult;
@@ -1554,16 +1909,37 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 // Pick the first earnable card (simple heuristic)
                 const chosenCard = pendingCardsToAdd[0].id;
                 log(`Collecting fish, picking card ${chosenCard}`, "fishing");
-                startResult = await g().fishingAction("loot", { cards: [chosenCard], nodeId: fishingAlloc.castNodeId });
-                pendingCardsToAdd = null; // consumed
+                startResult = await g().fishingAction("loot", { cards: [chosenCard], nodeId: alloc.castNodeId, tierId: offering.tier });
+                // Only close the previous cast's books if the loot actually
+                // landed. Clearing `pendingCardsToAdd` on a failed loot left the
+                // catch uncollected on the server, and the next cast's
+                // start_run recovery would loot it internally — so the previous
+                // pond's Cores arrived in this pond's `gains` and were filed
+                // against the wrong pond's measured yield. Leaving both open
+                // means the next iteration retries the loot and the record is
+                // still the one that earned it.
+                if (startResult) {
+                  // This response pays out the catch that just ended, so it is
+                  // credited to that cast's pond — which may not be this one.
+                  if (pendingCastRecord) mergeGains(pendingCastRecord.gains, startResult.gameItemBalanceChanges);
+                  // Cleared BEFORE the flush: the catch has now been collected,
+                  // and flushCastRecord discards any record still showing one
+                  // outstanding. Flushing first would throw away the very cast
+                  // whose payout just arrived.
+                  pendingCardsToAdd = null;
+                  flushCastRecord();
+                }
               } else {
+                // Nothing further will arrive for the previous cast.
+                flushCastRecord();
                 // No pending card pick — normal start_run
-                startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId, tierId: castTierForNode(fishingAlloc.castNodeId) });
+                startResult = await g().fishingAction("start_run", { cards: [], nodeId: alloc.castNodeId, tierId: offering.tier });
                 // If start fails, retry with recovered token
                 if (!startResult) {
                   await delay(300);
-                  startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId, tierId: castTierForNode(fishingAlloc.castNodeId) });
+                  startResult = await g().fishingAction("start_run", { cards: [], nodeId: alloc.castNodeId, tierId: offering.tier });
                 }
+                mergeGains(gains, startResult?.gameItemBalanceChanges);
               }
 
               if (!startResult) {
@@ -1576,6 +1952,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
               // Play cards loop
               let fishComplete = false;
+              let redrawsThisCast = 0;
               let iterations = 0;
               const MAX_FISH_ITERATIONS = 50;
 
@@ -1590,19 +1967,27 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
                 if (isComplete || !gameData) {
                   fishComplete = true;
-                  const success = stateResult?.gameState?.SUCCESS_CID;
+                  const success = !!stateResult?.gameState?.SUCCESS_CID;
                   if (success) {
                     caught++;
                     const fish = gameData?.caughtFish;
-                    const seaweed = fish?.seaweedEarned ?? 0;
-                    summaryStats.seaweedEarned += seaweed;
+                    const earned = fish?.currencyEarned ?? 0;
+                    addCurrency(alloc.pondId, earned);
                     pendingCardsToAdd = gameData?.cardsToAdd ?? null;
-                    log(`Caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`, "fishing");
+                    log(`Caught ${fish?.name ?? "fish"} (+${earned} ${pondCurrencyLabel(alloc.pondId)})`, "fishing");
                   } else {
                     escaped++;
                     pendingCardsToAdd = null;
                     log(`Fish escaped`, "fishing");
                   }
+                  pendingCastRecord = {
+                    pondId: alloc.pondId,
+                    nodeId: alloc.castNodeId,
+                    energyCost: alloc.castCost,
+                    multiplier: stateResult?.gameState?.MULTIPLIER_CID ?? offering.dropMultiplier,
+                    caught: success,
+                    gains,
+                  };
                   break;
                 }
 
@@ -1615,6 +2000,15 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 if (gameData.focusMechanicEnabled && !grove) {
                   log("No playable card in the Grove", "error");
                   break;
+                }
+                if (grove?.redraw && redrawsThisCast < MAX_REDRAWS_PER_CAST) {
+                  redrawsThisCast++;
+                  log(grove.reason, "info");
+                  await g().fishingAction("play_cards", {
+                    cards: [], nodeId: "", focusPoint: gameData.focusPoint ?? [],
+                  });
+                  await delay(300);
+                  continue;
                 }
                 const best = grove
                   ? { handIndex: grove.handIndex }
@@ -1636,6 +2030,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   log(`Card play failed`, "error");
                   break;
                 }
+                mergeGains(gains, cardResult.gameItemBalanceChanges);
 
                 // Check if complete from card result
                 const doc = cardResult.data.doc;
@@ -1644,15 +2039,23 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   if (doc.SUCCESS_CID) {
                     caught++;
                     const fish = doc.data?.caughtFish;
-                    const seaweed = fish?.seaweedEarned ?? 0;
-                    summaryStats.seaweedEarned += seaweed;
+                    const earned = fish?.currencyEarned ?? 0;
+                    addCurrency(alloc.pondId, earned);
                     pendingCardsToAdd = doc.data?.cardsToAdd ?? null;
-                    log(`Caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`, "fishing");
+                    log(`Caught ${fish?.name ?? "fish"} (+${earned} ${pondCurrencyLabel(alloc.pondId)})`, "fishing");
                   } else {
                     escaped++;
                     pendingCardsToAdd = null;
                     log(`Fish escaped`, "fishing");
                   }
+                  pendingCastRecord = {
+                    pondId: alloc.pondId,
+                    nodeId: alloc.castNodeId,
+                    energyCost: alloc.castCost,
+                    multiplier: doc.MULTIPLIER_CID ?? offering.dropMultiplier,
+                    caught: !!doc.SUCCESS_CID,
+                    gains,
+                  };
                 }
 
                 await delay(300);
@@ -1662,14 +2065,15 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               escaped++;
             }
 
-            summaryStats.fishCaught += caught;
-
-            if (cast < fishingAlloc.casts - 1) {
+            if (cast < alloc.casts - 1) {
               await g().refreshAll();
               await delay(300);
             }
           }
 
+          // Outside the cast loop: this used to run per cast against a running
+          // total, so three catches reported as six.
+          summaryStats.fishCaught += caught;
           updateStep(stepId, {
             status: cancelRef.current ? "skipped" : "done",
             detail: stoppedShort
@@ -1677,8 +2081,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               : `${caught} caught / ${escaped} escaped`,
           });
           await g().refreshAll();
-        }
       }
+      // Nothing left to loot, so any still-open record is as complete as it gets.
+      flushCastRecord();
 
       // 8. Sell fish
       if (stepList.find((s) => s.id === "sell-fish")) {
@@ -1694,21 +2099,23 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               const qty = balMap[String(r.id)] ?? 0;
               if (qty <= 0) return null;
               const pct = Math.round(((r.value - r.baseVal) / r.baseVal) * 100);
-              return { id: r.id, qty, value: r.value, pct };
+              return { id: r.id, qty, value: r.value, pct, pondId: r.pondId };
             })
             .filter((f): f is NonNullable<typeof f> => f !== null && f.pct >= 50);
 
           let totalSold = 0;
-          let totalEarned = 0;
+          const earnedByPond = new Map<number, number>();
           for (const f of fishToSell) {
             if (cancelRef.current) break;
             for (let i = 0; i < f.qty; i++) {
               if (cancelRef.current) break;
               try {
-                const r = await g().sellFish(f.id, 1, f.value);
+                const r = await g().sellFish(f.id, 1, f.value, f.pondId);
                 if (r?.success) {
                   totalSold++;
-                  totalEarned += r.data?.value ?? f.value;
+                  const got = r.data?.value ?? f.value;
+                  earnedByPond.set(f.pondId, (earnedByPond.get(f.pondId) ?? 0) + got);
+                  addCurrency(f.pondId, got);
                 } else {
                   log(`Sell failed: ${r?.message || "error"}`, "error");
                   break;
@@ -1717,9 +2124,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               await delay(150);
             }
           }
-          summaryStats.seaweedEarned += totalEarned;
-          updateStep("sell-fish", { status: "done", detail: `${totalSold} sold, ${totalEarned} seaweed` });
-          log(`Sold ${totalSold} fish for ${totalEarned} seaweed`, "fishing");
+          const earnedText = Array.from(earnedByPond, ([pondId, amount]) => `${amount} ${pondCurrencyLabel(pondId)}`).join(" + ") || "nothing";
+          updateStep("sell-fish", { status: "done", detail: `${totalSold} sold, ${earnedText}` });
+          log(`Sold ${totalSold} fish for ${earnedText}`, "fishing");
         }
       }
 
@@ -1742,6 +2149,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         e instanceof Error ? e.message : "unknown error"
       );
     } finally {
+      // A cast that finished before the run blew up still happened, and its
+      // yield is what the advisor ranks ponds by. flushCastRecord clears the
+      // record first, so reaching here after a normal flush is a no-op.
+      flushCastRecord();
       gigaRef.current.autoBattleRef.current = false;
       setExecuting(false);
       setStopping(false);
@@ -2328,7 +2739,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         <div className="space-y-2 mb-4">
           {dungeonAllocs.map((d, idx) => {
             const totalCost = d.runs * d.energyCost;
-            const canIncrease = d.runs < d.maxRuns && allocatedEnergy + d.energyCost <= effectiveEnergy;
+            const canIncrease = d.runs < remainingFor(d) && allocatedEnergy + d.energyCost <= effectiveEnergy;
             const info = findDungeonInfo(d.name);
             return (
               <div
@@ -2349,7 +2760,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                     )}
                   </div>
                   <div className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
-                    {d.energyCost}E per run &middot; {d.maxRuns} remaining
+                    {d.energyCost}E per run &middot; {remainingFor(d)} remaining
                     {info && <> &middot; {info.currency}</>}
                   </div>
                 </div>
@@ -2411,69 +2822,85 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           ))}
         </div>
 
-        {/* Fishing stepper */}
-        <div
-          className="flex items-center gap-3 px-3 py-2.5 rounded-lg mb-4"
-          style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
-        >
-          <div className="flex-1 min-w-0">
-            <div className="text-[13px] font-semibold">Fishing</div>
-            <div className="flex items-center gap-2 mt-1">
-              {CAST_NODES.map((node) => (
-                <button
-                  key={node.nodeId}
-                  disabled={executing}
-                  onClick={() => changeCastNode(node.nodeId)}
-                  className="btn-press touch-target text-[11px] font-bold px-2.5 py-1 rounded cursor-pointer disabled:cursor-not-allowed"
-                  style={{
-                    background: fishingAlloc.castNodeId === node.nodeId ? "var(--orange-glow)" : "var(--bg-inset)",
-                    border: fishingAlloc.castNodeId === node.nodeId ? "1px solid var(--border-accent)" : "1px solid var(--border)",
-                    color: fishingAlloc.castNodeId === node.nodeId ? "var(--orange)" : "var(--text-faint)",
-                  }}
-                >
-                  {node.label} ({node.cost}E)
-                </button>
-              ))}
-            </div>
-            <div className="text-[11px] tabular-nums mt-1" style={{ color: "var(--text-faint)" }}>
-              {remainingCasts} casts remaining today
-            </div>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              disabled={fishingAlloc.casts <= 0 || executing}
-              onClick={() => adjustFishing(-1)}
-              aria-label="One fewer fishing cast"
-              className="btn-press touch-target w-8 h-8 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[15px] font-bold"
-              style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
-            >
-              -
-            </button>
-            <span className="text-[14px] font-bold tabular-nums w-6 text-center" aria-label={`${fishingAlloc.casts} fishing casts planned`}>{fishingAlloc.casts}</span>
-            <button
-              disabled={fishingAlloc.casts >= remainingCasts || allocatedEnergy + fishingAlloc.castCost > effectiveEnergy || executing}
-              onClick={() => adjustFishing(1)}
-              aria-label="One more fishing cast"
-              className="btn-press touch-target w-8 h-8 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[15px] font-bold"
-              style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
-            >
-              +
-            </button>
-            <button
-              disabled={fishingAlloc.casts >= remainingCasts || allocatedEnergy + fishingAlloc.castCost > effectiveEnergy || executing}
-              onClick={maxFishing}
-              aria-label="Fill remaining energy with fishing casts"
-              className="btn-press touch-target h-8 px-2.5 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[11px] font-bold uppercase tracking-wider"
-              style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text-dim)" }}
-            >
-              Max
-            </button>
-          </div>
-          {fishingAlloc.casts > 0 && (
-            <span className="text-[11px] tabular-nums font-medium shrink-0" style={{ color: "var(--orange)", minWidth: 56, textAlign: "right" }}>
-              {fishingAlloc.casts} = {fishingAlloc.casts * fishingAlloc.castCost}E
+        {/* Fishing steppers — one per node, all drawing on one cast pool */}
+        <div className="mb-4">
+          <div
+            className="flex items-baseline justify-between px-3 py-2 rounded-t-lg"
+            style={{ background: "var(--bg-raised)", borderTop: "1px solid var(--border)", borderLeft: "1px solid var(--border)", borderRight: "1px solid var(--border)" }}
+          >
+            <span className="text-[13px] font-semibold">Fishing</span>
+            <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+              {plannedCasts} of {remainingCasts} casts planned
+              {unplannedCasts > 0 && ` · ${unplannedCasts} unspent`}
             </span>
-          )}
+          </div>
+          {CAST_NODES.map((node, i) => {
+            const casts = castsForNode(node.nodeId);
+            const canAdd =
+              unplannedCasts > 0 && allocatedEnergy + node.cost <= effectiveEnergy && !executing;
+            return (
+              <div
+                key={`${node.pondId}-${node.nodeId}`}
+                className="flex items-center gap-3 px-3 py-2"
+                style={{
+                  background: "var(--bg-raised)",
+                  border: "1px solid var(--border)",
+                  borderTop: "none",
+                  borderRadius: i === CAST_NODES.length - 1 ? "0 0 0.5rem 0.5rem" : undefined,
+                }}
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] font-medium truncate">
+                    {node.pondName} &middot; {node.label}
+                  </div>
+                  <div className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+                    {node.cost}E per cast &middot; pays {pondCurrencyLabel(node.pondId)}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    disabled={casts <= 0 || executing}
+                    onClick={() => adjustFishingNode(node.nodeId, -1)}
+                    aria-label={`One fewer ${node.pondName} ${node.label} cast`}
+                    className="btn-press touch-target w-8 h-8 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[15px] font-bold"
+                    style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
+                  >
+                    -
+                  </button>
+                  <span
+                    className="text-[14px] font-bold tabular-nums w-6 text-center"
+                    aria-label={`${casts} ${node.pondName} ${node.label} casts planned`}
+                  >
+                    {casts}
+                  </span>
+                  <button
+                    disabled={!canAdd}
+                    onClick={() => adjustFishingNode(node.nodeId, 1)}
+                    aria-label={`One more ${node.pondName} ${node.label} cast`}
+                    className="btn-press touch-target w-8 h-8 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[15px] font-bold"
+                    style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
+                  >
+                    +
+                  </button>
+                  <button
+                    disabled={!canAdd}
+                    onClick={() => maxFishingNode(node.nodeId)}
+                    aria-label={`Fill remaining energy with ${node.pondName} ${node.label} casts`}
+                    className="btn-press touch-target h-8 px-2.5 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[11px] font-bold uppercase tracking-wider"
+                    style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text-dim)" }}
+                  >
+                    Max
+                  </button>
+                </div>
+                <span
+                  className="text-[11px] tabular-nums font-medium shrink-0"
+                  style={{ color: casts > 0 ? "var(--orange)" : "transparent", minWidth: 44, textAlign: "right" }}
+                >
+                  {casts * node.cost}E
+                </span>
+              </div>
+            );
+          })}
         </div>
 
         {/* Allocation bar */}
@@ -2557,8 +2984,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               disabled: !chestsReady,
             },
             { key: "breakPots" as const, label: "Break pots", info: (() => { const p: string[] = []; if (!bluePotCd.onCooldown && paperHandsId) p.push("Blue ready"); else if (!bluePotCd.onCooldown) p.push("Blue: no Paper Hands"); else p.push(`Blue: ${bluePotCd.text}`); if (!tanPotCd.onCooldown && rockHandsId) p.push("Tan ready"); else if (!tanPotCd.onCooldown) p.push("Tan: no Rock Hands"); else p.push(`Tan: ${tanPotCd.text}`); return p.join(", "); })(), disabled: !potsActuallyReady },
-            { key: "sellFish" as const, label: "Sell +50% fish", info: fishStallInfo.totalCount > 0 ? `${fmt(fishStallInfo.totalCount)} fish (~${fmt(fishStallInfo.totalSeaweed)} seaweed)` : "None available", disabled: fishStallInfo.totalCount === 0 },
+            { key: "sellFish" as const, label: "Sell +50% fish", info: fishStallInfo.totalCount > 0 ? `${fmt(fishStallInfo.totalCount)} fish (~${fishStallInfo.proceeds.map((p) => `${fmt(p.amount)} ${p.label}`).join(" + ")})` : "None available", disabled: fishStallInfo.totalCount === 0 },
             { key: "repairGear" as const, label: "Repair worn gear", info: wornGear.length > 0 ? `${wornGear.length} item${wornGear.length === 1 ? "" : "s"} worn` : "All gear healthy", disabled: wornGear.length === 0 },
+            {
+              key: "spendEntryOfferings" as const,
+              label: "Pay pond entry offerings",
+              info: entryOfferings.length > 0
+                ? `${entryOfferings.map((o) => `${o.pond.name} ${o.payable!.dropMultiplier}x`).join(", ")} — costs a faction ring per cast`
+                : "No offering ring affordable",
+              disabled: entryOfferings.length === 0,
+            },
             { key: "vote" as const, label: "Vote on Abstract Portal", info: hasVoted ? "Voted" : "Not voted", disabled: hasVoted },
           ]).map((item) => (
             <label key={item.key} className="flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", opacity: item.disabled ? 0.5 : 1 }}>

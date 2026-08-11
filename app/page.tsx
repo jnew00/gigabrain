@@ -11,10 +11,14 @@ import { Sword, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote,
 import { MissionControlPage } from "./mission-control";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import type { Player, DungeonAction, DungeonActionResponse, RomEntity, FishingCard, FishingGameData } from "@/lib/types";
-import { pickBestCard, pickGroveMove, shouldRedraw, predictNextPositionsWeighted, scoreHand, coordToCell, inferGrid, resolveGrid, DEFAULT_GRID } from "@/lib/fishing-ai";
+import { pickBestCard, pickGroveMove, shouldRedraw, predictNextPositionsWeighted, predictGroveCoords, focusZone, scoreHand, scoreGroveHand, coordToCell, cellToCoord, inferGrid, resolveGrid, DEFAULT_GRID } from "@/lib/fishing-ai";
 import { probeFishMove } from "@/lib/fishing-probe";
 import type { GridDims } from "@/lib/fishing-ai";
-import { FISHING, CLAIM_RECIPES, getMaxRunsPerDay, castTierForNode, castsUsedToday, isAwakeningActive, AWAKENING } from "@/lib/game-data";
+import { FISHING, CLAIM_RECIPES, getMaxRunsPerDay } from "@/lib/game-data";
+import {
+  openCastNodes, castsUsedToday, pondCurrencyLabel, findPondForNode, pondEntryOptions,
+} from "@/lib/ponds";
+import { nodeIdForGame } from "@/lib/fishing-state";
 import { buildSkillAdvice } from "@/lib/skill-advisor";
 
 // Donations — GigaBrain is free; these fund the coffee
@@ -2634,17 +2638,16 @@ export default function Home() {
 
 /* ─── Fishing Page ──────────────────────────────────────── */
 
-const CLASSIC_CAST_NODES = [
-  { nodeId: "0", label: "Small", energyKey: "node0Energy" as const, cost: 12 },
-  { nodeId: "1", label: "Normal", energyKey: "node1Energy" as const, cost: 16 },
-  { nodeId: "2", label: "Big", energyKey: "node2Energy" as const, cost: 20 },
-] as const;
+// Every castable node across every open pond, all drawing on one daily pool.
+// Only the classic pond's nodes have a live `nodeNEnergy` field in the state
+// response; the rest price from the pond table.
+const NODE_ENERGY_FIELD: Record<string, "node0Energy" | "node1Energy" | "node2Energy"> = {
+  "0": "node0Energy",
+  "1": "node1Energy",
+  "2": "node2Energy",
+};
 
-// The Dendren Grove is a fourth node drawing on the same daily cast pool. It
-// has no nodeNEnergy field of its own, so its cost comes from the constant.
-const CAST_NODES = isAwakeningActive()
-  ? [...CLASSIC_CAST_NODES, { ...AWAKENING.pond, energyKey: "node0Energy" as const }]
-  : [...CLASSIC_CAST_NODES];
+const CAST_NODES = openCastNodes();
 
 const RARITY_FISH_COLORS = [
   "var(--text-faint)",   // 0 - common
@@ -2664,9 +2667,11 @@ function FishingPage({ giga, addLog }: {
   // `catches` keeps the actual fish, not just a tally — an auto-fish run that
   // reports "7 caught" says nothing about whether they were worth the energy.
   const [sessionStats, setSessionStats] = useState<{
-    casts: number; caught: number; escaped: number; seaweed: number;
-    catches: { name: string; rarity: number; quality: number; size: string; seaweed: number }[];
-  }>({ casts: 0, caught: 0, escaped: 0, seaweed: 0, catches: [] });
+    casts: number; caught: number; escaped: number;
+    /** Proceeds keyed by pond. Two ponds, two currencies, never one total. */
+    earnedByPond: Record<number, number>;
+    catches: { name: string; rarity: number; quality: number; size: string; earned: number; currency: string }[];
+  }>({ casts: 0, caught: 0, escaped: 0, earnedByPond: {}, catches: [] });
   const [fishingLog, setFishingLog] = useState<string[]>([]);
   const [confirmSellAll, setConfirmSellAll] = useState(false);
   const autoFishRef = useRef(false);
@@ -2695,12 +2700,11 @@ function FishingPage({ giga, addLog }: {
   }, [addLog]);
 
   const getNodeEnergy = useCallback((nodeId: string): number => {
-    if (!fs) return 0;
-    if (nodeId === "0") return fs.node0Energy;
-    if (nodeId === "1") return fs.node1Energy;
-    if (nodeId === "2") return fs.node2Energy;
-    // The Grove has no nodeNEnergy field of its own, so its cost comes from the
-    // node table. Returning 0 here showed it as a free cast.
+    const live = NODE_ENERGY_FIELD[nodeId];
+    if (live && fs) return fs[live];
+    // Nodes outside the classic three have no nodeNEnergy field of their own,
+    // so their cost comes from the pond table. Returning 0 here showed the
+    // Grove as a free cast.
     return CAST_NODES.find((n) => n.nodeId === nodeId)?.cost ?? 0;
   }, [fs]);
 
@@ -2708,14 +2712,34 @@ function FishingPage({ giga, addLog }: {
   const energyAvailable = giga.energy?.entities?.[0]?.parsedData?.energyValue ?? 0;
 
   const startCast = useCallback(async (nodeId: string) => {
-    addFishLog(`Starting cast (node ${nodeId})...`);
-    const result = await giga.fishingAction("start_run", { cards: [], nodeId, tierId: castTierForNode(nodeId) });
+    const pond = findPondForNode(nodeId);
+    if (!pond) {
+      addFishLog(`Cast node ${nodeId} belongs to no known pond — refusing to cast`);
+      return null;
+    }
+    // Manual casting always takes the free offering. Spending a faction ring
+    // for 2x/4x Cores is a deliberate act and lives in the Run Plan, behind its
+    // own toggle, rather than happening on a button press here.
+    // currentDay matters: a tier's startDay/endDay bound it, and sending an
+    // out-of-window tier is a rejected cast.
+    const { free } = pondEntryOptions(
+      fs?.pondEntryTiers, pond.pondId, giga.itemBalances, giga.currentDay
+    );
+    if (!free) {
+      addFishLog(
+        `${pond.name} has no free entry offering — every tier costs a faction ring. ` +
+          `Cast it from the Run Plan with "Pay pond entry offerings" on.`
+      );
+      return null;
+    }
+    addFishLog(`Starting ${pond.name} cast (node ${nodeId})...`);
+    const result = await giga.fishingAction("start_run", { cards: [], nodeId, tierId: free.tier });
     if (result) {
       setSessionStats((s) => ({ ...s, casts: s.casts + 1 }));
       addFishLog(`Cast started! Fish HP: ${result.data.doc.data.fishHp}/${result.data.doc.data.fishMaxHp}`);
     }
     return result;
-  }, [giga, addFishLog]);
+  }, [giga, addFishLog, fs?.pondEntryTiers]);
 
   // `snapshot` is the state the decision was made from. The auto-fish loop
   // holds a fresher copy than this closure does, and the probe has to score the
@@ -2740,13 +2764,21 @@ function FishingPage({ giga, addLog }: {
       if (isComplete) {
         if (result.data.doc.SUCCESS_CID && d.caughtFish) {
           const fish = d.caughtFish;
-          addFishLog(`Caught ${fish.name} (${fish.size}, Q${fish.quality})! +${fish.seaweedEarned} seaweed`);
+          // The pond comes off the game document itself — `ID_CID` is the node
+          // this cast was started on. Reading it from the closure gave whatever
+          // the component last rendered, and reading `focusMechanicEnabled`
+          // asks about a mechanic when the question is which stall pays.
+          const pondId = findPondForNode(nodeIdForGame(result.data.doc))?.pondId;
+          const currency = pondCurrencyLabel(pondId);
+          addFishLog(`Caught ${fish.name} (${fish.size}, Q${fish.quality})! +${fish.currencyEarned} ${currency}`);
           setSessionStats((s) => ({
             ...s,
             caught: s.caught + 1,
-            seaweed: s.seaweed + (fish.seaweedEarned ?? 0),
+            earnedByPond: pondId === undefined
+              ? s.earnedByPond
+              : { ...s.earnedByPond, [pondId]: (s.earnedByPond[pondId] ?? 0) + (fish.currencyEarned ?? 0) },
             catches: [
-              { name: fish.name, rarity: fish.rarity, quality: fish.quality, size: fish.size, seaweed: fish.seaweedEarned },
+              { name: fish.name, rarity: fish.rarity, quality: fish.quality, size: fish.size, earned: fish.currencyEarned, currency },
               ...s.catches,
             ].slice(0, 40),
           }));
@@ -2769,10 +2801,22 @@ function FishingPage({ giga, addLog }: {
 
     const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+    // Mana falls by one per card on every redraw, so the loop terminates on its
+    // own; the cap stops a stubborn hand from spending a whole cast reshuffling
+    // rather than swinging.
+    const MAX_REDRAWS_PER_CAST = 3;
+
     const runOneCast = async (): Promise<"caught" | "escaped" | "error" | "cancelled"> => {
+      let redraws = 0;
       // Start a new cast
       const resolvedNode = autoCastNode === "auto" ? recommendedCast : autoCastNode;
-      const nodeCost = CAST_NODES.find((n) => n.nodeId === resolvedNode)?.cost ?? 12;
+      // Priced from the pond table via the live node energies, not from a
+      // guessed 12 — a wrong cost here waves through a cast the server refuses.
+      const nodeCost = getNodeEnergy(resolvedNode);
+      if (nodeCost <= 0) {
+        addFishLog(`Don't know what node ${resolvedNode} costs — stopping rather than casting blind`);
+        return "error";
+      }
 
       // Check energy
       await giga.refreshAll();
@@ -2821,13 +2865,18 @@ function FishingPage({ giga, addLog }: {
             await delay(300);
             continue;
           }
-          if (move.redraw) {
-            // Recommendation only — the redraw action name is still unknown, so
-            // the best reachable card is played rather than stalling the cast.
-            addFishLog(`AI: ${move.reason} (redraw not automated yet)`);
-          } else {
+          if (move.redraw && redraws < MAX_REDRAWS_PER_CAST) {
+            // Redraw is play_cards with no cards: the hand is discarded and
+            // refilled for one mana per card held.
+            redraws++;
             addFishLog(`AI: ${move.reason}`);
+            await giga.fishingAction("play_cards", {
+              cards: [], nodeId: "", focusPoint: data.focusPoint ?? [],
+            });
+            await delay(300);
+            continue;
           }
+          addFishLog(`AI: ${move.reason}`);
           await playCard(move.handIndex, move.focusPoint, data);
           await delay(300);
           continue;
@@ -2874,11 +2923,14 @@ function FishingPage({ giga, addLog }: {
           break;
         }
 
-        // Show result
+        // Show result. The pond comes from the finished game, not from the cast
+        // type the dropdown happens to be on — with "auto" selected those are
+        // routinely different ponds.
         const freshState = giga.fishingState;
         const fish = freshState?.gameState?.data?.caughtFish;
         if (result === "caught" && fish) {
-          addFishLog(`*** CAUGHT: ${fish.name} (Q${fish.quality}) +${fish.seaweedEarned} seaweed ***`);
+          const pondId = findPondForNode(nodeIdForGame(freshState?.gameState))?.pondId;
+          addFishLog(`*** CAUGHT: ${fish.name} (Q${fish.quality}) +${fish.currencyEarned} ${pondCurrencyLabel(pondId)} ***`);
         } else if (result === "escaped") {
           addFishLog(`--- Fish escaped ---`);
         }
@@ -2933,31 +2985,98 @@ function FishingPage({ giga, addLog }: {
     return inferred;
   }, [gameData, fs?.gameState?.docId]);
 
-  const noHit = gameData ? shouldRedraw(
-    gameData.hand, gameData.deckCardData, gameData.fishPosition,
-    gameData.previousFishPosition, gameData.nextPosition, fishGrid
-  ) : false;
+  /**
+   * Fish in inventory the stalls will buy, each tagged with the pond that buys
+   * it. Built once and shared by the Fish Stall header and the list under it,
+   * which had drifted into two copies of the same mapping — so a fix to one
+   * (like carrying pondId through to the sell call) could miss the other.
+   */
+  const sellableFish = useMemo(
+    () =>
+      (fs?.exchangeRates ?? [])
+        .map((r) => {
+          const qty = giga.itemBalances[String(r.id)] ?? 0;
+          if (qty <= 0) return null;
+          return {
+            id: r.id,
+            name: giga.itemInfo[String(r.id)]?.name || `Fish#${r.id}`,
+            qty,
+            baseVal: r.baseVal,
+            value: r.value,
+            pct: Math.round(((r.value - r.baseVal) / r.baseVal) * 100),
+            // Required, not defaulted: the sell call is rejected without it,
+            // and guessing sends the fish to the wrong stall.
+            pondId: r.pondId,
+          };
+        })
+        .filter((f): f is NonNullable<typeof f> => f !== null)
+        .sort((a, b) => b.pct - a.pct),
+    [fs?.exchangeRates, giga.itemBalances, giga.itemInfo]
+  );
 
-  // Recommend best cast type based on energy budget and remaining casts
+  /**
+   * Per-card scores for the hand panel, in whichever model this pond uses.
+   *
+   * Null on the classic ponds, where the board-address scorer applies. In the
+   * Grove a card's hitZones are offsets from the lure, so scoring them as board
+   * cells made the "BEST" badge disagree with the card auto-fish actually
+   * played — the two now run the same function.
+   */
+  const groveScores = useMemo(
+    () => (gameData?.focusMechanicEnabled ? scoreGroveHand(gameData) : null),
+    [gameData]
+  );
+
+  const noHit = !gameData
+    ? false
+    : groveScores
+    ? groveScores.length > 0 && groveScores.every((s) => s.pHit < 0.2)
+    : shouldRedraw(
+        gameData.hand, gameData.deckCardData, gameData.fishPosition,
+        gameData.previousFishPosition, gameData.nextPosition, fishGrid
+      );
+
+  /**
+   * Biggest cast the energy supports, within one pond.
+   *
+   * Explicitly scoped to a pond, because "which cast size" and "which pond" are
+   * different questions and only the first one has an answer here. Cast size
+   * trades energy for fish quality inside a pond; choosing between ponds trades
+   * one currency for another, which needs the yield history the Run Plan's
+   * advisor has and this button does not. So Auto picks a size and never
+   * switches pond behind your back — the Grove is chosen by clicking it.
+   */
+  // "auto" is the one value that legitimately names no node — it means "size
+  // the cast for me", and it sizes within the first declared pond. Any OTHER
+  // unrecognised value is a node from a pond this build does not know about,
+  // and quietly sizing that as a classic cast is the single-pond assumption
+  // coming back in through the UI, so it resolves to nothing instead.
+  const autoPondId =
+    autoCastNode === "auto"
+      ? CAST_NODES[0]?.pondId
+      : findPondForNode(autoCastNode)?.pondId;
   const recommendedCast = (() => {
-    if (!fs) return "1"; // default normal
+    const nodes = CAST_NODES.filter((n) => n.pondId === autoPondId);
+    if (!nodes.length) return CAST_NODES[0]?.nodeId ?? "0";
+    const bySize = [...nodes].sort((a, b) => a.cost - b.cost);
+    const smallest = bySize[0];
+    if (!fs) return smallest.nodeId;
     const eng = Math.floor(energyAvailable);
-    const remainingCasts = maxCasts - castsToday;
-    if (remainingCasts <= 0) return "0";
+    const remaining = maxCasts - castsToday;
+    if (remaining <= 0) return smallest.nodeId;
 
-    // Calculate max casts per type
-    const bigCasts = Math.min(remainingCasts, Math.floor(eng / (fs.node2Energy || 20)));
-    const normalCasts = Math.min(remainingCasts, Math.floor(eng / (fs.node1Energy || 16)));
-    const smallCasts = Math.min(remainingCasts, Math.floor(eng / (fs.node0Energy || 12)));
+    const affordable = (nodeId: string) =>
+      Math.min(remaining, Math.floor(eng / (getNodeEnergy(nodeId) || 1)));
 
-    // Use big if we can afford all remaining casts at big, else normal, else small
-    if (bigCasts >= remainingCasts) return "2";
-    if (normalCasts >= remainingCasts) return "1";
-    // If we can't do all remaining at normal, use the biggest that lets us do the most casts
-    // Prefer big if it still gets us 80%+ of remaining casts
-    if (bigCasts >= remainingCasts * 0.8) return "2";
-    if (normalCasts >= remainingCasts * 0.8) return "1";
-    return smallCasts > 0 ? "0" : "1";
+    // Biggest node that covers every remaining cast, else the biggest that
+    // still covers 80% of them, else the smallest that buys anything at all.
+    for (const n of [...bySize].reverse()) {
+      if (affordable(n.nodeId) >= remaining) return n.nodeId;
+    }
+    for (const n of [...bySize].reverse()) {
+      if (affordable(n.nodeId) >= remaining * 0.8) return n.nodeId;
+    }
+    return smallest.nodeId;
   })();
 
   return (
@@ -3031,13 +3150,19 @@ function FishingPage({ giga, addLog }: {
               ))}
             </div>
 
-            {/* Session Stats */}
+            {/* Session Stats. One tile per currency actually earned — a session
+                that fished both ponds has two, and adding them would be adding
+                Seaweed to Infused Sediment. */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
               {[
                 { label: "Casts", value: fmt(sessionStats.casts), color: "var(--text)" },
                 { label: "Caught", value: fmt(sessionStats.caught), color: "var(--green)" },
                 { label: "Escaped", value: fmt(sessionStats.escaped), color: "var(--red)" },
-                { label: "Seaweed", value: fmt(sessionStats.seaweed), color: "var(--green)" },
+                ...Object.entries(sessionStats.earnedByPond).map(([pondId, amount]) => ({
+                  label: pondCurrencyLabel(Number(pondId)),
+                  value: fmt(amount),
+                  color: "var(--green)",
+                })),
               ].map((stat) => (
                 <div key={stat.label} className="text-center">
                   <div className="text-[11px] font-bold uppercase" style={{ color: "var(--text-faint)" }}>{stat.label}</div>
@@ -3059,7 +3184,7 @@ function FishingPage({ giga, addLog }: {
                         {c.name}
                       </span>
                       <span className="tabular-nums shrink-0 ml-2" style={{ color: "var(--text-faint)" }}>
-                        Q{c.quality} &middot; {c.size} &middot; <span style={{ color: "var(--green)" }}>+{fmt(c.seaweed)}</span>
+                        Q{c.quality} &middot; {c.size} &middot; <span style={{ color: "var(--green)" }}>+{fmt(c.earned)} {c.currency}</span>
                       </span>
                     </div>
                   ))}
@@ -3128,20 +3253,48 @@ function FishingPage({ giga, addLog }: {
               )}
             </h3>
             {(() => {
-              // Convert API [col,row] coordinates to cell IDs
+              // Convert API [row,col] coordinates to cell IDs
               const fishCell = gameData ? coordToCell(gameData.fishPosition, fishGrid) : 0;
               const prevCell = gameData ? coordToCell(gameData.previousFishPosition, fishGrid) : 0;
               const hasFintuition = gameData?.nextPosition && gameData.nextPosition.length === 2;
               const nextCell = hasFintuition ? coordToCell(gameData!.nextPosition!, fishGrid) : 0;
 
+              // On a lure-anchored pond the fish walks one orthogonal step and
+              // never reverses, and cards are 3x3 stamps around the lure rather
+              // than board addresses. Drawing that board with the classic
+              // model highlighted cells no card could reach and predicted moves
+              // the fish cannot make.
+              const lure =
+                gameData?.focusMechanicEnabled && gameData.focusPoint?.length === 2
+                  ? gameData.focusPoint
+                  : null;
+              const lureCell = lure ? coordToCell(lure, fishGrid) : 0;
+
               // Predicted cells — where the fish is GOING (likely cells only)
-              const predicted = hasFintuition
-                ? [nextCell]
-                : gameData
-                ? predictNextPositionsWeighted(fishCell, prevCell, fishGrid)
+              const predicted = !gameData
+                ? []
+                : lure
+                ? predictGroveCoords(
+                    gameData.fishPosition, gameData.previousFishPosition,
+                    fishGrid.cols, gameData.nextPosition
+                  )
                     .filter((e) => e.p >= 0.12)
-                    .map((e) => e.cell)
-                : [];
+                    .map((e) => coordToCell(e.coord, fishGrid))
+                : hasFintuition
+                ? [nextCell]
+                : predictNextPositionsWeighted(fishCell, prevCell, fishGrid)
+                    .filter((e) => e.p >= 0.12)
+                    .map((e) => e.cell);
+
+              /**
+               * The card zone that covers a board cell right now.
+               *
+               * Identity on the classic ponds, where a zone IS a board cell. In
+               * the Grove it is the offset from the lure, and cells more than
+               * one step away are covered by nothing at all.
+               */
+              const zoneForCell = (cell: number): number | null =>
+                lure ? focusZone(cellToCoord(cell, fishGrid), lure) : cell;
 
               const cells = Array.from({ length: fishGrid.cols * fishGrid.rows }, (_, i) => i + 1);
 
@@ -3157,11 +3310,17 @@ function FishingPage({ giga, addLog }: {
                     {cells.map((pos) => {
                       const hasFish = pos === fishCell;
                       const isPredicted = predicted.includes(pos);
-                      // Check which hand cards cover this PREDICTED position
-                      const coveredBy = isPredicted
-                        ? handCards.map((c, i) => (c?.hitZones.includes(pos) ? i : -1)).filter((i) => i >= 0)
-                        : [];
-                      const isCritZone = isPredicted && handCards.some((c) => c?.critZones.includes(pos) && c?.hitZones.includes(pos));
+                      const isLure = lureCell > 0 && pos === lureCell;
+                      // Which hand cards cover this PREDICTED cell, through
+                      // whatever zone scheme the pond uses.
+                      const zone = isPredicted ? zoneForCell(pos) : null;
+                      const coveredBy =
+                        zone === null
+                          ? []
+                          : handCards.map((c, i) => (c?.hitZones.includes(zone) ? i : -1)).filter((i) => i >= 0);
+                      const isCritZone =
+                        zone !== null &&
+                        handCards.some((c) => c?.critZones.includes(zone) && c?.hitZones.includes(zone));
 
                       return (
                         <div
@@ -3176,6 +3335,8 @@ function FishingPage({ giga, addLog }: {
                               : "var(--bg-inset)",
                             border: hasFish
                               ? "2px solid var(--orange)"
+                              : isLure
+                              ? "2px dashed var(--blue)"
                               : isPredicted && hasFintuition
                               ? `2px solid ${isCritZone ? "var(--gold)" : "var(--blue)"}`
                               : coveredBy.length > 0
@@ -3186,6 +3347,11 @@ function FishingPage({ giga, addLog }: {
                         >
                           {hasFish && (
                             <Fish size={20} style={{ color: "var(--orange)" }} />
+                          )}
+                          {isLure && !hasFish && (
+                            <span className="text-[10px] font-bold" style={{ color: "var(--blue)" }}>
+                              LURE
+                            </span>
                           )}
                           <span
                             className="absolute text-[10px] font-medium"
@@ -3293,11 +3459,25 @@ function FishingPage({ giga, addLog }: {
               <div className="flex flex-col gap-2">
                 {(() => {
                   // Same scoring the auto-player uses — "BEST" here is what
-                  // auto-fish would play
-                  const scored = scoreHand(
-                    gameData.hand, gameData.deckCardData, gameData.fishPosition,
-                    gameData.previousFishPosition, gameData.nextPosition, fishGrid
-                  );
+                  // auto-fish would play, in whichever model this pond plays by.
+                  const sumOf = (fx?: { amount: number }[]) =>
+                    (fx ?? []).reduce((t, e) => t + Math.abs(e.amount), 0);
+                  const scored = groveScores
+                    ? groveScores.map((s) => ({
+                        handIdx: s.handIndex, cardId: s.cardId, card: s.card,
+                        // An unplayable card sorts last but still renders, so
+                        // "not enough mana" is visible rather than the card
+                        // simply looking bad.
+                        ev: s.playable ? s.ev : -Infinity,
+                        pHit: s.pHit, pCrit: s.pCrit, reason: s.reason,
+                        hitDmg: sumOf(s.card?.hitEffects),
+                        missPenalty: sumOf(s.card?.missEffects),
+                        critDmg: sumOf(s.card?.critEffects),
+                      }))
+                    : scoreHand(
+                        gameData.hand, gameData.deckCardData, gameData.fishPosition,
+                        gameData.previousFishPosition, gameData.nextPosition, fishGrid
+                      );
                   const bestIdx = scored.reduce((best, s, i) => (s.ev > scored[best].ev ? i : best), 0);
 
                   return scored.map((s) => {
@@ -3392,7 +3572,8 @@ function FishingPage({ giga, addLog }: {
                     {gameData.caughtFish.size} | Q{gameData.caughtFish.quality}
                     {" | "}{gameData.caughtFish.sizes.weight}lb
                     {" | +"}
-                    <span style={{ color: "var(--green)" }}>{gameData.caughtFish.seaweedEarned}</span> seaweed
+                    <span style={{ color: "var(--green)" }}>{gameData.caughtFish.currencyEarned}</span>{" "}
+                    {pondCurrencyLabel(findPondForNode(nodeIdForGame(fs?.gameState))?.pondId)}
                   </div>
                 </div>
               </div>
@@ -3406,23 +3587,18 @@ function FishingPage({ giga, addLog }: {
                 Fish Stall
               </h3>
               {(() => {
-                const rates = fs?.exchangeRates || [];
-                const balMap = giga.itemBalances;
-                const fish = rates
-                  .map((r: { id: number; baseVal: number; value: number }) => {
-                    const qty = balMap[String(r.id)] ?? 0;
-                    if (qty <= 0) return null;
-                    const pct = Math.round(((r.value - r.baseVal) / r.baseVal) * 100);
-                    const name = giga.itemInfo[String(r.id)]?.name || `Fish#${r.id}`;
-                    return { id: r.id, name, qty, baseVal: r.baseVal, value: r.value, pct };
-                  })
-                  .filter((f: unknown): f is { id: number; name: string; qty: number; baseVal: number; value: number; pct: number } => f !== null)
-                  .sort((a: { pct: number }, b: { pct: number }) => b.pct - a.pct);
+                const plus50 = sellableFish.filter((f) => f.pct >= 50);
+                // Proceeds per stall. One total would be adding Seaweed to
+                // Infused Sediment, which is not a quantity of anything.
+                const proceeds = new Map<number, number>();
+                for (const f of plus50) {
+                  proceeds.set(f.pondId, (proceeds.get(f.pondId) ?? 0) + f.value * f.qty);
+                }
+                const proceedsText = Array.from(proceeds, ([pondId, amount]) =>
+                  `${amount} ${pondCurrencyLabel(pondId)}`
+                ).join(" + ");
 
-                const plus50 = fish.filter((f: { pct: number }) => f.pct >= 50);
-                const totalPlus50Seaweed = plus50.reduce((s: number, f: { value: number; qty: number }) => s + f.value * f.qty, 0);
-
-                const totalFish = plus50.reduce((s: number, f: { qty: number }) => s + f.qty, 0);
+                const totalFish = plus50.reduce((s, f) => s + f.qty, 0);
                 return plus50.length > 0 ? (
                   <button
                     onClick={async () => {
@@ -3433,13 +3609,14 @@ function FishingPage({ giga, addLog }: {
                       setConfirmSellAll(false);
                       addFishLog(`Selling ${totalFish} fish at +50%...`);
                       let totalSold = 0;
-                      let totalEarned = 0;
+                      const earnedByPond = new Map<number, number>();
                       for (const f of plus50) {
                         for (let i = 0; i < f.qty; i++) {
-                          const r = await giga.sellFish(f.id, 1, f.value);
+                          const r = await giga.sellFish(f.id, 1, f.value, f.pondId);
                           if (r?.success) {
                             totalSold++;
-                            totalEarned += r.data?.value ?? f.value;
+                            const got = r.data?.value ?? f.value;
+                            earnedByPond.set(f.pondId, (earnedByPond.get(f.pondId) ?? 0) + got);
                           } else {
                             addFishLog(`Failed to sell ${f.name}: ${r?.message || "error"}`);
                             break;
@@ -3447,7 +3624,10 @@ function FishingPage({ giga, addLog }: {
                           await new Promise((r) => setTimeout(r, 150));
                         }
                       }
-                      addFishLog(`*** Sold ${totalSold} fish for ${totalEarned} seaweed ***`);
+                      const earnedText = Array.from(earnedByPond, ([pondId, amount]) =>
+                        `${amount} ${pondCurrencyLabel(pondId)}`
+                      ).join(" + ") || "nothing";
+                      addFishLog(`*** Sold ${totalSold} fish for ${earnedText} ***`);
                       await giga.refreshAll();
                     }}
                     onBlur={() => setConfirmSellAll(false)}
@@ -3460,30 +3640,17 @@ function FishingPage({ giga, addLog }: {
                   >
                     {confirmSellAll
                       ? `Sell ${totalFish} fish — sure?`
-                      : `Sell All +50% (${totalPlus50Seaweed} seaweed)`}
+                      : `Sell All +50% (${proceedsText})`}
                   </button>
                 ) : null;
               })()}
             </div>
             {(() => {
-              const rates = fs?.exchangeRates || [];
-              const balMap = giga.itemBalances;
-              const fish = rates
-                .map((r: { id: number; baseVal: number; value: number }) => {
-                  const qty = balMap[String(r.id)] ?? 0;
-                  if (qty <= 0) return null;
-                  const pct = Math.round(((r.value - r.baseVal) / r.baseVal) * 100);
-                  const name = giga.itemInfo[String(r.id)]?.name || `Fish#${r.id}`;
-                  return { id: r.id, name, qty, baseVal: r.baseVal, value: r.value, pct };
-                })
-                .filter((f: unknown): f is { id: number; name: string; qty: number; baseVal: number; value: number; pct: number } => f !== null)
-                .sort((a: { pct: number }, b: { pct: number }) => b.pct - a.pct);
-
-              if (fish.length === 0) return <div className="text-[12px]" style={{ color: "var(--text-faint)" }}>No fish in inventory</div>;
+              if (sellableFish.length === 0) return <div className="text-[12px]" style={{ color: "var(--text-faint)" }}>No fish in inventory</div>;
 
               return (
                 <div className="space-y-1.5">
-                  {fish.map((f: { id: number; name: string; qty: number; baseVal: number; value: number; pct: number }) => (
+                  {sellableFish.map((f) => (
                     <div key={f.id} className="flex items-center justify-between py-1.5 px-2.5 rounded" style={{ background: "var(--bg-inset)" }}>
                       <div className="flex items-center gap-2">
                         <span className="text-[13px] font-medium">{f.name}</span>
@@ -3493,21 +3660,21 @@ function FishingPage({ giga, addLog }: {
                         <span className="text-[12px] tabular-nums font-bold" style={{
                           color: f.pct >= 50 ? "var(--green)" : f.pct > 0 ? "var(--text)" : f.pct === 0 ? "var(--text-faint)" : "var(--red)"
                         }}>
-                          {f.value} seaweed {f.pct > 0 ? `+${f.pct}%` : f.pct === 0 ? "" : `${f.pct}%`}
+                          {f.value} {pondCurrencyLabel(f.pondId)} {f.pct > 0 ? `+${f.pct}%` : f.pct === 0 ? "" : `${f.pct}%`}
                         </span>
                         <button
                           onClick={async () => {
                             let sold = 0;
                             let earned = 0;
                             for (let i = 0; i < f.qty; i++) {
-                              const r = await giga.sellFish(f.id, 1, f.value);
+                              const r = await giga.sellFish(f.id, 1, f.value, f.pondId);
                               if (r?.success) {
                                 sold++;
                                 earned += r.data?.value ?? f.value;
                               } else break;
                               await new Promise((r) => setTimeout(r, 150));
                             }
-                            addFishLog(`Sold ${sold}x ${f.name} for ${earned} seaweed`);
+                            addFishLog(`Sold ${sold}x ${f.name} for ${earned} ${pondCurrencyLabel(f.pondId)}`);
                             await giga.refreshAll();
                           }}
                           className="btn-press text-[10px] font-bold px-2 py-1 rounded cursor-pointer"

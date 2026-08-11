@@ -186,7 +186,15 @@ export function probeFishMove(
   if (!fishProbeEnabled() || !before || !after) return;
   if (!Array.isArray(before.fishPosition) || !Array.isArray(after.fishPosition)) return;
 
-  const gridSize = before.gridSize ?? 3;
+  // The board has to come from the state being scored. Defaulting to 3 meant a
+  // Grove observation was scored against a 3x3, so neighbours in row or column
+  // 4 were "off the board" and the actual move landed out-of-set — the one
+  // statistic the probe exists to keep at 100%.
+  const gridSize = before.gridSize;
+  if (typeof gridSize !== "number" || gridSize < 1) {
+    console.warn("[fishprobe] skipped an observation with no gridSize — nothing to score against");
+    return;
+  }
   const hadFintuition = !!(before.nextPosition && before.nextPosition.length === 2);
 
   // Score the walk model itself, so pass no Fintuition hint even when one was
