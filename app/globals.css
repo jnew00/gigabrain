@@ -23,14 +23,18 @@
   /* Accents */
   --orange: #e8863a;
   --orange-bright: #f59e0b;
+  --orange-lite: #f0975a;
   --orange-dim: #b56a2d;
   --orange-glow: rgba(232, 134, 58, 0.12);
+  /* Ink for text sitting on an orange fill — white measures 2.7:1 and fails AA */
+  --on-orange: #1a0f05;
   --green: #4ade80;
   --green-dim: #22c55e;
   --green-glow: rgba(74, 222, 128, 0.1);
   --green-border: rgba(74, 222, 128, 0.25);
   --red: #f87171;
   --red-dim: #ef4444;
+  --red-cta: #b91c1c;
   --red-dark: #7f1d1d;
   --red-glow: rgba(248, 113, 113, 0.1);
   --red-border: rgba(248, 113, 113, 0.2);
@@ -83,6 +87,11 @@ body {
   animation: pulse-glow 2s ease-in-out infinite;
 }
 
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
 @keyframes shimmer {
   0% { background-position: -200% 0; }
   100% { background-position: 200% 0; }
@@ -118,6 +127,47 @@ body {
 }
 .btn-press:hover:not(:disabled) {
   border-color: var(--border-lite) !important;
+}
+
+/* Filled call-to-action surfaces. Both gradients are dark enough that
+   --on-orange / white clear 4.5:1 at every stop, so contrast stays correct
+   wherever these are reused. */
+.cta-orange {
+  background: linear-gradient(135deg, var(--orange-lite), var(--orange));
+  border: none;
+  color: var(--on-orange);
+}
+.cta-red {
+  background: linear-gradient(135deg, var(--red-cta), var(--red-dark));
+  border: none;
+  color: var(--text-inverse);
+}
+
+/* Compact cockpit controls stay dense with a mouse and grow to a
+   comfortable tap size on touch devices. */
+.touch-target {
+  min-width: 32px;
+  min-height: 32px;
+}
+@media (pointer: coarse) {
+  .touch-target {
+    min-width: 44px !important;
+    min-height: 44px !important;
+  }
+}
+
+/* ─── Screen-reader-only text ───────────────────────────── */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* ─── Card surface ──────────────────────────────────────── */
@@ -198,6 +248,17 @@ input:focus-visible {
   animation: flyout-backdrop-in 0.2s ease both;
 }
 
+/* ─── Fishing page columns ─────────────────────────────── */
+
+.fishing-grid {
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 900px) {
+  .fishing-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ─── Mobile layout ────────────────────────────────────── */
 
 @media (max-width: 767px) {
@@ -226,10 +287,15 @@ input:focus-visible {
     border-right: none !important;
     border-top: 1px solid var(--border) !important;
     z-index: 50;
-    overflow: visible !important;
+    overflow: hidden !important;
   }
+  /* Nine rail buttons at a fixed 48px overflow a 360px viewport, so they
+     share the row instead and keep the full 48px tap height. */
   .nav-rail button {
-    width: 48px !important;
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+    max-width: 56px !important;
+    width: auto !important;
     height: 48px !important;
     padding: 0 !important;
     justify-content: center !important;
@@ -253,6 +319,11 @@ input:focus-visible {
   /* Main content: tighter padding */
   .main-content {
     padding: 16px !important;
+  }
+
+  /* Error toast sits above the bottom nav bar */
+  .error-toast {
+    bottom: 76px !important;
   }
 }
 

@@ -9,6 +9,7 @@ import type {
   RomsResponse,
   DungeonTodayResponse,
   AccountResponse,
+  MarketListingsResponse,
 } from "./types";
 
 const BASE_URL = "https://gigaverse.io";
@@ -123,6 +124,11 @@ export function getFishingState(token: string, address: string) {
 
 export function getFishingCards(token: string) {
   return apiFetch<unknown>("/api/fishing/cards", token);
+}
+
+/** Open marketplace listings for one item, cheapest first once sorted. */
+export function getItemListings(token: string, itemId: number) {
+  return apiFetch<MarketListingsResponse>(`/api/marketplace/item/listing/item/${itemId}`, token);
 }
 
 // ─── POST endpoints ────────────────────────────────────────────

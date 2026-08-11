@@ -1,84 +1,15 @@
 "use server";
 
 import {
-  insertMove,
-  getAllMoves,
-  getStats as dbGetStats,
-  importBulk,
   insertRun,
   getRunStats as dbGetRunStats,
   getDungeonPerformance as dbGetDungeonPerformance,
-} from "@/lib/enemy-db";
-import type { EnemyMoveRow } from "@/lib/enemy-db";
+} from "@/lib/run-db";
 
 /* ─── Validation helpers ─────────────────────────────── */
 
-const VALID_MOVES = new Set(["rock", "paper", "scissor"]);
-const MAX_BULK_IMPORT = 10_000;
-
 function isPositiveInt(n: unknown): n is number {
   return typeof n === "number" && Number.isInteger(n) && n >= 0;
-}
-
-/* ─── Enemy Intel ─────────────────────────────────────── */
-
-export async function recordEnemyMoveAction(
-  enemyId: number,
-  roomNum: number,
-  dungeonId: number,
-  level: number,
-  move: string,
-  round: number,
-  userAddress: string
-) {
-  if (!isPositiveInt(enemyId) || !isPositiveInt(roomNum) || !isPositiveInt(dungeonId) || !isPositiveInt(level) || !isPositiveInt(round)) {
-    throw new Error("Invalid numeric parameter");
-  }
-  if (!VALID_MOVES.has(move)) {
-    throw new Error("Invalid move");
-  }
-  if (typeof userAddress !== "string") {
-    throw new Error("Invalid user address");
-  }
-  await insertMove(enemyId, roomNum, dungeonId, level, move, round, Date.now(), userAddress);
-}
-
-export async function getAllEnemyMoves(userAddress: string): Promise<EnemyMoveRow[]> {
-  if (typeof userAddress !== "string") {
-    throw new Error("Invalid user address");
-  }
-  return getAllMoves(userAddress);
-}
-
-export async function getEnemyStats(userAddress: string): Promise<{ totalRecords: number; uniqueEnemies: number }> {
-  if (typeof userAddress !== "string") {
-    throw new Error("Invalid user address");
-  }
-  return dbGetStats(userAddress);
-}
-
-/** Migrate localStorage records to SQLite (one-time) */
-export async function migrateEnemyMoves(
-  records: { enemyId: number; roomNum: number; dungeonId: number; level: number; move: string; round: number; timestamp: number }[],
-  userAddress: string
-): Promise<{ imported: number }> {
-  if (!Array.isArray(records) || records.length === 0) return { imported: 0 };
-  if (records.length > MAX_BULK_IMPORT) {
-    throw new Error(`Bulk import limited to ${MAX_BULK_IMPORT} records`);
-  }
-  if (typeof userAddress !== "string") {
-    throw new Error("Invalid user address");
-  }
-  for (const r of records) {
-    if (!isPositiveInt(r.enemyId) || !isPositiveInt(r.roomNum) || !isPositiveInt(r.dungeonId) || !isPositiveInt(r.level) || !isPositiveInt(r.round) || !isPositiveInt(r.timestamp)) {
-      throw new Error("Invalid record in bulk import");
-    }
-    if (!VALID_MOVES.has(r.move)) {
-      throw new Error("Invalid move in bulk import");
-    }
-  }
-  await importBulk(records, userAddress);
-  return { imported: records.length };
 }
 
 /* ─── Run History ─────────────────────────────────────── */

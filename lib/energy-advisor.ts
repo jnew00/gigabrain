@@ -8,7 +8,7 @@
 // - Gigus (200E) is the only source of Gigus materials but is brutal —
 //   only worth it when you clear deep rooms reliably.
 
-import { findDungeonInfo, FISHING } from "./game-data";
+import { findDungeonInfo, isAwakeningActive, AWAKENING, FISHING } from "./game-data";
 
 export interface AdvisorDungeon {
   dungeonId: number;
@@ -21,6 +21,8 @@ export interface AdvisorDungeon {
   /** Average rooms cleared (out of 16), null when no data */
   avgRooms: number | null;
   totalRuns: number;
+  /** Drops Hard Cores — funded before permanent currencies during the event */
+  eventPriority?: boolean;
 }
 
 export interface AdvisorInput {
@@ -32,11 +34,21 @@ export interface AdvisorInput {
   romEnergyAvailable: number;
   dungeons: AdvisorDungeon[];
   fishingCastsLeft: number;
+  /**
+   * The Dendren Grove pond, when the event is running. The Grove draws from
+   * the same daily cast pool as the classic ponds, so this is not an extra
+   * budget — supplying it means those casts go to the Grove instead.
+   */
+  eventFishingNode?: { nodeId: string; label: string; cost: number };
+  /** Unix seconds, injectable so the event window can be tested */
+  now?: number;
 }
 
 export interface AdvisorResult {
   dungeonRuns: { dungeonId: number; runs: number }[];
   fishing: { nodeId: string; casts: number };
+  /** Grove casts, when the caller supplied a pond to plan for */
+  eventFishing?: { nodeId: string; casts: number };
   /** Advisor thinks ROM energy should be claimed into the pool (not dusted) */
   claimRomEnergy: boolean;
   notes: string[];
@@ -68,27 +80,110 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
 
   // ── What would it cost to fill every daily cap? ──
   const fishNodes = FISHING.nodes;
-  const bigCost = fishNodes[2].cost;
+  const eventNode = input.eventFishingNode;
+  // Casts are a single shared pool, so the cap costs whatever node they land on
+  const castCost = eventNode ? eventNode.cost : fishNodes[2].cost;
   const capCost =
-    input.fishingCastsLeft * bigCost +
+    input.fishingCastsLeft * castCost +
     input.dungeons
       .filter((d) => d.energyCost > 0)
       .reduce((s, d) => s + d.runsLeft * d.energyCost, 0);
 
   // ── ROM energy: claim it if we can't otherwise fill the cheap caps ──
+  // Only what fits under the cap can actually land in the pool. Budgeting the
+  // full ROM balance while the pool is near max plans a run that can't be paid
+  // for, and the shortfall lands on whatever executes last.
+  const headroom = Math.max(0, input.maxEnergy - input.currentEnergy);
+  let claimedRomEnergy = 0;
   if (input.romEnergyAvailable > 0 && budget < capCost) {
-    claimRomEnergy = true;
-    budget += input.romEnergyAvailable;
+    claimedRomEnergy = Math.min(input.romEnergyAvailable, headroom);
+    if (claimedRomEnergy > 0) {
+      claimRomEnergy = true;
+      budget += claimedRomEnergy;
+      const spare = Math.floor(input.romEnergyAvailable - claimedRomEnergy);
+      notes.push(
+        `Claim ${Math.floor(claimedRomEnergy)}E from ROMs as energy (not dust) — you have more daily caps than energy today.` +
+          (spare > 0
+            ? ` The other ${spare}E won't fit under the ${input.maxEnergy}E cap; spend some energy first, then claim again.`
+            : "")
+      );
+    } else if (input.romEnergyAvailable > 0) {
+      notes.push(
+        `${Math.floor(input.romEnergyAvailable)}E is sitting on ROMs but your pool is full — spend energy first or it can't be claimed.`
+      );
+    }
+  }
+
+  // ── 1. The Awakening: Hard Cores first while the window is open ──
+  // Scrap and Giga Shards are farmable forever; Hard Cores stop existing on
+  // the event's end date and pay out of a real prize pot. So for the duration
+  // every Core-yielding action outranks the permanent grind, and event
+  // dungeons are exempt from the depth ranking below (a dungeon nobody has
+  // run yet always loses that comparison to one with history).
+  const eventActive = isAwakeningActive(input.now);
+  const eventDungeons = eventActive
+    ? input.dungeons.filter((d) => d.eventPriority && d.runsLeft > 0)
+    : [];
+  let eventFishing: { nodeId: string; casts: number } | undefined;
+  const groveActive = eventActive && !!eventNode && input.fishingCastsLeft > 0;
+
+  if (eventActive && (eventDungeons.length > 0 || groveActive)) {
     notes.push(
-      `Claim ${Math.floor(input.romEnergyAvailable)}E from ROMs as energy (not dust) — you have more daily caps than energy today.`
+      `${AWAKENING.name} is live — Hard Cores are funded before scrap and shards because they expire when the event ends.` +
+        (input.isJuiced
+          ? " Juice is active, so every Core counts 4x."
+          : " Without Juice you earn 1x Cores; juiced players earn 4x for the same energy.")
     );
   }
 
-  // ── 1. Fishing: cheapest capped action, fill first ──
+  if (groveActive && eventNode) {
+    // Every cast goes to the Grove during the event. It shares the daily cast
+    // pool with the classic ponds, and at 12E it is both the cheapest node and
+    // the only one paying a currency that expires — so there is nothing to
+    // trade off. Seaweed keeps; Cores don't.
+    const casts = Math.min(input.fishingCastsLeft, Math.floor(budget / eventNode.cost));
+    if (casts > 0) {
+      eventFishing = { nodeId: eventNode.nodeId, casts };
+      budget -= casts * eventNode.cost;
+      notes.push(
+        `Dendren Grove: ${casts}x ${eventNode.label} cast (${eventNode.cost}E) for Hard Cores — the classic ponds share this cast pool and are skipped while the event runs.` +
+          (casts < input.fishingCastsLeft
+            ? ` ${input.fishingCastsLeft - casts} casts left unfunded.`
+            : "")
+      );
+    } else {
+      warnings.push(
+        `${input.fishingCastsLeft} casts are available but there isn't ${eventNode.cost}E for even one Grove cast.`
+      );
+    }
+  }
+
+  // Cheapest first so the most Core-yielding runs get funded
+  for (const d of [...eventDungeons].sort((a, b) => a.energyCost - b.energyCost)) {
+    if (d.energyCost <= 0) {
+      notes.push(`${d.name}: item entry, no energy — run it from the Dungeon tab, it costs the plan nothing.`);
+      continue;
+    }
+    const runs = Math.min(d.runsLeft, Math.floor(budget / d.energyCost));
+    if (runs <= 0) {
+      warnings.push(
+        `${d.name} drops Hard Cores and has ${d.runsLeft} runs left, but there isn't ${d.energyCost}E for a run. This is the spend that expires — consider skipping a regular dungeon.`
+      );
+      continue;
+    }
+    dungeonRuns.push({ dungeonId: d.dungeonId, runs });
+    budget -= runs * d.energyCost;
+    notes.push(
+      `${d.name}: ${runs}x run for Hard Cores — funded ahead of scrap and shards.` +
+        (runs < d.runsLeft ? ` ${d.runsLeft - runs} capped runs left unfunded.` : "")
+    );
+  }
+
+  // ── 2. Fishing: cheapest capped action, fill first ──
   // Pick the biggest cast size the budget supports across ALL remaining casts;
   // the cast cap binds before energy does, so maximize reward per cast.
   let fishing = { nodeId: "0", casts: 0 };
-  if (input.fishingCastsLeft > 0) {
+  if (input.fishingCastsLeft > 0 && !eventFishing) {
     // Reserve nothing yet — fishing gets first claim, then dungeons
     const node =
       [...fishNodes].reverse().find((n) => n.cost * input.fishingCastsLeft <= budget * 0.6) ??
@@ -107,9 +202,15 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
     }
   }
 
-  // ── 2. Dungeons: rank by performance-adjusted value per energy ──
+  // ── 3. Dungeons: rank by performance-adjusted value per energy ──
+  const alreadyPlanned = new Set(dungeonRuns.map((r) => r.dungeonId));
   const standard = input.dungeons.filter(
-    (d) => d.energyCost > 0 && d.runsLeft > 0 && !findDungeonInfo(d.name)?.eventOnly
+    (d) =>
+      d.energyCost > 0 &&
+      d.runsLeft > 0 &&
+      !findDungeonInfo(d.name)?.eventOnly &&
+      !alreadyPlanned.has(d.dungeonId) &&
+      !(eventActive && d.eventPriority)
   );
   const gigusLike = standard.filter((d) => findDungeonInfo(d.name)?.exclusiveSource);
   const regular = standard.filter((d) => !findDungeonInfo(d.name)?.exclusiveSource);
@@ -179,14 +280,16 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
   }
 
   // ── Leftover guidance ──
-  const totalSpend = input.currentEnergy + (claimRomEnergy ? input.romEnergyAvailable : 0) - budget;
+  const totalSpend = input.currentEnergy + claimedRomEnergy - budget;
   if (budget >= 40) {
     const anyCapLeft =
       input.dungeons.some(
         (d) =>
           d.energyCost > 0 &&
           d.runsLeft > (dungeonRuns.find((r) => r.dungeonId === d.dungeonId)?.runs ?? 0)
-      ) || fishing.casts < input.fishingCastsLeft;
+      ) ||
+      // One shared cast pool, so whichever pond claimed it answers for it
+      (fishing.casts + (eventFishing?.casts ?? 0)) < input.fishingCastsLeft;
     if (!anyCapLeft) {
       notes.push(
         `${Math.floor(budget)}E left with all daily caps filled — it banks toward tomorrow as long as you stay under the ${input.maxEnergy}E cap.`
@@ -197,6 +300,7 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
   return {
     dungeonRuns,
     fishing,
+    eventFishing,
     claimRomEnergy,
     notes,
     warnings,

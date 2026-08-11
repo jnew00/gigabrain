@@ -74,15 +74,43 @@ const COMBAT_LADDER_SURVIVAL: LadderStep[] = [
   { match: ["hp"], target: 10, reason: "Depth insurance for floors 3-4" },
 ];
 
+/**
+ * Trees for the Void and Forbidden Woods dungeons. These have NO attack stats
+ * — only Max HP, Max AMR, and the five proc chances — so the combat ladder's
+ * whole damage-first premise silently no-ops against them and falls through to
+ * armour by accident. Five of the seven stats matched no step at all.
+ *
+ * Ordering rationale, given how the auto-battler actually fights:
+ * flat mitigation before proc chances, because armour and HP apply on every
+ * exchange while a proc is a dice roll; and in these dungeons rooms cleared is
+ * what pays, so not dying dominates. Per-level rates are the published Void
+ * figures (Block and Tenacity 1%, Evasion and Intuition 0.5%, Luck 0.75%) and
+ * have NOT been verified against live combat — the ordering follows them, so
+ * it is worth revisiting if a probe ever measures them.
+ */
+const PROC_LADDER: LadderStep[] = [
+  { match: ["amr"], target: 4, reason: "Flat armour applies every exchange — no roll to lose" },
+  { match: ["hp"], target: 5, reason: "Rooms cleared is what pays here, and dying is what stops it" },
+  { match: ["block"], target: 5, reason: "Best per-level rate of the defensive procs (1%/lvl)" },
+  { match: ["tenacity"], target: 5, reason: "Same 1%/lvl rate, stacking a second damage reducer" },
+  { match: ["amr"], target: 10, reason: "Raise the guaranteed floor before betting on dice" },
+  { match: ["hp"], target: 10, reason: "Depth insurance for the later rooms" },
+  { match: ["intuition"], target: 5, reason: "Feeds the move read the auto-battler already counters with" },
+  { match: ["evasion"], target: 5, reason: "Half Block's rate per level, so it waits" },
+  { match: ["luck"], target: 5, reason: "Crits only pay on exchanges you were winning anyway" },
+];
+
 const FISHING_LADDER: LadderStep[] = [
   { match: ["fintuition"], target: 5, reason: "Reveals the fish's next cell — card AI hits ~100% when it fires" },
-  { match: ["stamina"], target: 5, reason: "More starting mana = more card plays per cast" },
+  // "stam" not "stamina": the game spells the stat "Stamana", so the longer
+  // match silently never fired and this step has never been recommended.
+  { match: ["stam"], target: 5, reason: "More starting mana = more card plays per cast" },
   { match: ["weed"], target: 5, reason: "Better sell prices compound into faster upgrades" },
   { match: ["luck"], target: 3, reason: "Rarity bumps = more seaweed per catch" },
   { match: ["taste"], target: 3, reason: "Quality bumps = 40-60% bonus seaweed per star" },
   { match: ["dual"], target: 3, reason: "Two fish on one capped cast" },
   { match: ["fintuition"], target: 10, reason: "Keep the prediction rate climbing" },
-  { match: ["stamina"], target: 10, reason: "Longer casts close out tanky fish" },
+  { match: ["stam"], target: 10, reason: "Longer casts close out tanky fish" },
 ];
 
 // Stats the ladders deliberately leave for last — used for respec detection
@@ -96,7 +124,18 @@ function statMatches(statName: string, parts: string[]): boolean {
 
 function isFishingTree(tree: SkillTree): boolean {
   const names = tree.stats.map((s) => s.name.toLowerCase()).join(" ");
-  return names.includes("stamina") || names.includes("fintuition") || tree.name.toLowerCase().includes("fish");
+  return names.includes("stam") || names.includes("fintuition") || tree.name.toLowerCase().includes("fish");
+}
+
+/**
+ * A tree with no attack stats at all — the Void and Forbidden Woods shape.
+ * Detected from the stats themselves rather than the name, so a future event
+ * tree of the same shape is handled without a code change.
+ */
+function isProcTree(tree: SkillTree): boolean {
+  const names = tree.stats.map((s) => s.name.toLowerCase());
+  if (names.some((n) => n.includes("atk"))) return false;
+  return names.some((n) => n.includes("tenacity") || n.includes("block") || n.includes("evasion"));
 }
 
 export interface DungeonPerfEntry {
@@ -105,10 +144,25 @@ export interface DungeonPerfEntry {
   totalRuns: number;
 }
 
+/** Words shared by several names, so useless for telling trees apart */
+const GENERIC_NAME_WORDS = new Set(["dungetron", "dungeon", "skills", "skill", "temporal"]);
+
+function distinctiveWords(name: string): string[] {
+  return name
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 2 && !GENERIC_NAME_WORDS.has(w));
+}
+
 /**
- * Clear depth for the dungeon THIS tree's currency comes from. Normal and
- * Underhaul have separate, non-transferable skill trees, so each is judged
- * by its own dungeon's performance. Falls back to the global average.
+ * Clear depth for the dungeon THIS tree's currency comes from. Each dungeon has
+ * its own non-transferable tree, so each is judged on its own record.
+ *
+ * Paired by distinctive name word rather than the old "Underhaul or not" split,
+ * which lumped every non-Underhaul dungeon together. Once Forbidden Woods
+ * existed that pooled it with Dungetron 5000, and a deep Dungetron record hid
+ * the fact that Woods runs were dying in room 2 — picking the thriving ladder
+ * when the survival one applied.
  */
 function avgRoomsForTree(
   tree: SkillTree,
@@ -116,12 +170,10 @@ function avgRoomsForTree(
   globalAvg: number | null
 ): number | null {
   if (!perf || perf.length === 0) return globalAvg;
-  const isUnderhaulTree = tree.name.toLowerCase().includes("underhaul");
-  const rows = perf.filter((p) => {
-    const n = p.name.toLowerCase();
-    if (n.includes("gigus") || n.includes("void")) return false; // no own trees
-    return isUnderhaulTree ? n.includes("underhaul") : !n.includes("underhaul");
-  });
+  const treeWords = distinctiveWords(tree.name);
+  const rows = perf.filter((p) =>
+    distinctiveWords(p.name).some((w) => treeWords.includes(w))
+  );
   const total = rows.reduce((s, r) => s + r.totalRuns, 0);
   if (total < 3) return globalAvg;
   return rows.reduce((s, r) => s + r.avgRooms * r.totalRuns, 0) / total;
@@ -159,9 +211,12 @@ export function buildSkillAdvice(
     const currentTotalLvl = totalLvl;
 
     const fishing = isFishingTree(tree);
+    const proc = !fishing && isProcTree(tree);
     const treeAvgRooms = fishing ? null : avgRoomsForTree(tree, dungeonPerf, avgRooms);
     const ladder = fishing
       ? FISHING_LADDER
+      : proc
+      ? PROC_LADDER
       : treeAvgRooms != null && treeAvgRooms < 6
       ? COMBAT_LADDER_SURVIVAL
       : COMBAT_LADDER;

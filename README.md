@@ -42,8 +42,12 @@ Open http://localhost:3000 and connect with your Abstract Global Wallet (or past
 Optional. Without a database, everything works except persisted run history and the history-driven advisor tuning.
 
 ```bash
-DATABASE_URL=postgres://...   # Neon (or any Postgres) — stores enemy intel + run history
+DATABASE_URL=postgres://...   # Neon (or any Postgres) — stores run history
 ```
+
+Run history is per-wallet and feeds the energy advisor's win-rate and average-depth
+advice. If you previously ran GigaBrain with an `enemy_moves` table, it is no longer
+read or written and can be dropped: `DROP TABLE enemy_moves;`
 
 ## Auth & privacy
 

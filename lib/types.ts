@@ -64,6 +64,57 @@ export interface LootOption {
   boonTypeString: string;
 }
 
+/** Affix carried by an Awakening enemy — "Searing", "Bladebreaker", etc. */
+export interface EnemyBuff {
+  id: string;
+  name: string;
+  description: string;
+  minTier: number;
+  effects: { kind: string; [key: string]: unknown }[];
+}
+
+/**
+ * Per-encounter stat roll the server applies on top of an enemy's static
+ * MOVE_STATS. Higher tiers roll higher, which is what makes them dangerous —
+ * base ATK/DEF are unchanged.
+ */
+export interface RolledEnemyStats {
+  evasion: number;
+  block: number;
+  lck: number;
+  tenacity: number;
+}
+
+/**
+ * Reward choice offered after clearing a room in the Awakening dungeon: a boon
+ * paired with a Hard Core payout. More Cores comes with a weaker boon.
+ */
+export interface RewardPathOption {
+  index: number;
+  tier: number;
+  tierName: string;
+  boon: LootOption;
+  gigusOrbItemId: number;
+  gigusOrbAmount: number;
+}
+
+/** Enemy choice offered after the reward choice. Tier drives Cores and risk. */
+export interface EnemyPathOption {
+  index: number;
+  tier: number;
+  tierName: string;
+  enemyId: number;
+  enemyBuff: EnemyBuff | null;
+  rolledEnemyStats: RolledEnemyStats;
+  lootTable?: {
+    NAME_CID: string;
+    ID_CID: number;
+    GAME_ITEM_ID_CID_array: number[];
+    WEIGHT_CID_array: number[];
+    LOOT_AMOUNT_CID_array: number[];
+  };
+}
+
 export interface RunData {
   _id: string;
   DUNGEON_ID_CID: number;
@@ -71,6 +122,16 @@ export interface RunData {
   players: Player[];
   lootPhase: boolean;
   lootOptions: LootOption[];
+  // Awakening phases. Absent on the classic dungeons, so all optional.
+  pathPhase?: boolean;
+  pathOptions?: unknown[];
+  rewardPathPhase?: boolean;
+  rewardPathOptions?: RewardPathOption[];
+  enemyPathPhase?: boolean;
+  enemyPathOptions?: EnemyPathOption[];
+  activeEnemyBuff?: EnemyBuff | null;
+  enemyStartingBuff?: EnemyBuff | null;
+  perpetualBuffs?: EnemyBuff[];
   version: number;
   createdAt: string;
   updatedAt: string;
@@ -433,6 +494,14 @@ export interface FishingGameData {
   fishMaxHp: number;
   fishPosition: number[];    // 1-2 grid positions where fish currently is
   previousFishPosition: number[];
+  /** Board edge length — 3 on the classic ponds, 4 in the Dendren Grove */
+  gridSize?: number;
+  /** Which movement pattern the fish is using this cast, stated outright */
+  patternIndex?: number;
+  focusPoint?: number[];
+  focusMeter?: number;
+  focusMeterMax?: number;
+  focusMechanicEnabled?: boolean;
   hand: number[];            // card IDs currently in hand
   discard: number[];
   fullDeck: number[];
@@ -459,7 +528,14 @@ export interface FishingGameState {
     LEVEL_CID: number;
     data: FishingGameData;
   };
-  dayDoc: { UINT256_CID: number };  // casts done today
+  /**
+   * Only the FIRST pond's counter. Do not read this for "casts used today" —
+   * the daily cap is shared across ponds and this omits every other one. Use
+   * castsUsedToday(), which sums dayDocs.
+   */
+  dayDoc: { UINT256_CID: number };
+  /** Per-pond cast counters. pondId 1 is the classic pond, 2 the Dendren Grove. */
+  dayDocs?: { pondId: number; doc: { UINT256_CID: number } }[];
   maxPerDay: number;
   maxPerDayJuiced: number;
   node0Energy: number;   // 12
@@ -477,6 +553,12 @@ export interface FishingActionPayload {
   data: {
     cards: number[];
     nodeId: string;
+    /** Grove offering tier: 1 = 1x Cores, 2 = 2x, 3 = 4x. 0 on classic ponds. */
+    tierId: number;
+    /** Lure position, sent with every card play rather than as its own action */
+    focusPoint: number[];
+    itemId: number;
+    slotIndex: number;
   };
 }
 
@@ -491,6 +573,26 @@ export interface FishingActionResponse {
   actionToken?: number;
 }
 
+// ─── Marketplace ──────────────────────────────────────────────
+
+export interface MarketListing {
+  docId: string;
+  ID_CID: string;
+  OWNER_CID: string;
+  GAME_ITEM_ID_CID: number;
+  /** Price per unit in wei */
+  ETH_MINT_PRICE_CID: number;
+  /** Units still available on this listing */
+  UINT256_CID: number;
+  /** Units originally listed */
+  EXPORT_AMOUNT_CID: number;
+  TIMESTAMP_CID: number;
+}
+
+export interface MarketListingsResponse {
+  entities: MarketListing[];
+}
+
 // ─── Action Payloads ───────────────────────────────────────────
 
 export type DungeonAction =
@@ -502,6 +604,13 @@ export type DungeonAction =
   | "loot_two"
   | "loot_three"
   | "loot_four"
+  // Awakening: reward choice (boon + Hard Cores), then enemy/difficulty choice
+  | "reward_one"
+  | "reward_two"
+  | "reward_three"
+  | "path_one"
+  | "path_two"
+  | "path_three"
   | "use_item";
 
 export interface DungeonActionPayload {

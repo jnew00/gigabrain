@@ -22,7 +22,7 @@
 12. [Skill Systems](#12-skill-systems)
 13. [Gear & Equipment](#13-gear--equipment)
 14. [Abstract Ecosystem (XP & Stubs)](#14-abstract-ecosystem-xp--stubs)
-15. [The Awakening (Seasonal Event)](#15-the-awakening-seasonal-event-aug-10---oct-12-2026)
+15. [The Awakening (Seasonal Event)](#15-the-awakening-seasonal-event-aug-10---oct-10-2026)
 16. [Automation Priority Matrix](#16-automation-priority-matrix)
 
 ---
@@ -605,7 +605,7 @@ Head, Body, Charms, Hands, Lures, Rods
 
 ---
 
-## 15. The Awakening (seasonal event: Aug 10 - Oct 12, 2026)
+## 15. The Awakening (seasonal event: Aug 10 - Oct 10, 2026)
 
 - Collect **Cores** via the event dungeon + fishing pond, resource conversion
   (ROMs, Giglings, relic armor), and daily/weekly quests + item turn-ins

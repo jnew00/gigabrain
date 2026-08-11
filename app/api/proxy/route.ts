@@ -41,6 +41,7 @@ const ALLOWED_PREFIXES = [
   "/api/gigajuice/player/",
   "/api/factions/player/",
   "/api/fishing/state/",
+  "/api/marketplace/item/listing/item/",
 ];
 
 function isEndpointAllowed(endpoint: string): boolean {

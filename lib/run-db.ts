@@ -22,24 +22,6 @@ async function ensureTables() {
   if (initialized) return;
   const p = getPool();
   await p.query(`
-    CREATE TABLE IF NOT EXISTS enemy_moves (
-      id SERIAL PRIMARY KEY,
-      enemy_id INTEGER NOT NULL,
-      room_num INTEGER NOT NULL,
-      dungeon_id INTEGER NOT NULL,
-      level INTEGER NOT NULL,
-      move TEXT NOT NULL,
-      round INTEGER NOT NULL,
-      timestamp BIGINT NOT NULL,
-      user_address TEXT NOT NULL DEFAULT ''
-    )
-  `);
-  // Migration: add user_address to existing tables
-  await p.query(`ALTER TABLE enemy_moves ADD COLUMN IF NOT EXISTS user_address TEXT NOT NULL DEFAULT ''`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_enemy_id ON enemy_moves(enemy_id)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_enemy_room ON enemy_moves(enemy_id, room_num)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_enemy_user ON enemy_moves(user_address)`);
-  await p.query(`
     CREATE TABLE IF NOT EXISTS run_history (
       id SERIAL PRIMARY KEY,
       dungeon_name TEXT NOT NULL,
@@ -56,89 +38,7 @@ async function ensureTables() {
   await p.query(`ALTER TABLE run_history ADD COLUMN IF NOT EXISTS user_address TEXT NOT NULL DEFAULT ''`);
   await p.query(`CREATE INDEX IF NOT EXISTS idx_run_timestamp ON run_history(timestamp)`);
   await p.query(`CREATE INDEX IF NOT EXISTS idx_run_user ON run_history(user_address)`);
-
-  // Clean up bad data (enemy_id -1 = no enemy)
-  await p.query(`DELETE FROM enemy_moves WHERE enemy_id < 0`);
   initialized = true;
-}
-
-export interface EnemyMoveRow {
-  id: number;
-  enemy_id: number;
-  room_num: number;
-  dungeon_id: number;
-  level: number;
-  move: string;
-  round: number;
-  timestamp: number;
-  user_address: string;
-}
-
-export async function insertMove(
-  enemyId: number,
-  roomNum: number,
-  dungeonId: number,
-  level: number,
-  move: string,
-  round: number,
-  timestamp: number,
-  userAddress: string
-) {
-  if (!hasDatabase()) return;
-  await ensureTables();
-  await getPool().query(
-    `INSERT INTO enemy_moves (enemy_id, room_num, dungeon_id, level, move, round, timestamp, user_address)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [enemyId, roomNum, dungeonId, level, move, round, timestamp, userAddress]
-  );
-}
-
-export async function getAllMoves(userAddress: string): Promise<EnemyMoveRow[]> {
-  if (!hasDatabase()) return [];
-  await ensureTables();
-  const { rows } = await getPool().query(
-    `SELECT * FROM enemy_moves WHERE user_address = $1 ORDER BY timestamp ASC`,
-    [userAddress]
-  );
-  return rows as EnemyMoveRow[];
-}
-
-export async function getStats(userAddress: string): Promise<{ totalRecords: number; uniqueEnemies: number }> {
-  if (!hasDatabase()) return { totalRecords: 0, uniqueEnemies: 0 };
-  await ensureTables();
-  const p = getPool();
-  const { rows: [{ c: total }] } = await p.query(
-    `SELECT COUNT(*) as c FROM enemy_moves WHERE user_address = $1`,
-    [userAddress]
-  );
-  const { rows: [{ c: unique }] } = await p.query(
-    `SELECT COUNT(DISTINCT enemy_id) as c FROM enemy_moves WHERE user_address = $1`,
-    [userAddress]
-  );
-  return { totalRecords: Number(total), uniqueEnemies: Number(unique) };
-}
-
-export async function importBulk(
-  records: { enemyId: number; roomNum: number; dungeonId: number; level: number; move: string; round: number; timestamp: number }[],
-  userAddress: string
-) {
-  if (!hasDatabase()) return;
-  await ensureTables();
-  const p = getPool();
-  // Build a multi-row INSERT for efficiency
-  const values: unknown[] = [];
-  const placeholders: string[] = [];
-  for (let i = 0; i < records.length; i++) {
-    const r = records[i];
-    const offset = i * 8;
-    placeholders.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8})`);
-    values.push(r.enemyId, r.roomNum, r.dungeonId, r.level, r.move, r.round, r.timestamp, userAddress);
-  }
-  await p.query(
-    `INSERT INTO enemy_moves (enemy_id, room_num, dungeon_id, level, move, round, timestamp, user_address)
-     VALUES ${placeholders.join(", ")}`,
-    values
-  );
 }
 
 /* ─── Run History ─────────────────────────────────────── */

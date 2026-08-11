@@ -23,14 +23,6 @@ import type {
   GearInstancesResponse,
   VendorListingsResponse,
 } from "./types";
-import { loadLocalStorageRecords, clearLocalStorageRecords } from "./enemy-tracker";
-import type { EnemyMoveRecord } from "./enemy-tracker";
-import {
-  recordEnemyMoveAction,
-  getAllEnemyMoves,
-  migrateEnemyMoves,
-} from "@/app/actions";
-
 const STORAGE_KEY = "giga-auth";
 
 interface StoredAuth {
@@ -64,6 +56,49 @@ function clearAuth() {
   localStorage.removeItem(STORAGE_KEY);
 }
 
+/**
+ * Item deltas seen while a capture is open.
+ *
+ * Every game action returns `gameItemBalanceChanges`, and every one of them
+ * goes through proxy(), so accumulating here catches the whole haul — dungeon
+ * loot, fish, chests, pots, trades, ROM claims — without each call site having
+ * to remember to report. A call site that forgets is exactly how the run
+ * summary ended up as counts with no items.
+ *
+ * Module-level rather than per-hook: one run is in flight at a time, and the
+ * executor spans several components.
+ */
+let haulCapture: Map<number, number> | null = null;
+
+export function beginHaulCapture(): void {
+  haulCapture = new Map();
+}
+
+/** Ends the capture and returns the net item deltas collected. */
+export function endHaulCapture(): { id: number; amount: number }[] {
+  const out = haulCapture
+    ? Array.from(haulCapture, ([id, amount]) => ({ id, amount })).filter((e) => e.amount !== 0)
+    : [];
+  haulCapture = null;
+  return out;
+}
+
+/**
+ * Fold one API response's item deltas into the open capture. Called by proxy()
+ * for every response; exported so the accumulation can be tested directly
+ * rather than only through begin/end.
+ */
+export function recordHaul(data: unknown): void {
+  if (!haulCapture) return;
+  const changes = (data as { gameItemBalanceChanges?: { id: number; amount: number }[] })
+    ?.gameItemBalanceChanges;
+  if (!Array.isArray(changes)) return;
+  for (const c of changes) {
+    if (typeof c?.id !== "number" || typeof c?.amount !== "number") continue;
+    haulCapture.set(c.id, (haulCapture.get(c.id) ?? 0) + c.amount);
+  }
+}
+
 async function proxy<T>(
   endpoint: string,
   token: string,
@@ -88,6 +123,7 @@ async function proxy<T>(
     throw err;
   }
 
+  recordHaul(data);
   return data as T;
 }
 
@@ -100,6 +136,8 @@ export function useGigaverse() {
   const [error, setError] = useState<string | null>(null);
   const [dungeonState, setDungeonState] =
     useState<DungeonActionResponse | null>(null);
+  // Mirrors dungeonState for callbacks that must read it synchronously
+  const dungeonStateRef = useRef<DungeonActionResponse | null>(null);
   const [energy, setEnergy] = useState<EnergyResponse | null>(null);
   const [dungeonToday, setDungeonToday] =
     useState<DungeonTodayResponse | null>(null);
@@ -109,7 +147,6 @@ export function useGigaverse() {
   const [itemNames, setItemNames] = useState<Record<string, string>>({});
   const [itemInfo, setItemInfo] = useState<Record<string, { name: string; rarity?: number; rarityName?: string; icon?: string }>>({});
   const [enemyNames, setEnemyNames] = useState<Record<string, { name: string; stats?: number[] }>>({});
-  const [enemyMoveRecords, setEnemyMoveRecords] = useState<EnemyMoveRecord[]>([]);
   const [worldRecipes, setWorldRecipes] = useState<RecipeEntity[]>([]);
   const [playerRecipes, setPlayerRecipes] = useState<PlayerRecipesResponse | null>(null);
   const [skillTrees, setSkillTrees] = useState<SkillTree[]>([]);
@@ -254,6 +291,7 @@ export function useGigaverse() {
         }
 
         setEnergy(eng);
+        dungeonStateRef.current = ds;
         setDungeonState(ds);
         setDungeonToday(dt);
         setRoms(rm);
@@ -264,30 +302,6 @@ export function useGigaverse() {
 
         // Persist JWT
         saveAuth(jwt, expiresAt);
-
-        // Load enemy intel from SQLite + migrate localStorage if needed
-        try {
-          const lsRecords = loadLocalStorageRecords();
-          if (lsRecords.length > 0) {
-            await migrateEnemyMoves(lsRecords, me.address);
-            clearLocalStorageRecords();
-          }
-          const dbRecords = await getAllEnemyMoves(me.address);
-          setEnemyMoveRecords(
-            dbRecords.map((r) => ({
-              enemyId: r.enemy_id,
-              roomNum: r.room_num,
-              dungeonId: r.dungeon_id,
-              level: r.level,
-              move: r.move,
-              round: r.round,
-              timestamp: r.timestamp,
-            }))
-          );
-        } catch {
-          // Fall back to localStorage if SQLite fails
-          setEnemyMoveRecords(loadLocalStorageRecords());
-        }
 
         return me;
       } catch (e) {
@@ -301,22 +315,12 @@ export function useGigaverse() {
     []
   );
 
-  /** Record an enemy move — writes to SQLite + updates local state */
-  const recordEnemyMove = useCallback(
-    (enemyId: number, roomNum: number, dungeonId: number, level: number, move: string, round: number) => {
-      const record: EnemyMoveRecord = { enemyId, roomNum, dungeonId, level, move, round, timestamp: Date.now() };
-      setEnemyMoveRecords((prev) => [...prev, record]);
-      // Fire-and-forget write to SQLite
-      recordEnemyMoveAction(enemyId, roomNum, dungeonId, level, move, round, address).catch(() => {});
-    },
-    [address]
-  );
-
   const disconnect = useCallback(() => {
     setToken("");
     setAddress("");
     setNoobId("");
     setUsername("");
+    dungeonStateRef.current = null;
     setDungeonState(null);
     setEnergy(null);
     setDungeonToday(null);
@@ -325,7 +329,6 @@ export function useGigaverse() {
     setItemNames({});
     setItemInfo({});
     setEnemyNames({});
-    setEnemyMoveRecords([]);
     setError(null);
     clearAuth();
   }, []);
@@ -403,8 +406,17 @@ export function useGigaverse() {
   const performAction = useCallback(
     async (action: DungeonAction, dungeonId: number = 0) => {
       if (!token) return null;
-      console.log(`[TOKEN] performAction(${action}) sending token=${actionTokenRef.current}`);
-      try {
+
+      // Refs only. The auto-play loops read these synchronously and
+      // deliberately don't depend on a re-render, so recovery paths must not
+      // trigger one mid-run; the success path still publishes to state below.
+      const adoptToken = (t: number) => {
+        actionTokenRef.current = t;
+        fishingActionTokenRef.current = t;
+      };
+
+      const send = async () => {
+        console.log(`[TOKEN] performAction(${action}) sending token=${actionTokenRef.current}`);
         const result = await proxy<DungeonActionResponse>(
           "/api/game/dungeon/action",
           token,
@@ -423,34 +435,66 @@ export function useGigaverse() {
           }
         );
         if (result) {
+          dungeonStateRef.current = result;
           setDungeonState(result);
           if (result.actionToken) {
             console.log(`[TOKEN] performAction(${action}) OK → new token=${result.actionToken}`);
+            adoptToken(result.actionToken);
             setActionToken(result.actionToken);
-            actionTokenRef.current = result.actionToken;
-            fishingActionTokenRef.current = result.actionToken;
           }
         }
         return result;
+      };
+
+      const tokenFrom = (e: unknown) =>
+        (e as Error & { responseData?: { actionToken?: number } }).responseData?.actionToken;
+
+      // No retry here. Feeding the server the exact actionToken it returned in
+      // its own rejection still got refused, so the token is minted per request
+      // and is a symptom rather than the cause — the move itself is what the
+      // server won't accept. Recover the token, report, and let the caller
+      // refetch state and pick again against reality.
+      const believed = dungeonStateRef.current;
+
+      try {
+        return await send();
       } catch (e) {
-        const msg = e instanceof Error ? e.message : "Action failed";
-        const respData = (e as Error & { responseData?: { actionToken?: number } }).responseData;
-        if (respData?.actionToken) {
-          console.log(`[TOKEN] performAction(${action}) FAILED → recovered token=${respData.actionToken} from error response`);
-          actionTokenRef.current = respData.actionToken;
-          fishingActionTokenRef.current = respData.actionToken;
-        } else {
-          console.log(`[TOKEN] performAction(${action}) FAILED → NO token in error response, fetching fresh state`);
-          try {
-            const fresh = await proxy<DungeonActionResponse>("/api/game/dungeon/state", token);
-            if (fresh?.actionToken) {
-              console.log(`[TOKEN] recovered from fetchState → token=${fresh.actionToken}`);
-              actionTokenRef.current = fresh.actionToken;
-              fishingActionTokenRef.current = fresh.actionToken;
-            }
-          } catch { /* ignore */ }
+        const recovered = tokenFrom(e);
+
+        // Always refetch on failure. Two jobs: recover a usable token, and show
+        // what the server thought was going on versus what we believed, which
+        // is the only way to separate a phase desync from an unplayable move.
+        let fresh: DungeonActionResponse | null = null;
+        try {
+          fresh = await proxy<DungeonActionResponse>("/api/game/dungeon/state", token);
+        } catch { /* ignore */ }
+
+        const view = (s: DungeonActionResponse | null) => {
+          const r = s?.data?.run;
+          const p = r?.players?.[0];
+          if (!r) return "no run";
+          return [
+            `loot=${r.lootPhase ? "YES" : "no"}`,
+            `opts=${r.lootOptions?.length ?? 0}`,
+            `room=${s?.data?.entity?.ROOM_NUM_CID ?? "?"}`,
+            p ? `charges r${p.rock.currentCharges}/p${p.paper.currentCharges}/s${p.scissor.currentCharges}` : "no player",
+            p ? `hp=${p.health.current}` : "",
+            `msg=${s?.message ?? ""}`,
+          ].join(" ");
+        };
+
+        console.warn(
+          `[ACTION FAILED] sent "${action}"\n` +
+            `   we believed : ${view(believed)}\n` +
+            `   server says : ${view(fresh)}`
+        );
+
+        if (fresh?.actionToken) {
+          adoptToken(fresh.actionToken);
+        } else if (recovered) {
+          adoptToken(recovered);
         }
-        setError(msg);
+        setError(e instanceof Error ? e.message : "Action failed");
         return null;
       }
     },
@@ -463,6 +507,7 @@ export function useGigaverse() {
     console.log(`[TOKEN] fetchDungeonState (current ref=${actionTokenRef.current})`);
     try {
       const ds = await proxy<DungeonActionResponse>("/api/game/dungeon/state", token);
+      dungeonStateRef.current = ds;
       setDungeonState(ds);
       if (ds.actionToken) {
         console.log(`[TOKEN] fetchDungeonState → new token=${ds.actionToken}`);
@@ -476,8 +521,16 @@ export function useGigaverse() {
     }
   }, [token]);
 
+  /**
+   * Start a dungeon run.
+   *
+   * `entryTier` is the offering index the Forbidden Woods charges a faction
+   * ring for: 1 is free at 1x Hard Cores, 2 costs a Silver ring for 2x, 3 costs
+   * a Golden ring for 4x. `isJuiced` is the per-run mode that charges 3x energy
+   * for 3x rewards — unrelated to the Giga Juice subscription despite the name.
+   */
   const startRun = useCallback(
-    async (dungeonId: number = 0, _isJuiced = false, gearInstanceIds: string[] = []) => {
+    async (dungeonId: number = 0, isJuiced = false, gearInstanceIds: string[] = [], entryTier = 1) => {
       if (!token) return null;
       setLoading(true);
       setError(null);
@@ -495,11 +548,14 @@ export function useGigaverse() {
               consumables: [],
               itemId: 0,
               expectedAmount: 0,
-              index: 0,
+              index: entryTier,
+              isJuiced,
               gearInstanceIds,
+              devBoons: [],
             },
           }
         );
+        dungeonStateRef.current = result;
         setDungeonState(result);
         if (result.actionToken) {
           setActionToken(result.actionToken);
@@ -641,7 +697,20 @@ export function useGigaverse() {
 
   /** Perform a fishing action (start_run or play_cards) */
   const fishingAction = useCallback(
-    async (action: "start_run" | "play_cards" | "loot", data: { cards: number[]; nodeId: string }) => {
+    async (
+      action: "start_run" | "play_cards" | "loot",
+      data: {
+        cards: number[];
+        nodeId: string;
+        /** Grove offering: 1 free at 1x Cores, 2 is 2x, 3 is 4x. 0 elsewhere. */
+        tierId?: number;
+        /** Where the lure sits. Sent on every card play, not a separate action. */
+        focusPoint?: number[];
+        /** Fishing oil to consume, with the slot it occupies */
+        itemId?: number;
+        slotIndex?: number;
+      }
+    ) => {
       if (!token || !address) return null;
 
       const doRequest = async (a: string, tkn: string, d: typeof data) => {
@@ -649,7 +718,20 @@ export function useGigaverse() {
           "/api/fishing/action",
           token,
           "POST",
-          { action: a, actionToken: tkn, data: d }
+          {
+            action: a,
+            actionToken: tkn,
+            // The server expects every field on every action; the classic
+            // ponds simply send the zero values.
+            data: {
+              cards: d.cards,
+              nodeId: d.nodeId,
+              focusPoint: d.focusPoint ?? [],
+              itemId: d.itemId ?? 0,
+              slotIndex: d.slotIndex ?? 0,
+              tierId: d.tierId ?? 0,
+            },
+          }
         );
         if (result) {
           const gd = result.data.doc.data;
@@ -702,6 +784,24 @@ export function useGigaverse() {
               // Use loot action: pick first card + start next cast
               const cardId = state.gameState.data.cardsToAdd[0].id;
               return await doRequest("loot", String(actionTokenRef.current), { cards: [cardId], nodeId: data.nodeId });
+            }
+            // A cast is already open — the server refuses a second start_run,
+            // and retrying it just fails the same way. Adopt the running cast
+            // and let the caller play it out. This happens routinely after
+            // playing in the official client, which leaves a cast mid-flight.
+            if (state?.gameState && !state.gameState.COMPLETE_CID) {
+              setFishingState(state);
+              if (state.actionToken) {
+                setFishingActionToken(state.actionToken);
+                fishingActionTokenRef.current = state.actionToken;
+                actionTokenRef.current = state.actionToken;
+              }
+              return {
+                success: true,
+                message: "Resumed cast already in progress",
+                data: { doc: state.gameState },
+                actionToken: state.actionToken,
+              } as FishingActionResponse;
             }
           } catch { /* fall through */ }
 
@@ -839,7 +939,6 @@ export function useGigaverse() {
     itemNames,
     itemInfo,
     enemyNames,
-    enemyMoveRecords,
     worldRecipes,
     playerRecipes,
     skillTrees,
@@ -853,7 +952,6 @@ export function useGigaverse() {
     // Actions
     connect,
     disconnect,
-    recordEnemyMove,
     refreshAll,
     autoBattleRef,
     lastErrorRef,

@@ -3,27 +3,35 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction } from "@/lib/auto-battle";
-import { pickBestCard } from "@/lib/fishing-ai";
+import { probeEnemyMove } from "@/lib/enemy-probe";
+import { pickBestCard, pickGroveMove, resolveGrid } from "@/lib/fishing-ai";
+import { beginHaulCapture, endHaulCapture } from "@/lib/use-gigaverse";
+import { probeFishMove } from "@/lib/fishing-probe";
 import { Sword, Package, Fish, AlertTriangle, Info, Lightbulb } from "lucide-react";
 import { recordRunAction, getDungeonPerformanceAction } from "./actions";
-import { getMaxRunsPerDay, findDungeonInfo, FISHING } from "@/lib/game-data";
+import { getMaxRunsPerDay, findDungeonInfo, isEventDungeon, isAwakeningActive, castTierForNode, castsUsedToday, pickEntryTier, CLAIM_RECIPES, CLAIM_RECIPE_IDS, AWAKENING, FISHING } from "@/lib/game-data";
 import { buildRecommendation } from "@/lib/energy-advisor";
 import type { AdvisorResult } from "@/lib/energy-advisor";
 
 
 /* ─── Constants ────────────────────────────────────────────── */
 
-const CAST_NODES = FISHING.nodes;
+// The Grove is a node like any other, so the stepper and every nodeId lookup
+// need it in the list while the event is running.
+const CAST_NODES = isAwakeningActive()
+  ? [...FISHING.nodes, AWAKENING.pond]
+  : [...FISHING.nodes];
 
-const RECIPE_ITEMS = {
-  chest: "Recipe#700000",
-  juiceChest: "Recipe#700003",
-  bluePot: "Recipe#700001",
-  tanPot: "Recipe#700002",
-} as const;
+// Recipe ids come from the shared claim table in game-data so this file and
+// the Pots & Chests panel cannot drift apart again.
+const RECIPE_ITEMS = CLAIM_RECIPE_IDS;
+
+/** Item rarity palette, matching the one the rest of the app uses */
+const RARITY_COLORS = ["var(--text-faint)", "var(--green)", "var(--blue)", "var(--gold)", "var(--orange)"];
 
 const PRESETS_KEY = "giga-daily-presets";
 const LAST_ALLOC_KEY = "giga-daily-last";
+const LAST_RUN_KEY = "giga-daily-last-run";
 
 /** Extract loot item names from a recipe response */
 function formatRecipeLoot(
@@ -48,7 +56,6 @@ export interface MissionControlProps {
   addLog: (msg: string) => void;
   handleVote: () => Promise<void>;
   hasVoted: boolean;
-  voting: boolean;
   refreshRunStats: () => void;
 }
 
@@ -85,13 +92,28 @@ interface Preset {
   freeActions: FreeActions;
 }
 
-type StepStatus = "pending" | "running" | "done" | "failed" | "skipped";
+// "skipped" means the plan had nothing to do for this step.
+// "not-run" means the run ended before reaching it — a different fact,
+// and the one that matters after a failure.
+type StepStatus = "pending" | "running" | "done" | "failed" | "skipped" | "not-run";
+
+type LogType = "loot" | "dungeon" | "fishing" | "error" | "info";
+
+interface McLogEntry {
+  id: number;
+  msg: string;
+  type: LogType;
+  ts: number;
+}
 
 interface ExecutionStep {
   id: string;
   label: string;
   status: StepStatus;
+  /** Full detail — itemized where the step spends or liquidates something. */
   detail: string;
+  /** One-line form for the compact plan preview. Falls back to `detail`. */
+  brief?: string;
 }
 
 /* ─── Helpers ──────────────────────────────────────────────── */
@@ -170,11 +192,25 @@ function fmt(n: number): string {
 
 function statusIcon(status: StepStatus): string {
   switch (status) {
-    case "pending": return "\u25CB";  // gray circle
-    case "running": return "\u25CF";  // filled circle (pulsing via CSS)
-    case "done": return "\u2713";     // checkmark
-    case "failed": return "\u2717";   // x mark
-    case "skipped": return "\u2013";  // dash
+    case "pending": return "\u25CB";   // hollow circle
+    case "running": return "\u25CF";   // filled circle (pulsing via CSS)
+    case "done": return "\u2713";      // checkmark
+    case "failed": return "\u2717";    // x mark
+    case "skipped": return "\u2013";   // dash
+    case "not-run": return "\u2298";   // circled slash
+  }
+}
+
+// Glyph + color alone carry the whole status, which a screen reader reads as
+// "x mark, Blue Pot". This is rendered as sr-only text beside the glyph.
+function statusLabel(status: StepStatus): string {
+  switch (status) {
+    case "pending": return "Pending";
+    case "running": return "Running";
+    case "done": return "Done";
+    case "failed": return "Failed";
+    case "skipped": return "Skipped, nothing to do";
+    case "not-run": return "Not run, the run ended first";
   }
 }
 
@@ -185,6 +221,59 @@ function statusColor(status: StepStatus): string {
     case "done": return "var(--green)";
     case "failed": return "var(--red)";
     case "skipped": return "var(--text-faint)";
+    case "not-run": return "var(--text-dim)";
+  }
+}
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Keeps Tab inside an open dialog and restores focus to the trigger on close.
+ * Returns a cleanup function for use as a useEffect teardown.
+ */
+function trapFocus(panel: HTMLElement | null, onEscape: () => void): () => void {
+  const trigger = document.activeElement as HTMLElement | null;
+  panel?.focus();
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") {
+      onEscape();
+      return;
+    }
+    if (e.key !== "Tab" || !panel) return;
+    const items = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+      (el) => el.offsetParent !== null || el === panel
+    );
+    if (items.length === 0) {
+      e.preventDefault();
+      panel.focus();
+      return;
+    }
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey && (active === first || active === panel)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+
+  window.addEventListener("keydown", onKey);
+  return () => {
+    window.removeEventListener("keydown", onKey);
+    trigger?.focus?.();
+  };
+}
+
+function loadLastRun(): string | null {
+  try {
+    return localStorage.getItem(LAST_RUN_KEY);
+  } catch {
+    return null;
   }
 }
 
@@ -197,11 +286,61 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   const cancelRef = useRef(false);
   const [executing, setExecuting] = useState(false);
   const [steps, setSteps] = useState<ExecutionStep[]>([]);
+  const stepsRef = useRef<ExecutionStep[]>([]);
   const [summary, setSummary] = useState<string | null>(null);
-  const [mcLog, setMcLog] = useState<{ id: number; msg: string; type: "loot" | "dungeon" | "fishing" | "error" | "info"; ts: number }[]>([]);
+  // Itemised haul from the last run. Counts alone ("7 fish caught") don't tell
+  // you whether the energy was well spent; the actual items do.
+  const [haul, setHaul] = useState<{ id: number; name: string; amount: number; rarity?: number }[]>([]);
+  const [summaryFailed, setSummaryFailed] = useState(false);
+  // Announced to screen readers one line at a time. The step list itself is
+  // not a live region — re-rendering it on every updateStep would re-announce
+  // the whole plan.
+  const [liveMessage, setLiveMessage] = useState("");
+  const [mcLog, setMcLog] = useState<McLogEntry[]>([]);
   const mcLogIdRef = useRef(0);
   const progressRef = useRef<HTMLDivElement>(null);
+  const modalRef = useRef<HTMLDivElement>(null);
+  const adjustRef = useRef<HTMLDivElement>(null);
   const [showModal, setShowModal] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [adjusting, setAdjusting] = useState(false);
+  const [adjustSection, setAdjustSection] = useState<"energy" | "free" | "merchant" | "presets">("energy");
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmTrade, setConfirmTrade] = useState<string | null>(null);
+  const [confirmRepairAll, setConfirmRepairAll] = useState(false);
+  const restoredEmptyRef = useRef(false);
+  const autoAppliedRef = useRef(false);
+
+  // Restore the last run's summary so a reload mid-run or after one doesn't
+  // erase the record of what was spent.
+  useEffect(() => {
+    const last = loadLastRun();
+    if (last) {
+      setSummary(last);
+      setSummaryFailed(last.startsWith("Run stopped"));
+    }
+  }, []);
+
+  // Two-press confirmations disarm on a timer rather than on blur, so tabbing
+  // to read the confirm label doesn't silently cancel it.
+  useEffect(() => {
+    if (!confirmDelete) return;
+    const t = setTimeout(() => setConfirmDelete(null), 5000);
+    return () => clearTimeout(t);
+  }, [confirmDelete]);
+
+  useEffect(() => {
+    if (!confirmTrade) return;
+    const t = setTimeout(() => setConfirmTrade(null), 5000);
+    return () => clearTimeout(t);
+  }, [confirmTrade]);
+
+  useEffect(() => {
+    if (!confirmRepairAll) return;
+    const t = setTimeout(() => setConfirmRepairAll(false), 5000);
+    return () => clearTimeout(t);
+  }, [confirmRepairAll]);
 
 
   // Presets
@@ -245,7 +384,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     const last = loadLastAlloc();
 
     // Filter out item-cost dungeons (like Temporal Void) that don't use energy
-    const currentEnergy = Math.floor(eng?.energy ?? 0);
+    const currentEnergy = Math.floor(eng?.energyValue ?? 0);
     let energyBudget = currentEnergy;
 
     const allocs = dungeons.filter((d) => d.ENERGY_CID > 0).map((d) => {
@@ -289,13 +428,17 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     if (last?.freeActions) {
       setFreeActions(last.freeActions);
     }
+
+    // Plan-first: if nothing was restored, the advisor's plan fills in once it's ready
+    restoredEmptyRef.current =
+      allocs.every((a) => a.runs === 0) && !(last?.fishingAlloc && last.fishingAlloc.casts > 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dungeons.length]);
 
   // Fishing state
   const fs = giga.fishingState;
   const isJuiced = eng?.isPlayerJuiced ?? false;
-  const castsToday = fs?.dayDoc?.UINT256_CID ?? 0;
+  const castsToday = castsUsedToday(fs);
   const maxCasts = isJuiced
     ? (fs?.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
     : (fs?.maxPerDay ?? FISHING.maxCastsPerDay);
@@ -306,7 +449,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     const maxC = isJuiced
       ? (fishState.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
       : (fishState.maxPerDay ?? FISHING.maxCastsPerDay);
-    const remaining = Math.max(0, maxC - (fishState.dayDoc?.UINT256_CID ?? 0));
+    const remaining = Math.max(0, maxC - castsUsedToday(fishState));
     if (remaining <= 0) return "0";
     const bigCasts = Math.min(remaining, Math.floor(energy / (fishState.node2Energy || 20)));
     const normalCasts = Math.min(remaining, Math.floor(energy / (fishState.node1Energy || 16)));
@@ -317,6 +460,18 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     return "0";
   }
 
+  // Execution order. During The Awakening, Core-yielding dungeons run first:
+  // if a run fails or energy comes up short, the spend that survives should be
+  // the one that expires with the event, not the scrap that's farmable forever.
+  // Both the previewed step list and the executor read this, so what the plan
+  // shows is the order it actually runs in.
+  const orderedDungeonAllocs = useMemo(() => {
+    if (!isAwakeningActive()) return dungeonAllocs;
+    return [...dungeonAllocs].sort(
+      (a, b) => Number(isEventDungeon(b.name)) - Number(isEventDungeon(a.name))
+    );
+  }, [dungeonAllocs]);
+
   // Allocated energy
   const dungeonEnergy = dungeonAllocs.reduce((s, d) => s + d.runs * d.energyCost, 0);
   const fishingEnergy = fishingAlloc.casts * fishingAlloc.castCost;
@@ -326,17 +481,25 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   const roms = giga.roms?.entities ?? [];
   const totalRomE = roms.reduce((s, r) => s + Math.floor(r.factoryStats.energyCollectable), 0);
   // Energy the plan can actually spend: pool + ROM energy when it will be
-  // claimed as energy before the runs start
-  const effectiveEnergy = currentEnergy + (freeActions.romEnergyMode === "claim" ? totalRomE : 0);
+  // claimed as energy before the runs start. A claim can't push the pool past
+  // its cap, so only the headroom counts — budgeting the full ROM balance at
+  // full energy plans a run that can't be paid for.
+  const romEnergyClaimable = Math.min(totalRomE, Math.max(0, maxEnergy - currentEnergy));
+  const effectiveEnergy =
+    currentEnergy + (freeActions.romEnergyMode === "claim" ? romEnergyClaimable : 0);
   const totalRomS = roms.reduce((s, r) => s + Math.floor(r.factoryStats.shardCollectable), 0);
   const totalRomD = roms.reduce((s, r) => s + Math.floor(r.factoryStats.dustCollectable), 0);
 
   // Recipe cooldowns
   const chestCd = getCooldownInfo(RECIPE_ITEMS.chest, giga.worldRecipes, giga.playerRecipes);
   const juiceChestCd = getCooldownInfo(RECIPE_ITEMS.juiceChest, giga.worldRecipes, giga.playerRecipes);
+  const juiceChestForestCd = getCooldownInfo(RECIPE_ITEMS.juiceChestForest, giga.worldRecipes, giga.playerRecipes);
   const bluePotCd = getCooldownInfo(RECIPE_ITEMS.bluePot, giga.worldRecipes, giga.playerRecipes);
   const tanPotCd = getCooldownInfo(RECIPE_ITEMS.tanPot, giga.worldRecipes, giga.playerRecipes);
-  const chestsReady = !chestCd.onCooldown || (!juiceChestCd.onCooldown && (eng?.isPlayerJuiced ?? false));
+  const juicedNow = eng?.isPlayerJuiced ?? false;
+  const chestsReady =
+    !chestCd.onCooldown ||
+    (juicedNow && (!juiceChestCd.onCooldown || !juiceChestForestCd.onCooldown));
 
   // Find hands gear for pots
   const findHandsGear = (handsType: "Paper Hands" | "Rock Hands"): string => {
@@ -413,9 +576,13 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           winRate: perf && perf.total_runs > 0 ? perf.wins / perf.total_runs : null,
           avgRooms: perf?.avg_rooms ?? null,
           totalRuns: perf?.total_runs ?? 0,
+          eventPriority: isEventDungeon(d.name),
         };
       }),
       fishingCastsLeft: remainingCasts,
+      // The Grove shares the daily cast pool, so this redirects casts rather
+      // than adding any. Gated on the event so it lapses on its own end date.
+      eventFishingNode: isAwakeningActive() ? { ...AWAKENING.pond } : undefined,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dungeonAllocs, currentEnergy, maxEnergy, isJuiced, totalRomE, dungeonPerf, remainingCasts]);
@@ -440,12 +607,26 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     }
   };
 
+  // Land on the advisor's plan when there's nothing saved to restore
+  useEffect(() => {
+    if (autoAppliedRef.current || !restoredEmptyRef.current || !recommendation) return;
+    if (dungeonAllocs.length === 0) return;
+    autoAppliedRef.current = true;
+    applyRecommendation();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recommendation, dungeonAllocs.length]);
+
   // Event dungeons (Void): item-based entry, not part of the energy plan
   const eventDungeons = dungeons.filter((d) => d.ENERGY_CID === 0 && (d.entryData?.length ?? 0) > 0);
 
+  // Gear the server has told us is out of repairs this session. It reports
+  // "already at max repair count N of N" and publishes no constant for that
+  // ceiling, so the ceiling is learned rather than guessed.
+  const [unrepairable, setUnrepairable] = useState<Set<string>>(new Set());
+
   // Gear that's broken or one use from it — only gear the daily loop needs
   // (equipped dungeon gear, hands for pots, rods/lures for fishing)
-  const wornGear = useMemo(() => {
+  const allWornGear = useMemo(() => {
     const out: { docId: string; name: string; durability: number; equipped: boolean }[] = [];
     for (const g of giga.gearInstances?.entities ?? []) {
       const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || `Gear #${g.GAME_ITEM_ID_CID}`;
@@ -461,24 +642,46 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     return out;
   }, [giga.gearInstances, giga.itemInfo]);
 
+  // Still worn, but repair will be refused — these need the restore flow, so
+  // they stay visible as a warning and out of every repair attempt.
+  const exhaustedGear = useMemo(
+    () => allWornGear.filter((g) => unrepairable.has(g.docId)),
+    [allWornGear, unrepairable]
+  );
+  const wornGear = useMemo(
+    () => allWornGear.filter((g) => !unrepairable.has(g.docId)),
+    [allWornGear, unrepairable]
+  );
+
   const [repairing, setRepairing] = useState(false);
+
   const repairWorn = useCallback(async (items: { docId: string; name: string }[], log?: (m: string) => void) => {
     const emit = log ?? addLog;
     setRepairing(true);
     let repaired = 0;
+    const exhausted: string[] = [];
     try {
       for (const item of items) {
         const r = await gigaRef.current.repairGear(item.docId);
-        if (r?.success === false) {
-          emit(`Repair ${item.name}: ${r.message || "failed (out of repairs?)"}`);
-        } else {
+        // repairGear swallows transport errors and returns null, so anything
+        // that isn't an explicit success is a failure — reporting null as
+        // "Repaired" is how a 500 used to look like it worked.
+        const ok = r != null && r.success !== false;
+        if (ok) {
           repaired++;
           emit(`Repaired ${item.name}`);
+        } else {
+          const msg = r?.message || gigaRef.current.lastErrorRef.current || "failed";
+          emit(`Repair ${item.name}: ${msg}`);
+          if (/max repair count/i.test(msg)) exhausted.push(item.docId);
         }
         await delay(300);
       }
     } finally {
       setRepairing(false);
+      if (exhausted.length > 0) {
+        setUnrepairable((prev) => new Set([...prev, ...exhausted]));
+      }
     }
     return repaired;
   }, [addLog]);
@@ -526,6 +729,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     });
   }, [giga.vendorListings, giga.itemInfo, giga.itemNames, giga.itemBalances]);
 
+  // The Merchant tab only exists while there are deals to show
+  useEffect(() => {
+    if (adjustSection === "merchant" && merchantDeals.length === 0) setAdjustSection("energy");
+  }, [adjustSection, merchantDeals.length]);
+
   /* ─── Stepper helpers ────────────────────────────────────── */
 
   const adjustDungeon = (idx: number, delta: number) => {
@@ -559,6 +767,25 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       castLabel: node.label,
       casts: Math.min(prev.casts, Math.floor(currentEnergy / node.cost)),
     }));
+  };
+
+  const maxDungeon = (idx: number) => {
+    setDungeonAllocs((prev) => {
+      const next = [...prev];
+      const d = next[idx];
+      const spare = effectiveEnergy - allocatedEnergy;
+      const affordable = d.runs + Math.floor(spare / d.energyCost);
+      next[idx] = { ...d, runs: Math.max(0, Math.min(d.maxRuns, affordable)) };
+      return next;
+    });
+  };
+
+  const maxFishing = () => {
+    setFishingAlloc((prev) => {
+      const spare = effectiveEnergy - allocatedEnergy;
+      const affordable = prev.casts + Math.floor(spare / prev.castCost);
+      return { ...prev, casts: Math.max(0, Math.min(remainingCasts, affordable)) };
+    });
   };
 
   /* ─── Preset handlers ───────────────────────────────────── */
@@ -601,37 +828,80 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   /* ─── Execution Engine ──────────────────────────────────── */
 
   const updateStep = useCallback((id: string, update: Partial<ExecutionStep>) => {
-    setSteps((prev) => prev.map((s) => (s.id === id ? { ...s, ...update } : s)));
+    setSteps((prev) => {
+      const next = prev.map((s) => {
+        if (s.id !== id) return s;
+        // Announce only status changes — detail updates fire once per dungeon
+        // room and would flood the live region.
+        if (update.status && update.status !== s.status) {
+          setLiveMessage(`${s.label}: ${statusLabel(update.status).toLowerCase()}`);
+        }
+        return { ...s, ...update };
+      });
+      stepsRef.current = next;
+      return next;
+    });
   }, []);
 
-  const execute = async () => {
-    cancelRef.current = false;
-    setExecuting(true);
-    setSummary(null);
-    setMcLog([]);
-    mcLogIdRef.current = 0;
-    gigaRef.current.autoBattleRef.current = true;
+  // The summary has to report what actually happened, including steps that
+  // failed or never ran. Reading the live step list from a ref keeps that
+  // honest without waiting for a state flush.
+  const finishRun = useCallback(
+    (
+      outcome: "done" | "cancelled" | "error",
+      stats: { dungeonRuns: number; dungeonWins: number; fishCasts: number; fishCaught: number; seaweedEarned: number },
+      errorMessage?: string
+    ) => {
+      const parts: string[] = [];
+      if (stats.dungeonRuns > 0) parts.push(`${stats.dungeonRuns} dungeon runs (${stats.dungeonWins}W)`);
+      if (stats.fishCasts > 0) parts.push(`${stats.fishCasts} casts, ${stats.fishCaught} fish caught`);
+      if (stats.seaweedEarned > 0) parts.push(`${fmt(stats.seaweedEarned)} seaweed earned`);
 
-    const g = () => gigaRef.current;
+      const failed = stepsRef.current.filter((s) => s.status === "failed").length;
+      const notRun = stepsRef.current.filter((s) => s.status === "not-run").length;
+      if (failed > 0) parts.push(`${failed} step${failed === 1 ? "" : "s"} failed`);
+      if (notRun > 0) parts.push(`${notRun} never ran`);
 
-    // Log to both parent log and local MC log panel
-    const log = (msg: string) => {
-      addLog(msg);
-      const id = ++mcLogIdRef.current;
-      const type: "loot" | "dungeon" | "fishing" | "error" | "info" =
-        msg.startsWith("Loot:") ? "loot"
-        : /^(Starting |.*run \d|reached room|Stuck run|Active dungeon|Collecting loot|Cannot advance|Cleaning up)/.test(msg) ? "dungeon"
-        : /^(Fishing|Caught|Fish escaped|Sold|Active fishing|Previous catch|Card play)/.test(msg) ? "fishing"
-        : /^(Error:|.*failed|Could not|Sell failed|Cannot)/.test(msg) ? "error"
-        : "info";
-      setMcLog((prev) => [...prev, { id, msg, type, ts: Date.now() }]);
-    };
+      const done = parts.length > 0 ? parts.join(", ") : "nothing to report";
+      const text =
+        outcome === "error"
+          ? `Run stopped after an error: ${errorMessage}. ${done}.`
+          : outcome === "cancelled"
+          ? `Stopped by you. ${done}.`
+          : `Done! ${done}.`;
 
-    // Build step list
+      // Close the capture even on error or cancel — a partial run still earned
+      // whatever it earned, and that is exactly when you want to see it.
+      const deltas = endHaulCapture();
+      const info = gigaRef.current.itemInfo;
+      const names = gigaRef.current.itemNames;
+      setHaul(
+        deltas
+          .map((d) => ({
+            id: d.id,
+            name: info[String(d.id)]?.name || names[String(d.id)] || `Item #${d.id}`,
+            amount: d.amount,
+            rarity: info[String(d.id)]?.rarity,
+          }))
+          .sort((a, b) => b.amount - a.amount)
+      );
+
+      setSummary(text);
+      setSummaryFailed(outcome !== "done" || failed > 0);
+      setLiveMessage(text);
+      try {
+        localStorage.setItem(LAST_RUN_KEY, text);
+      } catch { /* private mode / quota — the in-session summary still stands */ }
+    },
+    []
+  );
+
+  // Builds the plan's step list from current state. Used three ways: the
+  // Today's Plan preview, the review modal, and the execution run itself.
+  const buildStepList = (): ExecutionStep[] => {
     const stepList: ExecutionStep[] = [];
-    const gearToRepair = [...wornGear];
-    if (freeActions.repairGear && gearToRepair.length > 0)
-      stepList.push({ id: "repair-gear", label: "Repair worn gear", status: "pending", detail: gearToRepair.map((g) => g.name).join(", ") });
+    if (freeActions.repairGear && wornGear.length > 0)
+      stepList.push({ id: "repair-gear", label: "Repair worn gear", status: "pending", detail: wornGear.map((g) => g.name).join(", ") });
     if (freeActions.claimRomResources && (totalRomS > 0 || totalRomD > 0))
       stepList.push({ id: "claim-roms", label: "Claim ROM shards & dust", status: "pending", detail: `${fmt(totalRomS)}S / ${fmt(totalRomD)}D` });
     if (freeActions.romEnergyMode === "convert" && totalRomE > 0)
@@ -646,9 +916,24 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       stepList.push({ id: "vote", label: "Vote on Abstract Portal", status: "pending", detail: "" });
     const hugisDeals = merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped);
     if (freeActions.tradeHugis && hugisDeals.length > 0)
-      stepList.push({ id: "hugis", label: "Traveling merchant trades", status: "pending", detail: `${hugisDeals.length} deal${hugisDeals.length === 1 ? "" : "s"}` });
+      stepList.push({
+        id: "hugis",
+        label: "Traveling merchant trades",
+        status: "pending",
+        // Itemized: these trades permanently remove materials from inventory,
+        // so the review has to show what leaves and what arrives.
+        detail: hugisDeals
+          .map(
+            (d) =>
+              `${d.inputs.map((i) => `${i.amount}x ${i.name}`).join(" + ")} → ${
+                d.outputs.map((o) => `${o.amount}x ${o.name}`).join(" + ") || d.name
+              }`
+          )
+          .join("\n"),
+        brief: `${hugisDeals.length} deal${hugisDeals.length === 1 ? "" : "s"}`,
+      });
 
-    for (const d of dungeonAllocs) {
+    for (const d of orderedDungeonAllocs) {
       if (d.runs > 0) {
         stepList.push({ id: `dungeon-${d.dungeonId}`, label: `${d.name} x${d.runs}`, status: "pending", detail: `${d.runs * d.energyCost}E` });
       }
@@ -657,9 +942,55 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       stepList.push({ id: "fishing", label: `Fishing ${fishingAlloc.castLabel} x${fishingAlloc.casts}`, status: "pending", detail: `${fishingAlloc.casts * fishingAlloc.castCost}E` });
     }
     if (freeActions.sellFish && fishStallInfo.totalCount > 0) {
-      stepList.push({ id: "sell-fish", label: `Sell +50% fish`, status: "pending", detail: `${fmt(fishStallInfo.totalCount)} fish` });
+      const byFish = fishStallInfo.fish
+        .map((f) => {
+          const name = giga.itemInfo[String(f.id)]?.name || giga.itemNames[String(f.id)] || `#${f.id}`;
+          return `${f.qty}x ${name} (+${f.pct}%)`;
+        })
+        .join("\n");
+      stepList.push({
+        id: "sell-fish",
+        label: "Sell +50% fish",
+        status: "pending",
+        // Liquidating inventory — name every fish, not just the count.
+        detail: `${byFish}\n${fmt(fishStallInfo.totalCount)} fish → ~${fmt(fishStallInfo.totalSeaweed)} seaweed`,
+        brief: `${fmt(fishStallInfo.totalCount)} fish → ~${fmt(fishStallInfo.totalSeaweed)} seaweed`,
+      });
     }
+    return stepList;
+  };
 
+  const execute = async () => {
+    cancelRef.current = false;
+    setExecuting(true);
+    setSummary(null);
+    setSummaryFailed(false);
+    setHaul([]);
+    beginHaulCapture();
+    setLiveMessage("Run started");
+    setMcLog([]);
+    mcLogIdRef.current = 0;
+    gigaRef.current.autoBattleRef.current = true;
+
+    const g = () => gigaRef.current;
+
+    // Log to both parent log and local MC log panel. The type is passed in
+    // rather than inferred from the prose — matching English with a regex made
+    // every copy edit silently reclassify an entry's icon and color.
+    const log = (msg: string, type: LogType = "info") => {
+      addLog(msg);
+      const id = ++mcLogIdRef.current;
+      setMcLog((prev) => [...prev, { id, msg, type, ts: Date.now() }]);
+      // Errors are the one log class worth interrupting a screen reader for.
+      if (type === "error") setLiveMessage(msg);
+    };
+
+    // Build step list
+    const stepList = buildStepList();
+    const gearToRepair = [...wornGear];
+    const hugisDeals = merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped);
+
+    stepsRef.current = stepList;
     setSteps(stepList);
 
     setShowModal(true);
@@ -750,29 +1081,39 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
               const msg = loot.length > 0 ? `Chest opened — ${loot.join(", ")}` : "Chest opened";
               results.push(msg);
-              log(msg);
+              log(msg, "loot");
             } else {
               const msg = `Chest: ${(r as { message?: string })?.message || "failed"}`;
               results.push(msg);
-              log(msg);
+              log(msg, "error");
             }
           } catch (e) { results.push(`Chest: ${e instanceof Error ? e.message : "error"}`); }
           await delay(200);
         }
-        if (!juiceChestCd.onCooldown && (g().energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false)) {
+        // Both juiced chests: the original and the Awakening forest one. They
+        // are separate weekly claims on separate cooldowns.
+        const juicedChests = CLAIM_RECIPES.filter((r) => r.needsJuice && !r.handsType).map((r) => ({
+          recipe: r.id,
+          label: r.label,
+          ready: !getCooldownInfo(r.id, g().worldRecipes, g().playerRecipes).onCooldown,
+        }));
+        for (const jc of juicedChests) {
+          if (!jc.ready) continue;
+          if (!(g().energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false)) continue;
           try {
-            const r = await g().useRecipe(RECIPE_ITEMS.juiceChest);
+            const r = await g().useRecipe(jc.recipe);
             if (r?.success !== false) {
               const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
-              const msg = loot.length > 0 ? `Juice Chest opened — ${loot.join(", ")}` : "Juice Chest opened";
+              const msg = loot.length > 0 ? `${jc.label} opened — ${loot.join(", ")}` : `${jc.label} opened`;
               results.push(msg);
-              log(msg);
+              log(msg, "loot");
             } else {
-              const msg = `Juice Chest: ${(r as { message?: string })?.message || "failed"}`;
+              const msg = `${jc.label}: ${(r as { message?: string })?.message || "failed"}`;
               results.push(msg);
-              log(msg);
+              log(msg, "error");
             }
-          } catch (e) { results.push(`Juice Chest: ${e instanceof Error ? e.message : "error"}`); }
+          } catch (e) { results.push(`${jc.label}: ${e instanceof Error ? e.message : "error"}`); }
+          await delay(200);
         }
         updateStep("open-chests", { status: "done", detail: results.join(", ") });
       }
@@ -789,11 +1130,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
               const msg = loot.length > 0 ? `Blue Pot broken — ${loot.join(", ")}` : "Blue Pot broken";
               results.push(msg);
-              log(msg);
+              log(msg, "loot");
             } else {
               const msg = `Blue Pot: ${(r as { message?: string })?.message || "failed"}`;
               results.push(msg);
-              log(msg);
+              log(msg, "error");
             }
           } catch (e) { results.push(`Blue Pot: ${e instanceof Error ? e.message : "error"}`); }
           await delay(200);
@@ -805,11 +1146,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
               const msg = loot.length > 0 ? `Tan Pot broken — ${loot.join(", ")}` : "Tan Pot broken";
               results.push(msg);
-              log(msg);
+              log(msg, "loot");
             } else {
               const msg = `Tan Pot: ${(r as { message?: string })?.message || "failed"}`;
               results.push(msg);
-              log(msg);
+              log(msg, "error");
             }
           } catch (e) { results.push(`Tan Pot: ${e instanceof Error ? e.message : "error"}`); }
         }
@@ -849,14 +1190,14 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               if (r?.success === false) {
                 const msg = `${deal.name}: ${(r as { message?: string })?.message || "failed"}`;
                 results.push(msg);
-                log(msg);
+                log(msg, "error");
                 break;
               }
               trades++;
               const loot = formatRecipeLoot(r, g().itemInfo, g().itemNames);
               const msg = loot.length > 0 ? `${deal.name} — ${loot.join(", ")}` : `${deal.name} traded`;
               results.push(msg);
-              log(msg);
+              log(msg, "loot");
             } catch (e) {
               results.push(`${deal.name}: ${e instanceof Error ? e.message : "error"}`);
               break;
@@ -879,27 +1220,27 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
       // If there's a stuck/active run, play through it (combat + loot)
       if (preState?.data?.run) {
-        log(`Active dungeon run found (${preState.message}, loot=${preState.data.run.lootPhase}), finishing it...`);
+        log(`Active dungeon run found (${preState.message}, loot=${preState.data.run.lootPhase}), finishing it...`, "dungeon");
         let s = preState;
         for (let i = 0; i < 150 && s?.data?.run; i++) {
           if (cancelRef.current) break;
           // Run fully complete and no loot pending — done
           if (s.message === "Run Complete" && !s.data.run.lootPhase) break;
 
-          let action = pickBestAction(s, g().enemyMoveRecords, g().enemyNames);
+          let action = pickBestAction(s, g().enemyNames);
           // If in loot phase but pickBestAction can't see options, default to loot_one
           if (!action && s.data.run.lootPhase) {
-            log(`Collecting loot...`);
+            log(`Collecting loot...`, "dungeon");
             action = "loot_one";
           }
           if (!action) {
-            log(`Cannot advance stuck run`);
+            log(`Cannot advance stuck run`, "error");
             break;
           }
 
           const result = await g().performAction(action);
           if (!result) {
-            log(`Action failed during stuck run, recovering...`);
+            log(`Action failed during stuck run, recovering...`, "error");
             const fresh = await g().fetchDungeonState();
             if (fresh) { s = fresh; await delay(150); continue; }
             break;
@@ -907,13 +1248,13 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           s = result;
           await delay(150);
         }
-        log(`Stuck run finished (${s?.message})`);
+        log(`Stuck run finished (${s?.message})`, "dungeon");
         await g().fetchDungeonState();
         await delay(500);
       }
 
       // 6. Dungeon runs
-      for (const alloc of dungeonAllocs) {
+      for (const alloc of orderedDungeonAllocs) {
         if (alloc.runs <= 0) continue;
         const stepId = `dungeon-${alloc.dungeonId}`;
         if (cancelRef.current) { updateStep(stepId, { status: "skipped" }); continue; }
@@ -925,16 +1266,26 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         for (let run = 0; run < alloc.runs; run++) {
           if (cancelRef.current) break;
           updateStep(stepId, { detail: `Run ${run + 1}/${alloc.runs} starting...` });
-          log(`Starting ${alloc.name} run ${run + 1}/${alloc.runs}`);
+          log(`Starting ${alloc.name} run ${run + 1}/${alloc.runs}`, "dungeon");
 
           try {
-            let startResult = await g().startRun(alloc.dungeonId);
+            // Highest offering we can pay for from inventory. The server picks
+            // which faction ring it wants, so a rejected tier retries at 1
+            // rather than losing the run.
+            const dungeonData = dungeons.find((d) => d.ID_CID === alloc.dungeonId);
+            const entryTier = pickEntryTier(dungeonData?.entryData, giga.itemBalances);
+            let startResult = await g().startRun(alloc.dungeonId, false, [], entryTier);
+            if (!startResult && entryTier > 1) {
+              log(`${alloc.name}: tier ${entryTier} offering refused, entering at tier 1`, "dungeon");
+              await delay(300);
+              startResult = await g().startRun(alloc.dungeonId, false, [], 1);
+            }
 
             if (!startResult || startResult.success === false) {
               await delay(500);
               startResult = await g().startRun(alloc.dungeonId);
               if (!startResult || startResult.success === false) {
-                log(`Could not start ${alloc.name}: ${g().lastErrorRef.current || "unknown"}`);
+                log(`Could not start ${alloc.name}: ${g().lastErrorRef.current || "unknown"}`, "error");
                 runResults.push(...Array(alloc.runs - run).fill("err"));
                 break;
               }
@@ -954,7 +1305,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   const name = g().itemInfo[String(c.id)]?.name || g().itemNames[String(c.id)] || `#${c.id}`;
                   const prev = runItems.get(c.id);
                   runItems.set(c.id, { name, amount: (prev?.amount ?? 0) + c.amount });
-                  log(`Loot: ${c.amount}x ${name}`);
+                  log(`Loot: ${c.amount}x ${name}`, "loot");
                 }
               }
             };
@@ -977,13 +1328,13 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               if (battleState.message === "Run Complete" && !battleState.data?.run?.lootPhase) {
                 complete = true;
                 runResults.push(String(curRoom));
-                log(`${alloc.name} run ${run + 1}: reached room ${curRoom}`);
+                log(`${alloc.name} run ${run + 1}: reached room ${curRoom}`, "dungeon");
                 break;
               }
 
               // Loot phase
               if (battleState.data?.run?.lootPhase) {
-                const lootAction = pickBestAction(battleState, g().enemyMoveRecords, g().enemyNames);
+                const lootAction = pickBestAction(battleState, g().enemyNames);
                 if (lootAction) {
                   const lootResult = await g().performAction(lootAction);
                   if (lootResult) {
@@ -991,7 +1342,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                     trackLoot(lootResult);
                   } else {
                     // Token desync — fetch fresh state to recover
-                    log(`Loot action failed, recovering state...`);
+                    log(`Loot action failed, recovering state...`, "error");
                     const fresh = await g().fetchDungeonState();
                     if (fresh) { battleState = fresh; trackLoot(fresh); }
                     else break;
@@ -1001,16 +1352,27 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 }
               }
 
-              const action = pickBestAction(battleState, g().enemyMoveRecords, g().enemyNames);
-              if (!action) break;
+              const action = pickBestAction(battleState, g().enemyNames);
+              if (!action) {
+                // No legal action means this run is over — usually death.
+                // runResults is shared across the whole allocation, so leaving
+                // without recording the room makes the next reader inherit the
+                // PREVIOUS run's room and win flag, writing a phantom clear
+                // into the history the advisor ranks dungeons by.
+                runResults.push(String(battleState.data?.entity?.ROOM_NUM_CID ?? lastRoom));
+                break;
+              }
 
+              // Enemy charges as they stood before this exchange — the probe
+              // can't recover them from the post-action state.
+              const enemyBefore = battleState.data?.run?.players?.[1] ?? null;
               const result = await g().performAction(action);
               if (!result) {
                 const fresh = await g().fetchDungeonState();
                 if (!fresh?.data?.run || fresh.message === "Run Complete") {
                   const room = fresh?.data?.entity?.ROOM_NUM_CID ?? lastRoom;
                   runResults.push(String(room));
-                  log(`${alloc.name} run ${run + 1}: reached room ${room}`);
+                  log(`${alloc.name} run ${run + 1}: reached room ${room}`, "dungeon");
                   trackLoot(fresh!);
                   complete = true;
                   break;
@@ -1025,23 +1387,22 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               battleState = result;
               trackLoot(result);
 
-              // Record enemy move
+              // Opt-in probe: validates that enemy charges deplete and scores
+              // the predictor against its 1/3 baseline. No-op unless enabled.
               const enemy = result.data?.run?.players?.[1];
               const entity = result.data?.entity;
               if (enemy?.lastMove && entity && entity.ENEMY_CID >= 0) {
-                const totalMaxCharges = 9;
-                const curCharges = (["rock", "paper", "scissor"] as const).reduce(
-                  (sum, m) => sum + Math.max(0, enemy[m].currentCharges), 0
-                );
-                const roundEst = Math.max(0, totalMaxCharges - curCharges - 1);
-                g().recordEnemyMove(entity.ENEMY_CID, entity.ROOM_NUM_CID, entity.DUNGEON_ID_CID, entity.LEVEL_CID, enemy.lastMove, roundEst);
+                const stats =
+                  g().enemyNames[String(entity.ENEMY_CID)]?.stats ??
+                  g().enemyNames[`idx:${entity.ENEMY_CID}`]?.stats;
+                probeEnemyMove(enemyBefore, enemy, entity.ENEMY_CID, entity.ROOM_NUM_CID, stats, result.data?.run?.players?.[0]);
               }
 
               if (result.message === "Run Complete" && !result.data?.run?.lootPhase) {
                 complete = true;
                 const room = result.data?.entity?.ROOM_NUM_CID ?? lastRoom;
                 runResults.push(String(room));
-                log(`${alloc.name} run ${run + 1}: reached room ${room}`);
+                log(`${alloc.name} run ${run + 1}: reached room ${room}`, "dungeon");
               }
 
               await delay(150);
@@ -1057,7 +1418,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               items, [], g().address
             ).catch(() => {});
           } catch (e) {
-            log(`Error: ${e instanceof Error ? e.message : "unknown"}`);
+            log(`Error: ${e instanceof Error ? e.message : "unknown"}`, "error");
             runResults.push("err");
           }
 
@@ -1088,12 +1449,12 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         const interState = await g().fetchDungeonState();
         // If there's a stuck/active run (e.g. uncollected loot), finish it
         if (interState?.data?.run) {
-          log(`Cleaning up pending run between allocs (${interState.message}, loot=${interState.data.run.lootPhase})`);
+          log(`Cleaning up pending run between allocs (${interState.message}, loot=${interState.data.run.lootPhase})`, "dungeon");
           let s = interState;
           for (let i = 0; i < 50 && s?.data?.run; i++) {
             if (cancelRef.current) break;
             if (s.message === "Run Complete" && !s.data.run.lootPhase) break;
-            let action = pickBestAction(s, g().enemyMoveRecords, g().enemyNames);
+            let action = pickBestAction(s, g().enemyNames);
             if (!action && s.data.run.lootPhase) action = "loot_one";
             if (!action) break;
             const result = await g().performAction(action);
@@ -1124,10 +1485,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           let pendingCardsToAdd: { id: number }[] | null = null;
           if (preFish?.gameState?.COMPLETE_CID && preFish.gameState.SUCCESS_CID) {
             pendingCardsToAdd = preFish.gameState.data?.cardsToAdd ?? null;
-            log(`Previous catch pending, cards to pick: ${pendingCardsToAdd?.map(c => c.id).join(", ") ?? "none"}`);
+            log(`Previous catch pending, cards to pick: ${pendingCardsToAdd?.map(c => c.id).join(", ") ?? "none"}`, "fishing");
           } else if (preFish?.gameState?.data && !preFish.gameState.COMPLETE_CID) {
             // Active in-progress game — play through it first
-            log(`Active fishing game found, finishing it...`);
+            log(`Active fishing game found, finishing it...`, "fishing");
             for (let i = 0; i < 50; i++) {
               if (cancelRef.current) break;
               const fs = await g().fetchFishingState();
@@ -1139,9 +1500,22 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               }
               const gd = fs.gameState.data;
               if (!gd.hand || gd.hand.length === 0) { await delay(300); continue; }
-              const best = pickBestCard(gd.hand, gd.deckCardData, gd.fishPosition, gd.previousFishPosition, gd.nextPosition);
-              const cr = await g().fishingAction("play_cards", { cards: [best.handIndex], nodeId: "" });
+              // The Grove picks card and lure together; other ponds keep the
+              // board-cell path.
+              const grove = gd.focusMechanicEnabled ? pickGroveMove(gd) : null;
+              if (gd.focusMechanicEnabled && !grove) break;
+              const best = grove
+                ? { handIndex: grove.handIndex }
+                : pickBestCard(
+                    gd.hand, gd.deckCardData, gd.fishPosition, gd.previousFishPosition, gd.nextPosition,
+                    resolveGrid(gd)
+                  );
+              const cr = await g().fishingAction("play_cards", {
+                cards: [best.handIndex], nodeId: "",
+                focusPoint: grove ? grove.focusPoint : (gd.focusPoint ?? []),
+              });
               if (!cr) break;
+              probeFishMove(gd, cr.data.doc.data);
               if (cr.data.doc.COMPLETE_CID) {
                 if (cr.data.doc.SUCCESS_CID) {
                   pendingCardsToAdd = cr.data.doc.data?.cardsToAdd ?? null;
@@ -1152,10 +1526,25 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             }
           }
 
+          let stoppedShort = "";
           for (let cast = 0; cast < fishingAlloc.casts; cast++) {
             if (cancelRef.current) break;
+
+            // The plan's energy budget was computed before the run started;
+            // dungeons may have spent more than projected. Both "start_run" and
+            // "loot" begin a new cast, so an unaffordable one is rejected
+            // outright — check against live energy first.
+            const liveEnergy = Math.floor(
+              g().energy?.entities?.[0]?.parsedData?.energyValue ?? 0
+            );
+            if (liveEnergy < fishingAlloc.castCost) {
+              stoppedShort = `out of energy after ${cast} of ${fishingAlloc.casts} casts (${liveEnergy}E left, need ${fishingAlloc.castCost}E)`;
+              log(`Fishing stopped: ${stoppedShort}`, "fishing");
+              break;
+            }
+
             updateStep(stepId, { detail: `cast ${cast + 1}/${fishingAlloc.casts}...` });
-            log(`Fishing cast ${cast + 1}/${fishingAlloc.casts} (${fishingAlloc.castLabel})`);
+            log(`Fishing cast ${cast + 1}/${fishingAlloc.casts} (${fishingAlloc.castLabel})`, "fishing");
 
             try {
               let startResult;
@@ -1164,21 +1553,21 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 // Use "loot" action: collect fish + pick card + start next cast in one request
                 // Pick the first earnable card (simple heuristic)
                 const chosenCard = pendingCardsToAdd[0].id;
-                log(`Collecting fish, picking card ${chosenCard}`);
+                log(`Collecting fish, picking card ${chosenCard}`, "fishing");
                 startResult = await g().fishingAction("loot", { cards: [chosenCard], nodeId: fishingAlloc.castNodeId });
                 pendingCardsToAdd = null; // consumed
               } else {
                 // No pending card pick — normal start_run
-                startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId });
+                startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId, tierId: castTierForNode(fishingAlloc.castNodeId) });
                 // If start fails, retry with recovered token
                 if (!startResult) {
                   await delay(300);
-                  startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId });
+                  startResult = await g().fishingAction("start_run", { cards: [], nodeId: fishingAlloc.castNodeId, tierId: castTierForNode(fishingAlloc.castNodeId) });
                 }
               }
 
               if (!startResult) {
-                log(`Fishing cast failed to start: ${g().lastErrorRef.current || "unknown"}`);
+                log(`Fishing cast failed to start: ${g().lastErrorRef.current || "unknown"}`, "error");
                 escaped++;
                 continue;
               }
@@ -1208,11 +1597,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                     const seaweed = fish?.seaweedEarned ?? 0;
                     summaryStats.seaweedEarned += seaweed;
                     pendingCardsToAdd = gameData?.cardsToAdd ?? null;
-                    log(`Caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
+                    log(`Caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`, "fishing");
                   } else {
                     escaped++;
                     pendingCardsToAdd = null;
-                    log(`Fish escaped`);
+                    log(`Fish escaped`, "fishing");
                   }
                   break;
                 }
@@ -1222,17 +1611,29 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   continue;
                 }
 
-                const best = pickBestCard(
-                  gameData.hand,
-                  gameData.deckCardData,
-                  gameData.fishPosition,
-                  gameData.previousFishPosition,
-                  gameData.nextPosition
-                );
+                const grove = gameData.focusMechanicEnabled ? pickGroveMove(gameData) : null;
+                if (gameData.focusMechanicEnabled && !grove) {
+                  log("No playable card in the Grove", "error");
+                  break;
+                }
+                const best = grove
+                  ? { handIndex: grove.handIndex }
+                  : pickBestCard(
+                      gameData.hand,
+                      gameData.deckCardData,
+                      gameData.fishPosition,
+                      gameData.previousFishPosition,
+                      gameData.nextPosition,
+                      resolveGrid(gameData)
+                    );
 
-                const cardResult = await g().fishingAction("play_cards", { cards: [best.handIndex], nodeId: "" });
+                const cardResult = await g().fishingAction("play_cards", {
+                  cards: [best.handIndex], nodeId: "",
+                  focusPoint: grove ? grove.focusPoint : (gameData.focusPoint ?? []),
+                });
+                if (cardResult) probeFishMove(gameData, cardResult.data.doc.data);
                 if (!cardResult) {
-                  log(`Card play failed`);
+                  log(`Card play failed`, "error");
                   break;
                 }
 
@@ -1246,18 +1647,18 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                     const seaweed = fish?.seaweedEarned ?? 0;
                     summaryStats.seaweedEarned += seaweed;
                     pendingCardsToAdd = doc.data?.cardsToAdd ?? null;
-                    log(`Caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`);
+                    log(`Caught ${fish?.name ?? "fish"} (+${seaweed} seaweed)`, "fishing");
                   } else {
                     escaped++;
                     pendingCardsToAdd = null;
-                    log(`Fish escaped`);
+                    log(`Fish escaped`, "fishing");
                   }
                 }
 
                 await delay(300);
               }
             } catch (e) {
-              log(`Fishing error: ${e instanceof Error ? e.message : "unknown"}`);
+              log(`Fishing error: ${e instanceof Error ? e.message : "unknown"}`, "error");
               escaped++;
             }
 
@@ -1271,7 +1672,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
           updateStep(stepId, {
             status: cancelRef.current ? "skipped" : "done",
-            detail: `${caught} caught / ${escaped} escaped`,
+            detail: stoppedShort
+              ? `${caught} caught / ${escaped} escaped — ${stoppedShort}`
+              : `${caught} caught / ${escaped} escaped`,
           });
           await g().refreshAll();
         }
@@ -1307,7 +1710,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   totalSold++;
                   totalEarned += r.data?.value ?? f.value;
                 } else {
-                  log(`Sell failed: ${r?.message || "error"}`);
+                  log(`Sell failed: ${r?.message || "error"}`, "error");
                   break;
                 }
               } catch { break; }
@@ -1316,27 +1719,32 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           }
           summaryStats.seaweedEarned += totalEarned;
           updateStep("sell-fish", { status: "done", detail: `${totalSold} sold, ${totalEarned} seaweed` });
-          log(`Sold ${totalSold} fish for ${totalEarned} seaweed`);
+          log(`Sold ${totalSold} fish for ${totalEarned} seaweed`, "fishing");
         }
       }
 
-      // Build summary
-      const parts: string[] = [];
-      if (summaryStats.dungeonRuns > 0) parts.push(`${summaryStats.dungeonRuns} dungeon runs (${summaryStats.dungeonWins}W)`);
-      if (summaryStats.fishCasts > 0) parts.push(`${summaryStats.fishCasts} casts, ${summaryStats.fishCaught} fish caught`);
-      if (summaryStats.seaweedEarned > 0) parts.push(`${summaryStats.seaweedEarned} seaweed earned`);
-      setSummary(cancelRef.current ? `Cancelled. ${parts.join(", ")}` : `Done! ${parts.join(", ")}`);
+      finishRun(cancelRef.current ? "cancelled" : "done", summaryStats);
 
     } catch (e) {
-      if ((e as Error).message !== "cancelled") {
-        log(`Error: ${e instanceof Error ? e.message : "unknown"}`);
+      const cancelled = (e as Error).message === "cancelled";
+      if (!cancelled) {
+        log(`Error: ${e instanceof Error ? e.message : "unknown"}`, "error");
       }
-      // Mark remaining steps as skipped
-      setSteps((prev) => prev.map((s) => (s.status === "pending" ? { ...s, status: "skipped" as const } : s)));
-      setSummary("Execution cancelled.");
+      // Steps the run never reached are "not-run" — a different fact from
+      // "skipped", which means the plan had nothing to do for them.
+      stepsRef.current = stepsRef.current.map((s) =>
+        s.status === "pending" ? { ...s, status: "not-run" as const } : s
+      );
+      setSteps(stepsRef.current);
+      finishRun(
+        cancelled ? "cancelled" : "error",
+        summaryStats,
+        e instanceof Error ? e.message : "unknown error"
+      );
     } finally {
       gigaRef.current.autoBattleRef.current = false;
       setExecuting(false);
+      setStopping(false);
       refreshRunStats();
       await gigaRef.current.refreshAll();
     }
@@ -1344,8 +1752,49 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
   const handleStop = () => {
     cancelRef.current = true;
-    addLog("[MC] stopping...");
+    setStopping(true);
+    addLog("[MC] stopping after current action...");
   };
+
+  /* ─── Review-before-run ─────────────────────────────────── */
+
+  const openReview = () => {
+    const preview = buildStepList();
+    stepsRef.current = preview;
+    setSteps(preview);
+    setSummary(null);
+    setReviewing(true);
+    setShowModal(true);
+  };
+
+  const confirmRun = () => {
+    setReviewing(false);
+    void execute();
+  };
+
+  const closeModal = () => {
+    // Cancelling a review clears the previewed steps so the inline
+    // progress card doesn't show a plan that never ran
+    if (reviewing && !executing) { stepsRef.current = []; setSteps([]); }
+    setReviewing(false);
+    setShowModal(false);
+  };
+  const closeModalRef = useRef(closeModal);
+  closeModalRef.current = closeModal;
+
+  // Dialog behavior: focus the panel on open, Escape closes, Tab cycles inside
+  // it rather than walking out behind the backdrop, focus returns to the
+  // trigger on close.
+  useEffect(() => {
+    if (!showModal) return;
+    return trapFocus(modalRef.current, () => closeModalRef.current());
+  }, [showModal]);
+
+  // Same dialog behavior for the Adjust Plan editor
+  useEffect(() => {
+    if (!adjusting) return;
+    return trapFocus(adjustRef.current, () => setAdjusting(false));
+  }, [adjusting]);
 
   /* ─── Render ─────────────────────────────────────────────── */
 
@@ -1355,7 +1804,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         <>
           <div className="px-4 py-2.5" style={{ borderBottom: "1px solid var(--border)" }}>
             <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
-              Progress
+              {reviewing ? "Plan" : "Progress"}
             </span>
           </div>
           <div className="divide-y" style={{ borderColor: "var(--border)" }}>
@@ -1367,6 +1816,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               >
                 <div className="flex items-center gap-3">
                   <span
+                    aria-hidden="true"
                     className="text-[14px] font-bold shrink-0 w-5 text-center"
                     style={{
                       color: statusColor(step.status),
@@ -1375,17 +1825,31 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   >
                     {statusIcon(step.status)}
                   </span>
+                  <span className="sr-only">{statusLabel(step.status)}:</span>
                   <span
                     className="text-[13px] font-medium"
                     style={{ color: step.status === "pending" ? "var(--text-faint)" : "var(--text)" }}
                   >
                     {step.label}
                   </span>
+                  {(step.status === "failed" || step.status === "not-run") && (
+                    <span
+                      aria-hidden="true"
+                      className="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded shrink-0"
+                      style={{
+                        color: statusColor(step.status),
+                        background: step.status === "failed" ? "var(--red-glow)" : "var(--bg-inset)",
+                        border: `1px solid ${step.status === "failed" ? "var(--red-border)" : "var(--border)"}`,
+                      }}
+                    >
+                      {step.status === "failed" ? "Failed" : "Not run"}
+                    </span>
+                  )}
                 </div>
                 {step.detail && (
                   <div
                     className="text-[12px] mt-1 ml-8"
-                    style={{ color: "var(--text-dim)", lineHeight: 1.5 }}
+                    style={{ color: "var(--text-dim)", lineHeight: 1.5, whiteSpace: "pre-line" }}
                   >
                     {step.detail}
                   </div>
@@ -1403,7 +1867,13 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               Activity
             </span>
           </div>
+          {/* role="log" is polite by default, which would narrate every loot
+              line of a ten-minute run. Steps and errors announce through the
+              dedicated live region instead; this stays readable on demand. */}
           <div
+            role="log"
+            aria-label="Run activity, newest first"
+            aria-live="off"
             className="overflow-y-auto px-4 pb-3 flex flex-col gap-1"
             style={{ scrollbarWidth: "none" }}
           >
@@ -1414,12 +1884,12 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 : entry.type === "error" ? AlertTriangle
                 : Info;
               const color = i === 0
-                ? (entry.type === "loot" ? "var(--yellow, #e2b340)"
-                  : entry.type === "fishing" ? "var(--blue, #5b9fd6)"
-                  : entry.type === "error" ? "var(--red, #e05252)"
-                  : "var(--text-primary, #e0e0e0)")
-                : entry.type === "loot" ? "var(--yellow, #e2b340)"
-                : entry.type === "error" ? "var(--red, #e05252)"
+                ? (entry.type === "loot" ? "var(--gold)"
+                  : entry.type === "fishing" ? "var(--blue)"
+                  : entry.type === "error" ? "var(--red)"
+                  : "var(--text)")
+                : entry.type === "loot" ? "var(--gold)"
+                : entry.type === "error" ? "var(--red)"
                 : "var(--text-faint)";
               return (
                 <div
@@ -1427,11 +1897,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   className="flex items-center gap-2 py-[2px] text-[13px]"
                   style={{
                     color,
-                    opacity: i === 0 ? 1 : Math.max(0.3, 1 - i * 0.06),
+                    opacity: i === 0 ? 1 : Math.max(0.55, 1 - i * 0.04),
                     fontWeight: i === 0 ? 500 : 400,
                   }}
                 >
-                  <IconCmp size={i === 0 ? 15 : 13} className="shrink-0" />
+                  <IconCmp size={i === 0 ? 15 : 13} className="shrink-0" aria-hidden="true" />
                   <span className="flex-1 leading-[20px]">{entry.msg}</span>
                 </div>
               );
@@ -1446,17 +1916,63 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     <div
       className="mt-3 px-4 py-3 rounded-lg text-[13px] font-medium"
       style={{
-        background: summary.startsWith("Done") ? "var(--green-glow)" : "var(--bg-raised)",
-        border: `1px solid ${summary.startsWith("Done") ? "var(--green-border)" : "var(--border)"}`,
-        color: summary.startsWith("Done") ? "var(--green)" : "var(--text)",
+        background: summaryFailed ? "var(--red-glow)" : "var(--green-glow)",
+        border: `1px solid ${summaryFailed ? "var(--red-border)" : "var(--green-border)"}`,
+        color: summaryFailed ? "var(--red)" : "var(--green)",
+        lineHeight: 1.5,
       }}
     >
       {summary}
     </div>
   ) : null;
 
+  // Everything the run actually put in your bags, itemised. Losses (fish sold,
+  // ring spent on an offering) show as negatives rather than being hidden —
+  // a net view is the honest one when the plan both earns and spends.
+  const haulContent = haul.length > 0 ? (
+    <div className="mt-3 card p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
+          Haul
+        </h3>
+        <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+          {haul.filter((h) => h.amount > 0).length} item{haul.filter((h) => h.amount > 0).length === 1 ? "" : "s"} gained
+        </span>
+      </div>
+      <div className="flex flex-col gap-1" style={{ maxHeight: 320, overflowY: "auto" }}>
+        {haul.map((h) => (
+          <div key={h.id} className="flex items-center justify-between text-[12px]">
+            <span className="truncate" style={{ color: RARITY_COLORS[h.rarity ?? 0] ?? "var(--text)" }}>
+              {h.name}
+            </span>
+            <span
+              className="tabular-nums shrink-0 ml-3 font-semibold"
+              style={{ color: h.amount > 0 ? "var(--green)" : "var(--red)" }}
+            >
+              {h.amount > 0 ? "+" : ""}{fmt(h.amount)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  ) : null;
+
+  // One phrasing for the plan's energy, used by every surface that shows it.
+  // Mid-run the pre-run figure is stale, so it switches to the live pool.
+  const energyLabel = executing
+    ? `${fmt(currentEnergy)}E left of ${fmt(maxEnergy)}E`
+    : `spends ${fmt(allocatedEnergy)}E of ${fmt(effectiveEnergy)}E`;
+  const overBudget = allocatedEnergy > effectiveEnergy;
+
   return (
     <div className="anim-in space-y-6" style={{ maxWidth: 720 }}>
+
+      {/* Single polite live region: step transitions, errors, and the final
+          summary. The step list itself is not live — re-rendering it on every
+          update would re-announce the whole plan. */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {liveMessage}
+      </div>
 
       {/* ── Advisor ── */}
       {recommendation && (recommendation.notes.length > 0 || recommendation.warnings.length > 0) && (
@@ -1509,6 +2025,35 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         </section>
       )}
 
+      {/* ── Out of repairs: needs the restore flow, not repair ── */}
+      {exhaustedGear.length > 0 && (
+        <section
+          className="p-3.5 rounded-lg"
+          style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
+        >
+          <div className="flex items-center gap-2 mb-1.5">
+            <AlertTriangle size={14} style={{ color: "var(--gold)" }} />
+            <span className="text-[13px] font-bold" style={{ color: "var(--gold)" }}>
+              Out of repairs
+            </span>
+          </div>
+          <div className="text-[12px] mb-2" style={{ color: "var(--text-dim)", lineHeight: 1.5 }}>
+            These have hit their repair limit. Repairing them is refused, so the plan skips
+            them — restore them in Gigaverse to keep using them.
+          </div>
+          <div className="space-y-1">
+            {exhaustedGear.map((g) => (
+              <div key={g.docId} className="text-[12px]" style={{ color: "var(--text-dim)" }}>
+                <span className="font-semibold" style={{ color: "var(--text)" }}>{g.name}</span>
+                {" — "}
+                {g.durability <= 0 ? "broken" : "1 use left"}
+                {g.equipped && " (equipped)"}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* ── Gear durability warning ── */}
       {wornGear.length > 0 && (
         <section
@@ -1522,15 +2067,39 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 Gear needs repair
               </span>
             </div>
-            {wornGear.length > 1 && (
-              <button
-                onClick={() => repairWorn(wornGear)}
-                disabled={repairing || executing}
-                className="btn-press text-[11px] font-bold px-2.5 py-1 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                style={{ background: "var(--bg-raised)", border: "1px solid var(--red-border)", color: "var(--red)" }}
-              >
-                {repairing ? "Repairing..." : "Repair all"}
-              </button>
+            {/* When the plan already repairs gear, the banner reports rather
+                than acts — repairing here left the plan step to fail later
+                against gear that was already fine. */}
+            {freeActions.repairGear ? (
+              <span className="text-[11px] font-semibold" style={{ color: "var(--text-dim)" }}>
+                Included in today&apos;s plan
+              </span>
+            ) : (
+              wornGear.length > 1 && (
+                <button
+                  onClick={() => {
+                    if (confirmRepairAll) {
+                      setConfirmRepairAll(false);
+                      void repairWorn(wornGear);
+                    } else {
+                      setConfirmRepairAll(true);
+                    }
+                  }}
+                  disabled={repairing || executing}
+                  className="btn-press touch-target text-[11px] font-bold px-3 py-1.5 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                  style={{
+                    background: confirmRepairAll ? "var(--red-glow)" : "var(--bg-raised)",
+                    border: "1px solid var(--red-border)",
+                    color: "var(--red)",
+                  }}
+                >
+                  {repairing
+                    ? "Repairing..."
+                    : confirmRepairAll
+                    ? `Repair all ${wornGear.length}?`
+                    : "Repair all"}
+                </button>
+              )
             )}
           </div>
           <div className="space-y-1">
@@ -1542,22 +2111,199 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   {g.durability <= 0 ? "broken" : "1 use left"}
                   {g.equipped && " (equipped)"}
                 </span>
-                <button
-                  onClick={() => repairWorn([g])}
-                  disabled={repairing || executing}
-                  className="btn-press text-[11px] font-bold px-2 py-0.5 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
-                  style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", color: "var(--text)" }}
-                >
-                  Repair
-                </button>
+                {!freeActions.repairGear && (
+                  <button
+                    onClick={() => repairWorn([g])}
+                    disabled={repairing || executing}
+                    aria-label={`Repair ${g.name}`}
+                    className="btn-press touch-target text-[11px] font-bold px-3 py-1.5 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                    style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", color: "var(--text)" }}
+                  >
+                    Repair
+                  </button>
+                )}
               </div>
             ))}
           </div>
         </section>
       )}
 
-      {/* ── Section A: Energy Budget ── */}
-      <section>
+      {/* ── Today's Plan ── */}
+      {(() => {
+        const planPreview = buildStepList();
+        const nothingToRun =
+          allocatedEnergy > effectiveEnergy || planPreview.length === 0;
+        return (
+          <section
+            className="p-4 rounded-lg"
+            style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
+          >
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-[14px] font-bold">Today&apos;s Plan</span>
+              <span
+                className="text-[12px] font-bold tabular-nums"
+                style={{ color: overBudget ? "var(--red)" : "var(--orange)" }}
+              >
+                {energyLabel}
+              </span>
+            </div>
+
+            {planPreview.length > 0 ? (
+              <div className="space-y-1.5 mb-4">
+                {planPreview.map((s) => (
+                  <div key={s.id} className="flex items-baseline justify-between gap-3 text-[12px]">
+                    <span style={{ color: "var(--text)" }}>{s.label}</span>
+                    {(s.brief ?? s.detail) && (
+                      <span className="tabular-nums shrink-0 text-right" style={{ color: "var(--text-dim)" }}>
+                        {s.brief ?? s.detail}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-[12px] mb-4" style={{ color: "var(--text-dim)", lineHeight: 1.5 }}>
+                Nothing planned yet. Press Adjust to build a plan by hand
+                {recommendation && (recommendation.notes.length > 0 || recommendation.warnings.length > 0)
+                  ? ", or apply the advisor's recommendation above."
+                  : "."}
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              {!executing ? (
+                <button
+                  onClick={openReview}
+                  disabled={nothingToRun}
+                  aria-describedby={nothingToRun ? "run-plan-blocked" : undefined}
+                  className="btn-press cta-orange flex-1 text-[15px] font-bold py-3 rounded-xl cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                  style={{
+                    boxShadow: "0 3px 16px var(--orange-glow)",
+                    letterSpacing: "0.02em",
+                  }}
+                >
+                  Run Plan
+                </button>
+              ) : (
+                <button
+                  onClick={handleStop}
+                  disabled={stopping}
+                  className="btn-press cta-red flex-1 text-[15px] font-bold py-3 rounded-xl cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                  style={{
+                    boxShadow: "0 3px 16px var(--red-border)",
+                    letterSpacing: "0.02em",
+                  }}
+                >
+                  {stopping ? "Stopping…" : "Stop"}
+                </button>
+              )}
+              <button
+                onClick={() => setAdjusting(true)}
+                disabled={executing}
+                className="btn-press px-5 py-3 rounded-xl text-[13px] font-semibold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{
+                  background: "var(--bg-inset)",
+                  border: "1px solid var(--border)",
+                  color: "var(--text-dim)",
+                }}
+              >
+                Adjust
+              </button>
+            </div>
+            {/* A disabled primary button with no explanation is its own defect —
+                say which of the two reasons is blocking it. */}
+            {nothingToRun && !executing && (
+              <div id="run-plan-blocked" className="text-[12px] mt-2" style={{ color: overBudget ? "var(--red)" : "var(--text-dim)" }}>
+                {overBudget
+                  ? `Over budget by ${fmt(allocatedEnergy - effectiveEnergy)}E — reduce runs or casts in Adjust to enable Run Plan.`
+                  : "Nothing to run yet — add runs, casts, or free actions in Adjust."}
+              </div>
+            )}
+            {stopping && (
+              <div className="text-[12px] mt-2" style={{ color: "var(--red)" }}>
+                Stopping after the current action finishes&hellip;
+              </div>
+            )}
+          </section>
+        );
+      })()}
+
+      {adjusting && (
+        <div className="fixed inset-0" style={{ zIndex: 50 }}>
+          <div
+            className="fixed inset-0"
+            style={{ background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)" }}
+            onClick={() => setAdjusting(false)}
+          />
+          <div
+            ref={adjustRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Adjust plan"
+            tabIndex={-1}
+            className="fixed inset-x-4 top-[6%] bottom-[6%] mx-auto flex flex-col rounded-xl overflow-hidden"
+            style={{
+              maxWidth: 640,
+              background: "var(--bg)",
+              border: "1px solid var(--border)",
+              zIndex: 51,
+              boxShadow: "0 24px 48px rgba(0,0,0,0.4)",
+              outline: "none",
+            }}
+          >
+            {/* Header */}
+            <div
+              className="flex items-center justify-between px-5 py-3 shrink-0"
+              style={{ borderBottom: "1px solid var(--border)", background: "var(--bg-raised)" }}
+            >
+              <span className="text-[15px] font-bold">Adjust Plan</span>
+              <span
+                className="text-[12px] font-bold tabular-nums"
+                style={{ color: overBudget ? "var(--red)" : "var(--orange)" }}
+              >
+                {energyLabel}
+              </span>
+            </div>
+
+            {/* Section nav — four very different jobs used to share one
+                30-target scroll with no way to tell them apart. */}
+            <div
+              role="tablist"
+              aria-label="Plan sections"
+              className="flex shrink-0 px-2 gap-1"
+              style={{ borderBottom: "1px solid var(--border)", background: "var(--bg-raised)" }}
+            >
+              {([
+                { id: "energy" as const, label: "Energy", cost: true },
+                { id: "free" as const, label: "Free", cost: false },
+                ...(merchantDeals.length > 0 ? [{ id: "merchant" as const, label: "Merchant", cost: false }] : []),
+                { id: "presets" as const, label: "Presets", cost: false },
+              ]).map((t) => {
+                const active = adjustSection === t.id;
+                return (
+                  <button
+                    key={t.id}
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => setAdjustSection(t.id)}
+                    className="touch-target text-[12px] font-bold px-3 py-2 cursor-pointer"
+                    style={{
+                      color: active ? (t.cost ? "var(--orange)" : "var(--text)") : "var(--text-faint)",
+                      borderBottom: `2px solid ${active ? (t.cost ? "var(--orange)" : "var(--text-dim)") : "transparent"}`,
+                      marginBottom: -1,
+                      background: "transparent",
+                    }}
+                  >
+                    {t.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Body — scrollable editor */}
+            <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-6">
+      {/* ── Section A: Energy Budget — the only section that spends anything ── */}
+      <section hidden={adjustSection !== "energy"}>
         <div className="flex items-center justify-between mb-4">
           <div className="text-[14px] font-bold">Energy Budget</div>
           <div className="text-[13px] font-bold tabular-nums" style={{ color: "var(--orange)" }}>
@@ -1611,19 +2357,30 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   <button
                     disabled={d.runs <= 0 || executing}
                     onClick={() => adjustDungeon(idx, -1)}
-                    className="btn-press w-7 h-7 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[14px] font-bold"
+                    aria-label={`One fewer ${d.name} run`}
+                    className="btn-press touch-target w-8 h-8 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[15px] font-bold"
                     style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
                   >
                     -
                   </button>
-                  <span className="text-[14px] font-bold tabular-nums w-6 text-center">{d.runs}</span>
+                  <span className="text-[14px] font-bold tabular-nums w-6 text-center" aria-label={`${d.runs} ${d.name} runs planned`}>{d.runs}</span>
                   <button
                     disabled={!canIncrease || executing}
                     onClick={() => adjustDungeon(idx, 1)}
-                    className="btn-press w-7 h-7 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[14px] font-bold"
+                    aria-label={`One more ${d.name} run`}
+                    className="btn-press touch-target w-8 h-8 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[15px] font-bold"
                     style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
                   >
                     +
+                  </button>
+                  <button
+                    disabled={!canIncrease || executing}
+                    onClick={() => maxDungeon(idx)}
+                    aria-label={`Fill remaining energy with ${d.name} runs`}
+                    className="btn-press touch-target h-8 px-2.5 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[11px] font-bold uppercase tracking-wider"
+                    style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text-dim)" }}
+                  >
+                    Max
                   </button>
                 </div>
                 {d.runs > 0 && (
@@ -1667,7 +2424,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   key={node.nodeId}
                   disabled={executing}
                   onClick={() => changeCastNode(node.nodeId)}
-                  className="btn-press text-[10px] font-bold px-2 py-0.5 rounded cursor-pointer disabled:cursor-not-allowed"
+                  className="btn-press touch-target text-[11px] font-bold px-2.5 py-1 rounded cursor-pointer disabled:cursor-not-allowed"
                   style={{
                     background: fishingAlloc.castNodeId === node.nodeId ? "var(--orange-glow)" : "var(--bg-inset)",
                     border: fishingAlloc.castNodeId === node.nodeId ? "1px solid var(--border-accent)" : "1px solid var(--border)",
@@ -1686,19 +2443,30 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             <button
               disabled={fishingAlloc.casts <= 0 || executing}
               onClick={() => adjustFishing(-1)}
-              className="btn-press w-7 h-7 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[14px] font-bold"
+              aria-label="One fewer fishing cast"
+              className="btn-press touch-target w-8 h-8 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[15px] font-bold"
               style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
             >
               -
             </button>
-            <span className="text-[14px] font-bold tabular-nums w-6 text-center">{fishingAlloc.casts}</span>
+            <span className="text-[14px] font-bold tabular-nums w-6 text-center" aria-label={`${fishingAlloc.casts} fishing casts planned`}>{fishingAlloc.casts}</span>
             <button
               disabled={fishingAlloc.casts >= remainingCasts || allocatedEnergy + fishingAlloc.castCost > effectiveEnergy || executing}
               onClick={() => adjustFishing(1)}
-              className="btn-press w-7 h-7 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[14px] font-bold"
+              aria-label="One more fishing cast"
+              className="btn-press touch-target w-8 h-8 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[15px] font-bold"
               style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
             >
               +
+            </button>
+            <button
+              disabled={fishingAlloc.casts >= remainingCasts || allocatedEnergy + fishingAlloc.castCost > effectiveEnergy || executing}
+              onClick={maxFishing}
+              aria-label="Fill remaining energy with fishing casts"
+              className="btn-press touch-target h-8 px-2.5 rounded flex items-center justify-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed text-[11px] font-bold uppercase tracking-wider"
+              style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text-dim)" }}
+            >
+              Max
             </button>
           </div>
           {fishingAlloc.casts > 0 && (
@@ -1732,9 +2500,12 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         </div>
       </section>
 
-      {/* ── Section B: Free Actions ── */}
-      <section>
-        <div className="text-[14px] font-bold mb-3">Free Actions</div>
+      {/* ── Section B: Free Actions — cost no energy ── */}
+      <section hidden={adjustSection !== "free"}>
+        <div className="text-[14px] font-bold mb-1">Free Actions</div>
+        <div className="text-[12px] mb-3" style={{ color: "var(--text-faint)" }}>
+          None of these spend energy.
+        </div>
         <div className="space-y-1.5">
           {/* ROM Resources (shards + dust) */}
           <label className="flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", opacity: (totalRomS === 0 && totalRomD === 0) ? 0.5 : 1 }}>
@@ -1769,10 +2540,24 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
           {/* Checkboxes for the rest */}
           {([
-            { key: "openChests" as const, label: "Open chests", info: chestsReady ? [!chestCd.onCooldown && "Chest ready", !juiceChestCd.onCooldown && (eng?.isPlayerJuiced ?? false) && "Juice ready"].filter(Boolean).join(" + ") || "Ready" : `Chest: ${chestCd.text}${(eng?.isPlayerJuiced ?? false) ? `, Juice: ${juiceChestCd.text}` : ""}`, disabled: !chestsReady },
+            {
+              key: "openChests" as const,
+              label: "Open chests",
+              info: chestsReady
+                ? [
+                    !chestCd.onCooldown && "Chest ready",
+                    juicedNow && !juiceChestCd.onCooldown && "Juice ready",
+                    juicedNow && !juiceChestForestCd.onCooldown && "Forest ready",
+                  ].filter(Boolean).join(" + ") || "Ready"
+                : [
+                    `Chest: ${chestCd.text}`,
+                    juicedNow && `Juice: ${juiceChestCd.text}`,
+                    juicedNow && `Forest: ${juiceChestForestCd.text}`,
+                  ].filter(Boolean).join(", "),
+              disabled: !chestsReady,
+            },
             { key: "breakPots" as const, label: "Break pots", info: (() => { const p: string[] = []; if (!bluePotCd.onCooldown && paperHandsId) p.push("Blue ready"); else if (!bluePotCd.onCooldown) p.push("Blue: no Paper Hands"); else p.push(`Blue: ${bluePotCd.text}`); if (!tanPotCd.onCooldown && rockHandsId) p.push("Tan ready"); else if (!tanPotCd.onCooldown) p.push("Tan: no Rock Hands"); else p.push(`Tan: ${tanPotCd.text}`); return p.join(", "); })(), disabled: !potsActuallyReady },
             { key: "sellFish" as const, label: "Sell +50% fish", info: fishStallInfo.totalCount > 0 ? `${fmt(fishStallInfo.totalCount)} fish (~${fmt(fishStallInfo.totalSeaweed)} seaweed)` : "None available", disabled: fishStallInfo.totalCount === 0 },
-            { key: "tradeHugis" as const, label: "Traveling merchant trades", info: (() => { const n = merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped).length; return n > 0 ? `${n} affordable deal${n === 1 ? "" : "s"}` : "None affordable"; })(), disabled: merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped).length === 0 },
             { key: "repairGear" as const, label: "Repair worn gear", info: wornGear.length > 0 ? `${wornGear.length} item${wornGear.length === 1 ? "" : "s"} worn` : "All gear healthy", disabled: wornGear.length === 0 },
             { key: "vote" as const, label: "Vote on Abstract Portal", info: hasVoted ? "Voted" : "Not voted", disabled: hasVoted },
           ]).map((item) => (
@@ -1787,13 +2572,39 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
       {/* ── Traveling Merchant (Hugis/Munis) ── */}
       {merchantDeals.length > 0 && (
-        <section>
+        <section hidden={adjustSection !== "merchant"}>
           <div className="flex items-center justify-between mb-3">
             <div className="text-[14px] font-bold">Traveling Merchant</div>
             <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-              stubs snapshot Fri 6pm UTC
+              deals refresh Fridays 6pm UTC
             </span>
           </div>
+          {/* The auto-trade toggle lives with the deals it acts on rather than
+              duplicated up in Free Actions. */}
+          <label
+            className="flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer mb-3"
+            style={{
+              background: "var(--bg-raised)",
+              border: "1px solid var(--border)",
+              opacity: merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped).length === 0 ? 0.5 : 1,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={freeActions.tradeHugis}
+              disabled={merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped).length === 0 || executing}
+              onChange={(e) => setFreeActions((prev) => ({ ...prev, tradeHugis: e.target.checked }))}
+              className="accent-[var(--orange)]"
+              style={{ width: 16, height: 16 }}
+            />
+            <div className="flex-1 text-[12px] font-semibold">Trade every affordable deal in Run Plan</div>
+            <span className="text-[11px] tabular-nums shrink-0" style={{ color: "var(--text-dim)" }}>
+              {(() => {
+                const n = merchantDeals.filter((d) => d.recipeId && d.affordable && !d.capped).length;
+                return n > 0 ? `${n} affordable` : "None affordable";
+              })()}
+            </span>
+          </label>
           <div className="space-y-1.5">
             {merchantDeals.map((d) => (
               <div
@@ -1816,6 +2627,13 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                     {d.recipeId && !d.capped && (
                       <button
                         onClick={async () => {
+                          // A trade permanently removes materials from
+                          // inventory, so it takes two presses like a delete.
+                          if (confirmTrade !== d.key) {
+                            setConfirmTrade(d.key);
+                            return;
+                          }
+                          setConfirmTrade(null);
                           addLog(`Trading ${d.name}...`);
                           const r = await giga.useRecipe(d.recipeId!);
                           if (r?.success !== false) {
@@ -1827,10 +2645,19 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                           giga.refreshAll();
                         }}
                         disabled={!d.affordable || executing}
-                        className="btn-press text-[11px] font-bold px-2.5 py-0.5 rounded cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
-                        style={{ background: "var(--bg-inset)", border: "1px solid var(--border-accent)", color: "var(--orange)" }}
+                        aria-label={
+                          confirmTrade === d.key
+                            ? `Confirm trading ${d.inputs.map((i) => `${i.amount} ${i.name}`).join(" and ")}`
+                            : `Trade ${d.name}`
+                        }
+                        className="btn-press touch-target text-[11px] font-bold px-3 py-1.5 rounded cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                        style={{
+                          background: confirmTrade === d.key ? "var(--orange-glow)" : "var(--bg-inset)",
+                          border: "1px solid var(--border-accent)",
+                          color: "var(--orange)",
+                        }}
                       >
-                        Trade
+                        {confirmTrade === d.key ? "Confirm?" : "Trade"}
                       </button>
                     )}
                   </span>
@@ -1856,7 +2683,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       )}
 
       {/* ── Section C: Presets ── */}
-      <section>
+      <section hidden={adjustSection !== "presets"}>
         <div className="flex items-center justify-between mb-3">
           <div className="text-[14px] font-bold">Presets</div>
           <button
@@ -1889,7 +2716,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               onClick={savePreset}
               disabled={!presetName.trim()}
               className="btn-press text-[11px] font-bold px-4 py-2 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
-              style={{ background: "var(--orange)", border: "none", color: "var(--text-inverse)" }}
+              style={{ background: "var(--orange)", border: "none", color: "var(--on-orange)" }}
             >
               Save
             </button>
@@ -1909,12 +2736,25 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   {p.name}
                 </button>
                 <button
-                  onClick={() => deletePreset(p.name)}
+                  onClick={() => {
+                    if (confirmDelete === p.name) {
+                      deletePreset(p.name);
+                      setConfirmDelete(null);
+                    } else {
+                      setConfirmDelete(p.name);
+                    }
+                  }}
                   disabled={executing}
-                  className="btn-press text-[11px] px-1.5 py-1.5 rounded-r-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
-                  style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", color: "var(--text-faint)" }}
+                  aria-label={confirmDelete === p.name ? `Confirm deleting preset ${p.name}` : `Delete preset ${p.name}`}
+                  className="btn-press touch-target text-[11px] font-semibold px-2.5 py-1.5 rounded-r-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                  style={{
+                    background: confirmDelete === p.name ? "var(--red-glow)" : "var(--bg-raised)",
+                    border: `1px solid ${confirmDelete === p.name ? "var(--red-border)" : "var(--border)"}`,
+                    color: confirmDelete === p.name ? "var(--red)" : "var(--text-faint)",
+                    minWidth: 28,
+                  }}
                 >
-                  x
+                  {confirmDelete === p.name ? "delete?" : "×"}
                 </button>
               </div>
             ))}
@@ -1925,77 +2765,71 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           </div>
         )}
       </section>
+            </div>
 
-      {/* ── Section D: Run Button + Progress ── */}
+            {/* Footer */}
+            <div
+              className="shrink-0 px-5 py-3"
+              style={{ borderTop: "1px solid var(--border)", background: "var(--bg-raised)" }}
+            >
+              <button
+                onClick={() => setAdjusting(false)}
+                className="btn-press cta-orange w-full py-2.5 rounded-lg text-[13px] font-bold cursor-pointer"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Progress + Activity ── */}
       <section>
-        {!executing ? (
-          <button
-            onClick={execute}
-            disabled={
-              executing ||
-              allocatedEnergy > effectiveEnergy ||
-              (allocatedEnergy === 0 &&
-                !freeActions.claimRomResources &&
-                freeActions.romEnergyMode === "skip" &&
-                !freeActions.openChests &&
-                !freeActions.breakPots &&
-                !freeActions.sellFish &&
-                !freeActions.vote &&
-                !freeActions.tradeHugis &&
-                !freeActions.repairGear)
-            }
-            className="btn-press w-full text-[16px] font-bold py-4 rounded-xl cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-            style={{
-              background: "linear-gradient(135deg, var(--orange), var(--orange-dim))",
-              border: "none",
-              color: "var(--text-inverse)",
-              boxShadow: "0 3px 16px var(--orange-glow)",
-              letterSpacing: "0.02em",
-            }}
-          >
-            Run Plan
-          </button>
-        ) : (
-          <button
-            onClick={handleStop}
-            className="btn-press w-full text-[16px] font-bold py-4 rounded-xl cursor-pointer"
-            style={{
-              background: "linear-gradient(135deg, var(--red), var(--red-dark))",
-              border: "none",
-              color: "var(--text-inverse)",
-              boxShadow: "0 3px 16px var(--red-border)",
-              letterSpacing: "0.02em",
-            }}
-          >
-            Stop
-          </button>
-        )}
-
         {/* Inline Progress + Activity Feed (visible when modal is closed) */}
-        {!showModal && (steps.length > 0 || mcLog.length > 0) && (
+        {!showModal && !reviewing && (steps.length > 0 || mcLog.length > 0) && (
           <div
             ref={progressRef}
+            role="button"
+            tabIndex={0}
+            aria-label={executing ? "Reopen the run in progress" : "Reopen the last run"}
             className="mt-4 rounded-lg overflow-hidden cursor-pointer"
             style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
             onClick={() => setShowModal(true)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                setShowModal(true);
+              }
+            }}
           >
             {progressContent}
             {summaryContent}
+            {haulContent}
           </div>
         )}
 
-        {!showModal && summary && !steps.length && !mcLog.length && summaryContent}
+        {!showModal && summary && !steps.length && !mcLog.length && (
+          <>
+            {summaryContent}
+            {haulContent}
+          </>
+        )}
       </section>
 
-      {/* Execution Modal */}
+      {/* Execution / Review Modal */}
       {showModal && (
         <div className="fixed inset-0" style={{ zIndex: 50 }}>
           <div
             className="fixed inset-0"
             style={{ background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)" }}
-            onClick={() => setShowModal(false)}
+            onClick={closeModal}
           />
           <div
+            ref={modalRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label={reviewing ? "Review plan before running" : "Run progress"}
+            tabIndex={-1}
             className="fixed inset-x-4 top-[10%] bottom-[10%] mx-auto flex flex-col rounded-xl overflow-hidden"
             style={{
               maxWidth: 520,
@@ -2003,20 +2837,23 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               border: "1px solid var(--border)",
               zIndex: 51,
               boxShadow: "0 24px 48px rgba(0,0,0,0.4)",
+              outline: "none",
             }}
           >
             {/* Modal header */}
             <div className="flex items-center justify-between px-5 py-3 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
               <span className="text-[15px] font-bold" style={{ color: "var(--text)" }}>
-                {executing ? "Running..." : summary ? "Run Complete" : "Run"}
+                {reviewing ? "Review Plan" : stopping ? "Stopping…" : executing ? "Running..." : summary ? "Run Complete" : "Run"}
               </span>
-              <button
-                onClick={() => setShowModal(false)}
-                className="px-3 py-1.5 rounded-md text-[12px] font-medium cursor-pointer"
-                style={{ color: "var(--text-dim)", background: "var(--bg-inset)", border: "1px solid var(--border)" }}
-              >
-                Minimize
-              </button>
+              {!reviewing && (
+                <button
+                  onClick={closeModal}
+                  className="px-3 py-1.5 rounded-md text-[12px] font-medium cursor-pointer"
+                  style={{ color: "var(--text-dim)", background: "var(--bg-inset)", border: "1px solid var(--border)" }}
+                >
+                  Minimize
+                </button>
+              )}
             </div>
 
             {/* Modal body — scrollable */}
@@ -2024,38 +2861,78 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               className="flex-1 min-h-0 overflow-y-auto"
               style={{ scrollbarWidth: "none" }}
             >
+              {reviewing && (
+                <div
+                  className="px-4 pt-3 pb-1 text-[12px]"
+                  style={{ color: "var(--text-dim)", lineHeight: 1.5 }}
+                >
+                  This run spends{" "}
+                  <span className="font-bold tabular-nums" style={{ color: "var(--orange)" }}>
+                    {fmt(allocatedEnergy)}E
+                  </span>{" "}
+                  and executes every step below on your account. Energy spent, items sold, and
+                  trades made can&apos;t be undone.
+                </div>
+              )}
               {progressContent}
-              {summaryContent && <div className="px-4 pb-4">{summaryContent}</div>}
+              {summaryContent && (
+                <div className="px-4 pb-4">
+                  {summaryContent}
+                  {haulContent}
+                </div>
+              )}
             </div>
 
             {/* Modal footer */}
             <div className="shrink-0 px-5 py-3 flex gap-3" style={{ borderTop: "1px solid var(--border)" }}>
-              {executing && (
-                <button
-                  onClick={() => { cancelRef.current = true; }}
-                  className="flex-1 py-2 rounded-lg text-[13px] font-semibold cursor-pointer"
-                  style={{
-                    background: "var(--red-glow)",
-                    border: "1px solid var(--red-border)",
-                    color: "var(--red)",
-                  }}
-                >
-                  Stop
-                </button>
+              {reviewing ? (
+                <>
+                  <button
+                    onClick={closeModal}
+                    className="flex-1 py-2 rounded-lg text-[13px] font-medium cursor-pointer"
+                    style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text-dim)" }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={confirmRun}
+                    className="btn-press cta-orange flex-1 py-2 rounded-lg text-[13px] font-bold cursor-pointer"
+                  >
+                    Confirm &amp; Run
+                  </button>
+                </>
+              ) : (
+                <>
+                  {executing && (
+                    <button
+                      onClick={handleStop}
+                      disabled={stopping}
+                      className="flex-1 py-2 rounded-lg text-[13px] font-semibold cursor-pointer disabled:cursor-not-allowed"
+                      style={{
+                        background: "var(--red-glow)",
+                        border: "1px solid var(--red-border)",
+                        color: "var(--red)",
+                        opacity: stopping ? 0.7 : 1,
+                      }}
+                    >
+                      {stopping ? "Stopping after current action…" : "Stop"}
+                    </button>
+                  )}
+                  <button
+                    onClick={closeModal}
+                    className={`${executing ? "" : "flex-1 "}py-2 rounded-lg text-[13px] font-medium cursor-pointer`}
+                    style={{
+                      flex: executing ? 1 : undefined,
+                      width: executing ? undefined : "100%",
+                      background: "var(--bg-inset)",
+                      border: "1px solid var(--border)",
+                      color: "var(--text-dim)",
+                    }}
+                  >
+                    {executing ? "Minimize" : "Close"}
+                  </button>
+                </>
               )}
-              <button
-                onClick={() => setShowModal(false)}
-                className={`${executing ? "" : "flex-1 "}py-2 rounded-lg text-[13px] font-medium cursor-pointer`}
-                style={{
-                  flex: executing ? 1 : undefined,
-                  width: executing ? undefined : "100%",
-                  background: "var(--bg-inset)",
-                  border: "1px solid var(--border)",
-                  color: "var(--text-dim)",
-                }}
-              >
-                {executing ? "Minimize" : "Close"}
-              </button>
             </div>
           </div>
         </div>

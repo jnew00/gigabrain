@@ -2,18 +2,19 @@
 
 import { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction, evaluateState, explainAction, MOVE_LABELS } from "@/lib/auto-battle";
-import { getTrackerStats, getAllEnemyProfiles } from "@/lib/enemy-tracker";
-import type { EnemyMoveRecord } from "@/lib/enemy-tracker";
+import { probeEnemyMove } from "@/lib/enemy-probe";
 import { authenticateWithSignature, recordRunAction, getRunStatsAction, getDungeonPerformanceAction } from "./actions";
 import { useLoginWithAbstract, useAbstractClient } from "@abstract-foundation/agw-react";
 import { useAccount, useSignMessage, useReadContract } from "wagmi";
 import { ABSTRACT_VOTING_ADDRESS, ABSTRACT_VOTING_ABI, GIGAVERSE_APP_ID } from "@/lib/voting-contract";
-import { Sword, Shield, Sparkles, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote, Fish, Rocket, Heart, Copy } from "lucide-react";
+import { Sword, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote, Fish, Rocket, Heart, Copy } from "lucide-react";
 import { MissionControlPage } from "./mission-control";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import type { Player, DungeonAction, DungeonActionResponse, RomEntity, FishingCard } from "@/lib/types";
-import { pickBestCard, shouldRedraw, predictNextPositionsWeighted, scoreHand, coordToCell } from "@/lib/fishing-ai";
-import { FISHING } from "@/lib/game-data";
+import type { Player, DungeonAction, DungeonActionResponse, RomEntity, FishingCard, FishingGameData } from "@/lib/types";
+import { pickBestCard, pickGroveMove, shouldRedraw, predictNextPositionsWeighted, scoreHand, coordToCell, inferGrid, resolveGrid, DEFAULT_GRID } from "@/lib/fishing-ai";
+import { probeFishMove } from "@/lib/fishing-probe";
+import type { GridDims } from "@/lib/fishing-ai";
+import { FISHING, CLAIM_RECIPES, getMaxRunsPerDay, castTierForNode, castsUsedToday, isAwakeningActive, AWAKENING } from "@/lib/game-data";
 import { buildSkillAdvice } from "@/lib/skill-advisor";
 
 // Donations — GigaBrain is free; these fund the coffee
@@ -23,12 +24,6 @@ const DONATIONS = {
     { label: "Abstract", address: "0x0757C2c5bC42F5aC373903B5DFd85CE2B9201124" },
     { label: "Ethereum", address: "0x42353a7Fc70Eab5C0017733813805313B7b10b8B" },
   ],
-};
-
-const MOVE_ICONS: Record<string, typeof Sword> = {
-  rock: Sword,
-  paper: Shield,
-  scissor: Sparkles,
 };
 
 const MOVE_IMAGES: Record<string, string> = {
@@ -112,11 +107,12 @@ function VitalBar({ current, max, color, gradient, thin, label }: {
       )}
       <div className="flex-1 rounded-full overflow-hidden" style={{ height: h, background: "var(--bg-inset)" }}>
         <div
-          className="h-full rounded-full"
+          className="h-full w-full rounded-full"
           style={{
-            width: `${pct}%`,
+            transform: `scaleX(${pct / 100})`,
+            transformOrigin: "left",
             background: gradient ? BAR_GRADIENTS[gradient] : color,
-            transition: "width 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
+            transition: "transform 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
           }}
         />
       </div>
@@ -211,14 +207,16 @@ function StatPill({ label, value, color }: { label: string; value: string | numb
 }
 
 /* ─── Stats Page ──────────────────────────────────────────── */
-function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
+function StatsPage({ runStats, enemyNames, itemInfo }: {
   runStats: { totalRuns: number; wins: number; losses: number; avgRooms: number; totalItems: Record<string, { name: string; amount: number }> } | null;
-  enemyMoveRecords: EnemyMoveRecord[];
   enemyNames: Record<string, { name: string; stats?: number[] }>;
   itemInfo: Record<string, { name: string; rarity?: number; rarityName?: string; icon?: string }>;
 }) {
-  const stats = getTrackerStats(enemyMoveRecords);
-  const profiles = getAllEnemyProfiles(enemyMoveRecords).sort((a, b) => b.confidence - a.confidence);
+  // enemyNames is keyed by both id and "idx:id"; take the numeric keys only.
+  const enemyList = Object.entries(enemyNames)
+    .filter(([k, v]) => !k.startsWith("idx:") && (v.stats?.length ?? 0) >= 8)
+    .map(([k, v]) => ({ id: k, name: v.name, stats: v.stats as number[] }))
+    .sort((a, b) => a.stats[6] - b.stats[6]);
 
   return (
     <div className="anim-in space-y-8">
@@ -286,131 +284,37 @@ function StatsPage({ runStats, enemyMoveRecords, enemyNames, itemInfo }: {
         )}
       </section>
 
-      {/* Enemy Intel */}
+      {/* Enemy Reference */}
       <section>
-        <h2 className="text-[18px] font-bold mb-1">Enemy Intel</h2>
+        <h2 className="text-[18px] font-bold mb-1">Enemy Reference</h2>
         <p className="text-[11px] mb-4" style={{ color: "var(--text-faint)" }}>
-          {fmt(stats.totalRecords)} moves tracked across {fmt(stats.uniqueEnemies)} enemies
+          Per-move ATK/DEF from the game&apos;s static data. The auto-battler predicts from
+          the enemy&apos;s live charges, using these stats only to break ties.
         </p>
 
-        {profiles.length === 0 ? (
-          <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>No data yet. Run some dungeons first.</p>
+        {enemyList.length === 0 ? (
+          <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>Enemy data not loaded yet.</p>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            {profiles.map((p) => {
-              const enemyEntry = enemyNames[String(p.enemyId)]
-                || enemyNames[`idx:${p.enemyId}`];
-              const name = enemyEntry?.name || `#${p.enemyId}`;
-              const baseStats = enemyEntry?.stats;
-
-              const rounds = Object.entries(p.roundMoves)
-                .map(([round, counts]) => {
-                  const total = counts.rock + counts.paper + counts.scissor;
-                  if (total < 2) return null;
-                  const best = (Object.entries(counts) as [string, number][]).sort((a, b) => b[1] - a[1])[0];
-                  const conf = best[1] / total;
-                  return { round: Number(round), move: best[0], conf, total };
-                })
-                .filter((r): r is NonNullable<typeof r> => r !== null)
-                .sort((a, b) => a.round - b.round);
-
-              const predictableRounds = rounds.filter((r) => r.conf >= 0.6);
-              const hasPredictablePattern = predictableRounds.length >= 2;
-
-              return (
-                <div
-                  key={p.enemyId}
-                  className="p-3 rounded-lg"
-                  style={{
-                    background: hasPredictablePattern ? "var(--green-glow)" : "var(--bg-raised)",
-                    border: `1px solid ${hasPredictablePattern ? "var(--green-border)" : "var(--border)"}`,
-                  }}
-                >
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-[13px] font-bold" style={{ color: hasPredictablePattern ? "var(--green)" : "var(--text)" }}>
-                      {name}
-                    </span>
-                    <span className="text-[10px] tabular-nums" style={{ color: "var(--text-faint)" }}>
-                      {fmt(p.totalMoves)} moves
-                    </span>
-                  </div>
-
-                  {/* Overall distribution bar */}
-                  <div className="flex rounded-sm overflow-hidden mb-2" style={{ height: 6 }}>
-                    {p.moveFreq.rock > 0 && <div style={{ width: `${p.moveFreq.rock * 100}%`, background: "var(--red)" }} />}
-                    {p.moveFreq.paper > 0 && <div style={{ width: `${p.moveFreq.paper * 100}%`, background: "var(--blue)" }} />}
-                    {p.moveFreq.scissor > 0 && <div style={{ width: `${p.moveFreq.scissor * 100}%`, background: "var(--green)" }} />}
-                  </div>
-                  <div className="flex gap-3 text-[10px] tabular-nums mb-3" style={{ color: "var(--text-faint)" }}>
-                    <span><span style={{ color: "var(--red)" }}>Sword</span> {Math.round(p.moveFreq.rock * 100)}%</span>
-                    <span><span style={{ color: "var(--blue)" }}>Shield</span> {Math.round(p.moveFreq.paper * 100)}%</span>
-                    <span><span style={{ color: "var(--green)" }}>Spell</span> {Math.round(p.moveFreq.scissor * 100)}%</span>
-                  </div>
-
-                  {/* Round-by-round patterns */}
-                  {rounds.length > 0 && (
-                    <>
-                      <h3 className="text-[11px] font-bold uppercase tracking-[0.1em] mb-1.5" style={{ color: "var(--text-faint)" }}>
-                        Round patterns
-                      </h3>
-                      <div className="flex gap-1.5 flex-wrap">
-                        {rounds.map((r) => {
-                          const Icon = MOVE_ICONS[r.move];
-                          const color = MOVE_COLORS[r.move];
-                          const strong = r.conf >= 0.6;
-                          return (
-                            <div
-                              key={r.round}
-                              className="flex items-center gap-1 px-2 py-1 rounded"
-                              style={{
-                                background: strong ? MOVE_BG[r.move] : "var(--bg-inset)",
-                                border: `1px solid ${strong ? color : "var(--border)"}`,
-                                opacity: strong ? 1 : r.conf >= 0.45 ? 0.7 : 0.4,
-                              }}
-                              title={`Round ${r.round + 1}: ${MOVE_LABELS[r.move]} ${Math.round(r.conf * 100)}% (${r.total} samples)`}
-                            >
-                              <span className="text-[10px] font-bold tabular-nums" style={{ color: "var(--text-faint)" }}>
-                                R{r.round + 1}
-                              </span>
-                              {Icon && <Icon size={12} style={{ color }} />}
-                              <span className="text-[10px] font-bold tabular-nums" style={{ color: strong ? color : "var(--text-faint)" }}>
-                                {Math.round(r.conf * 100)}%
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </>
-                  )}
-
-                  {predictableRounds.length > 0 && (
-                    <div className="text-[10px] mt-2 font-medium" style={{ color: hasPredictablePattern ? "var(--green)" : "var(--text-faint)" }}>
-                      {predictableRounds.length} of {rounds.length} rounds predictable
-                    </div>
-                  )}
-
-                  {/* Base Stats */}
-                  {baseStats && baseStats.length >= 8 && (
-                    <div className="mt-2">
-                      <h3 className="text-[11px] font-bold uppercase tracking-[0.1em] mb-1" style={{ color: "var(--text-faint)" }}>
-                        Base Stats
-                      </h3>
-                      <div className="text-[11px] tabular-nums" style={{ color: "var(--text-dim)" }}>
-                        <span style={{ color: "var(--red)" }}>Sword</span>{" "}{baseStats[0]}/{baseStats[1]}
-                        <span style={{ color: "var(--text-faint)" }}> · </span>
-                        <span style={{ color: "var(--blue)" }}>Shield</span>{" "}{baseStats[2]}/{baseStats[3]}
-                        <span style={{ color: "var(--text-faint)" }}> · </span>
-                        <span style={{ color: "var(--green)" }}>Spell</span>{" "}{baseStats[4]}/{baseStats[5]}
-                        <span style={{ color: "var(--text-faint)" }}> · </span>
-                        HP {baseStats[6]}
-                        <span style={{ color: "var(--text-faint)" }}> · </span>
-                        SH {baseStats[7]}
-                      </div>
-                    </div>
-                  )}
+            {enemyList.map((e) => (
+              <div
+                key={e.id}
+                className="p-3 rounded-lg"
+                style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[13px] font-bold">{e.name}</span>
+                  <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+                    HP {e.stats[6]} &middot; SH {e.stats[7]}
+                  </span>
                 </div>
-              );
-            })}
+                <div className="flex gap-3 text-[11px] tabular-nums" style={{ color: "var(--text-dim)" }}>
+                  <span><span style={{ color: "var(--red)" }}>Sword</span> {e.stats[0]}/{e.stats[1]}</span>
+                  <span><span style={{ color: "var(--blue)" }}>Shield</span> {e.stats[2]}/{e.stats[3]}</span>
+                  <span><span style={{ color: "var(--green)" }}>Spell</span> {e.stats[4]}/{e.stats[5]}</span>
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </section>
@@ -429,6 +333,7 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
   addLog: (msg: string) => void;
 }) {
   const [claiming, setClaiming] = useState(false);
+  const [confirmConvert, setConfirmConvert] = useState(false);
 
   // Aggregates
   const totalE = roms.reduce((s, r) => s + Math.floor(r.factoryStats.energyCollectable), 0);
@@ -531,11 +436,27 @@ function RomsPage({ roms, onClaimRom, onConvertToDust, onRefresh, loading, addLo
         </button>
         <button
           disabled={loading || claiming || totalE === 0}
-          onClick={handleConvertAll}
+          onClick={() => {
+            if (!confirmConvert) {
+              setConfirmConvert(true);
+              return;
+            }
+            setConfirmConvert(false);
+            handleConvertAll();
+          }}
+          onBlur={() => setConfirmConvert(false)}
           className="btn-press text-[11px] font-bold uppercase px-4 py-2 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
-          style={{ background: "var(--green)", border: "none", color: "var(--bg)" }}
+          style={{
+            background: confirmConvert ? "var(--red-cta)" : "var(--green)",
+            border: "none",
+            color: confirmConvert ? "var(--text-inverse)" : "var(--bg)",
+          }}
         >
-          {claiming ? "..." : `Convert All Energy to Dust (${fmt(totalE)}E)`}
+          {claiming
+            ? "..."
+            : confirmConvert
+              ? `Convert ${fmt(totalE)}E — can't be undone. Sure?`
+              : `Convert All Energy to Dust (${fmt(totalE)}E)`}
         </button>
       </div>
 
@@ -689,6 +610,10 @@ export default function Home() {
   const [autoPlay, setAutoPlay] = useState(false);
   const [chainMode, setChainMode] = useState<{ dungeonId: number; dungeonName: string } | null>(null);
   const chainModeRef = useRef<{ dungeonId: number; dungeonName: string } | null>(null);
+  const [chainCap, setChainCap] = useState("");
+  const chainCapRef = useRef("");
+  useEffect(() => { chainCapRef.current = chainCap; }, [chainCap]);
+  const [dismissedError, setDismissedError] = useState<string | null>(null);
   const [runSummary, setRunSummary] = useState<{
     roomsCleared: number;
     boons: string[];
@@ -734,32 +659,27 @@ export default function Home() {
     }));
   }, []);
 
-  // Track enemy moves from action responses
-  const trackEnemyMove = useCallback((result: DungeonActionResponse) => {
-    const run = result.data?.run;
-    const entity = result.data?.entity;
-    const enemy = run?.players?.[1];
-    if (!enemy?.lastMove || !entity || entity.ENEMY_CID < 0) return;
-
-    // Estimate which round this was (0-indexed).
-    // After the enemy plays, one charge is spent. Charges start at 9 total (3 per move).
-    // charges_used = 9 - currentCharges. But we see state AFTER the move,
-    // so charges_used includes this move. Round = charges_used - 1.
-    const totalMaxCharges = 9;
-    const currentCharges = (["rock", "paper", "scissor"] as const).reduce(
-      (sum, m) => sum + Math.max(0, enemy[m].currentCharges), 0
-    );
-    const roundEst = Math.max(0, totalMaxCharges - currentCharges - 1);
-
-    giga.recordEnemyMove(
-      entity.ENEMY_CID,
-      entity.ROOM_NUM_CID,
-      entity.DUNGEON_ID_CID,
-      entity.LEVEL_CID,
-      enemy.lastMove,
-      roundEst
-    );
-  }, []);
+  // Opt-in probe: validates that enemy charges deplete and scores the
+  // predictor against its 1/3 baseline. No-op unless enabled in localStorage.
+  const trackEnemyMove = useCallback(
+    (before: DungeonActionResponse | null, result: DungeonActionResponse) => {
+      const entity = result.data?.entity;
+      const enemy = result.data?.run?.players?.[1];
+      if (!enemy?.lastMove || !entity || entity.ENEMY_CID < 0) return;
+      const names = gigaRef.current.enemyNames;
+      const stats =
+        names[String(entity.ENEMY_CID)]?.stats ?? names[`idx:${entity.ENEMY_CID}`]?.stats;
+      probeEnemyMove(
+        before?.data?.run?.players?.[1] ?? null,
+        enemy,
+        entity.ENEMY_CID,
+        entity.ROOM_NUM_CID,
+        stats,
+        result.data?.run?.players?.[0]
+      );
+    },
+    []
+  );
 
   const addLog = useCallback(
     (msg: string) => {
@@ -967,6 +887,7 @@ export default function Home() {
       setLastDrops([]);
 
       let lastRoomNum = 0;
+      let noActionStreak = 0;
       // Capture dungeon name early before state is cleared at run end
       let capturedDungeonName = getDungeonName();
       // Track state locally so we don't depend on async React re-renders
@@ -982,6 +903,22 @@ export default function Home() {
           return { roomsCleared: lastRoomNum, won: false, finalHp: 0, maxHp: 0, dungeonName: capturedDungeonName };
         }
 
+        // Death ends the run server-side, but the response that kills you comes
+        // back as "Move Used" rather than "Run Complete" and still carries a
+        // run object — so without this the loop keeps firing moves into a run
+        // that no longer exists.
+        const me = run.players?.[0];
+        if (me && me.health.current <= 0) {
+          addLog(`auto: died in room ${lastRoomNum}`);
+          return {
+            roomsCleared: lastRoomNum,
+            won: false,
+            finalHp: 0,
+            maxHp: me.health.currentMax ?? 0,
+            dungeonName: capturedDungeonName,
+          };
+        }
+
         // Re-capture dungeon name while entity is still available
         if (entity) {
           lastRoomNum = entity.ROOM_NUM_CID;
@@ -989,12 +926,22 @@ export default function Home() {
           if (freshName !== "Unknown") capturedDungeonName = freshName;
         }
 
-        const action = pickBestAction(state!, g.enemyMoveRecords, g.enemyNames);
+        const action = pickBestAction(state!, g.enemyNames);
         if (!action) {
-          addLog("auto: no valid action");
-          await delay(1000);
+          // Refetch once in case our copy of the state is behind; if the server
+          // agrees there's nothing to do, stop rather than spinning forever.
+          addLog("auto: no valid action, refetching state");
+          noActionStreak++;
+          if (noActionStreak >= 3) {
+            addLog("auto: no valid action after 3 tries, ending run");
+            return { roomsCleared: lastRoomNum, won: false, finalHp: 0, maxHp: 0, dungeonName: capturedDungeonName };
+          }
+          const refetched = await g.fetchDungeonState();
+          currentState = refetched;
+          await delay(500);
           continue;
         }
+        noActionStreak = 0;
 
         if (typeof action === "string" && action.startsWith("loot_")) {
           const idx = ["loot_one", "loot_two", "loot_three", "loot_four"].indexOf(action);
@@ -1006,14 +953,26 @@ export default function Home() {
           }
         }
 
-        const explanation = explainAction(state!, action, g.enemyMoveRecords, g.enemyNames);
+        // Awakening runs take their boons through the reward screen instead, so
+        // the run summary has to read them from there or it comes out empty.
+        if (typeof action === "string" && action.startsWith("reward_")) {
+          const idx = ["reward_one", "reward_two", "reward_three"].indexOf(action);
+          const reward = run.rewardPathOptions?.[idx];
+          if (reward?.boon) {
+            runBoonsRef.current.push(
+              `${formatBoon(reward.boon.boonTypeString, reward.boon.selectedVal1, reward.boon.selectedVal2)} +${reward.gigusOrbAmount} Cores`
+            );
+          }
+        }
+
+        const explanation = explainAction(state!, action, g.enemyNames);
         addLog(`auto: ${explanation}`);
 
         const result = await g.performAction(action as DungeonAction);
 
         if (result) {
+          trackEnemyMove(state ?? null, result);
           currentState = result;
-          trackEnemyMove(result);
           trackItemDrops(result);
 
           if (result.message === "Run Complete") {
@@ -1038,7 +997,6 @@ export default function Home() {
           const fresh = await g.fetchDungeonState();
           if (fresh) {
             currentState = fresh;
-            trackEnemyMove(fresh);
           } else {
             addLog(`auto: recovery failed, stopping`);
             break;
@@ -1085,6 +1043,12 @@ export default function Home() {
         const chain = chainModeRef.current;
         if (!chain) break;
 
+        const cap = parseInt(chainCapRef.current, 10);
+        if (cap > 0 && chainStatsRef.current.totalRuns >= cap) {
+          addLog(`chain: run cap of ${cap} reached`);
+          break;
+        }
+
         addLog(`chain: starting run #${chainStatsRef.current.totalRuns + 1}...`);
         const startResult = await gigaRef.current.startRun(chain.dungeonId);
 
@@ -1128,8 +1092,8 @@ export default function Home() {
     [giga.dungeonState]
   );
   const recommended = useMemo(
-    () => giga.dungeonState ? pickBestAction(giga.dungeonState, giga.enemyMoveRecords, giga.enemyNames) : null,
-    [giga.dungeonState, giga.enemyMoveRecords, giga.enemyNames]
+    () => giga.dungeonState ? pickBestAction(giga.dungeonState, giga.enemyNames) : null,
+    [giga.dungeonState, giga.enemyNames]
   );
 
   // Track dungeon name while in a run so it's available after the run ends
@@ -1177,12 +1141,15 @@ export default function Home() {
       const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || "";
       return name.toLowerCase().includes("rock");
     }) ?? false;
-    let count = 0;
-    if (!isOnCooldown("Recipe#700000")) count++;
-    if (!isOnCooldown("Recipe#700003") && eng?.isPlayerJuiced) count++;
-    if (!isOnCooldown("Recipe#700001") && hasPaperHands) count++;
-    if (!isOnCooldown("Recipe#700002") && hasRockHands) count++;
-    return count;
+    // Counted off the shared table so a new claim cannot be shown in the panel
+    // while the nav badge silently ignores it.
+    return CLAIM_RECIPES.filter((r) => {
+      if (isOnCooldown(r.id)) return false;
+      if (r.needsJuice && !eng?.isPlayerJuiced) return false;
+      if (r.handsType === "Paper Hands" && !hasPaperHands) return false;
+      if (r.handsType === "Rock Hands" && !hasRockHands) return false;
+      return true;
+    }).length;
   }, [giga.worldRecipes, giga.playerRecipes, giga.gearInstances, giga.itemInfo, eng?.isPlayerJuiced]);
 
   const upgradableBadge = useMemo(() => {
@@ -1194,6 +1161,32 @@ export default function Home() {
       return nextCost !== undefined && currencyBal >= nextCost;
     }).length;
   }, [giga.skillTrees, giga.skillProgress, giga.itemBalances]);
+
+  // Daily completion strip — one glance answers "am I done for today?"
+  const daily = useMemo(() => {
+    const juiced = eng?.isPlayerJuiced ?? false;
+    const dungeons = (giga.dungeonToday?.dungeonDataEntities ?? []).filter((d) => d.ENERGY_CID > 0);
+    const dayProgress = giga.dungeonToday?.dayProgressEntities ?? [];
+    let runsUsed = 0;
+    let runsMax = 0;
+    for (const d of dungeons) {
+      const p = dayProgress.find((pp) => pp.ID_CID === `Dungeon#${d.ID_CID}`);
+      runsUsed += p?.UINT256_CID ?? 0;
+      runsMax += getMaxRunsPerDay(d, juiced);
+    }
+    const fs = giga.fishingState;
+    const castsToday = fs ? castsUsedToday(fs) : null;
+    const maxCasts = fs
+      ? (juiced ? (fs.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay) : (fs.maxPerDay ?? FISHING.maxCastsPerDay))
+      : null;
+    const allDone =
+      runsMax > 0 &&
+      runsUsed >= runsMax &&
+      castsToday !== null && maxCasts !== null && castsToday >= maxCasts &&
+      worldBadge === 0 &&
+      hasVoted;
+    return { runsUsed, runsMax, castsToday, maxCasts, allDone };
+  }, [giga.dungeonToday, giga.fishingState, eng?.isPlayerJuiced, worldBadge, hasVoted]);
 
   /* ─── Restoring session ──────────────────────────────── */
   if (giga.restoringSession) {
@@ -1231,11 +1224,8 @@ export default function Home() {
             <button
               onClick={handleWalletLogin}
               disabled={giga.loading}
-              className="btn-press w-full py-3 text-[13px] font-bold rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed mb-4"
+              className="btn-press cta-orange w-full py-3 text-[13px] font-bold rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed mb-4"
               style={{
-                background: "linear-gradient(135deg, var(--orange), var(--orange-dim))",
-                color: "var(--text-inverse)",
-                border: "none",
                 boxShadow: "0 2px 8px var(--orange-glow), 0 1px 0 var(--orange-dim)",
               }}
             >
@@ -1245,6 +1235,11 @@ export default function Home() {
                   ? "Sign & Connect"
                   : "Connect Wallet"}
             </button>
+
+            <p className="text-[11px] -mt-2 mb-4" style={{ color: "var(--text-faint)", lineHeight: 1.5 }}>
+              This signs a login message to prove you own the wallet — no transaction, no gas, no
+              spending approval. GigaBrain never asks for private keys or seed phrases.
+            </p>
 
             {walletConnected && walletAddress && (
               <div className="text-[11px] text-center mb-4 -mt-2" style={{ color: "var(--text-faint)" }}>
@@ -1282,10 +1277,20 @@ export default function Home() {
                 <label className="text-[11px] font-semibold uppercase tracking-[0.1em] block mb-2" style={{ color: "var(--text-faint)" }}>
                   Session Token
                 </label>
-                <p className="text-[11px] mb-3" style={{ color: "var(--text-faint)" }}>
-                  <code className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: "var(--bg-inset)", color: "var(--text-dim)" }}>
-                    JSON.parse(localStorage.authResponse).jwt
-                  </code>
+                <ol className="text-[11px] mb-2 space-y-1 list-decimal list-inside" style={{ color: "var(--text-dim)", lineHeight: 1.5 }}>
+                  <li>Log in at gigaverse.io in another tab</li>
+                  <li>Open the browser console there (F12 → Console)</li>
+                  <li>
+                    Run{" "}
+                    <code className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: "var(--bg-inset)", color: "var(--text-dim)", overflowWrap: "anywhere" }}>
+                      JSON.parse(localStorage.authResponse).jwt
+                    </code>
+                  </li>
+                  <li>Paste the result below</li>
+                </ol>
+                <p className="text-[11px] mb-3" style={{ color: "var(--text-faint)", lineHeight: 1.5 }}>
+                  Treat the token like a password — it grants full access to your Gigaverse account.
+                  It stays in this browser and is used only to call the Gigaverse API.
                 </p>
                 <textarea
                   value={jwtInput}
@@ -1359,7 +1364,7 @@ export default function Home() {
           {/* Energy */}
           <div className="flex items-center gap-3 shrink-0" title="Energy — regenerates over time, used for dungeons, fishing, pots">
             <div>
-              <div className="text-[10px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>Energy</div>
+              <div className="text-[11px] font-bold uppercase tracking-wide" style={{ color: "var(--text-dim)" }}>Energy</div>
               <div className="flex items-baseline gap-1">
                 <span className="text-[18px] font-bold tabular-nums" style={{ color: "var(--orange)" }}>
                   {eng ? Math.floor(eng.energyValue) : "--"}
@@ -1396,7 +1401,7 @@ export default function Home() {
 
           {/* Dungeon status */}
           <div className="hud-detail shrink-0" title="Current dungeon run status">
-            <div className="text-[10px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>Dungeon</div>
+            <div className="text-[11px] font-bold uppercase tracking-wide" style={{ color: "var(--text-dim)" }}>Dungeon</div>
             <div className="flex items-center gap-2">
               <span
                 className="inline-block w-2 h-2 rounded-full shrink-0"
@@ -1420,6 +1425,55 @@ export default function Home() {
             </div>
           </div>
 
+          <div className="hud-detail w-px h-5 shrink-0" style={{ background: "var(--border)" }} />
+
+          {/* Daily completion strip */}
+          <div className="hud-detail shrink-0">
+            <div className="text-[11px] font-bold uppercase tracking-wide" style={{ color: "var(--text-dim)" }}>Today</div>
+            {daily.allDone ? (
+              <div className="text-[13px] font-semibold" style={{ color: "var(--green)" }}>✓ Done for today</div>
+            ) : (
+              <div className="flex items-center gap-3 text-[13px] font-semibold tabular-nums">
+                <span
+                  className="flex items-center gap-1"
+                  title={`Dungeon runs used today: ${daily.runsUsed} of ${daily.runsMax}`}
+                  aria-label={`Dungeon runs used today: ${daily.runsUsed} of ${daily.runsMax}`}
+                  style={{ color: daily.runsMax > 0 && daily.runsUsed >= daily.runsMax ? "var(--green)" : "var(--text-dim)" }}
+                >
+                  <Sword size={13} aria-hidden="true" /> {daily.runsUsed}/{daily.runsMax}
+                </span>
+                {daily.castsToday !== null && daily.maxCasts !== null && (
+                  <span
+                    className="flex items-center gap-1"
+                    title={`Fishing casts used today: ${daily.castsToday} of ${daily.maxCasts}`}
+                    aria-label={`Fishing casts used today: ${daily.castsToday} of ${daily.maxCasts}`}
+                    style={{ color: daily.castsToday >= daily.maxCasts ? "var(--green)" : "var(--text-dim)" }}
+                  >
+                    <Fish size={13} aria-hidden="true" /> {daily.castsToday}/{daily.maxCasts}
+                  </span>
+                )}
+                <span
+                  className="flex items-center gap-1"
+                  title={worldBadge > 0 ? `${worldBadge} chest${worldBadge === 1 ? "" : "s"}/pot${worldBadge === 1 ? "" : "s"} ready to open` : "All chests and pots on cooldown"}
+                  aria-label={worldBadge > 0 ? `${worldBadge} chests or pots ready to open` : "All chests and pots on cooldown"}
+                  style={{ color: worldBadge > 0 ? "var(--gold)" : "var(--green)" }}
+                >
+                  <Package size={13} aria-hidden="true" /> {worldBadge > 0 ? worldBadge : "✓"}
+                </span>
+                {walletConnected && (
+                  <span
+                    className="flex items-center gap-1"
+                    title={hasVoted ? "Voted on the Abstract portal today" : "Portal vote not cast yet"}
+                    aria-label={hasVoted ? "Voted on the Abstract portal today" : "Portal vote not cast yet"}
+                    style={{ color: hasVoted ? "var(--green)" : "var(--text-dim)" }}
+                  >
+                    <Vote size={13} aria-hidden="true" /> {hasVoted ? "✓" : "–"}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Spacer */}
           <div className="flex-1 min-w-0" />
 
@@ -1434,7 +1488,7 @@ export default function Home() {
             {/* Portal vote */}
             {walletConnected && (
               <div className="hud-detail-secondary shrink-0" title="Abstract Portal — vote for Gigaverse to earn XP">
-                <div className="text-[10px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>Vote</div>
+                <div className="text-[11px] font-bold uppercase tracking-wide" style={{ color: "var(--text-dim)" }}>Vote</div>
                 {hasVoted ? (
                   <div className="flex items-center gap-1.5 text-[13px] font-semibold" style={{ color: "var(--green)" }}>
                     <Vote size={15} /> Voted
@@ -1518,7 +1572,6 @@ export default function Home() {
             width: railExpanded ? 180 : 56,
             background: "var(--bg-raised)",
             borderRight: "1px solid var(--border)",
-            transition: "width 200ms ease",
             overflow: "hidden",
           }}
         >
@@ -1533,7 +1586,7 @@ export default function Home() {
               background: "transparent",
               border: "1px solid transparent",
               color: "var(--text-faint)",
-              transition: "all 200ms ease",
+              transition: "background 150ms ease, border-color 150ms ease, color 150ms ease",
               paddingLeft: railExpanded ? 12 : 0,
               justifyContent: railExpanded ? "flex-start" : "center",
             }}
@@ -1560,7 +1613,7 @@ export default function Home() {
                   key={item.id}
                   onClick={() => { setActivePage(item.id); setFlyout(null); }}
                   title={railExpanded ? undefined : item.label}
-                  aria-label={item.label}
+                  aria-label={item.badge > 0 ? `${item.label}, ${item.badge} ready` : item.label}
                   aria-current={active ? "page" : undefined}
                   className="cursor-pointer flex items-center gap-2.5 rounded-md mx-auto relative"
                   style={{
@@ -1571,7 +1624,7 @@ export default function Home() {
                     background: active ? "var(--orange-glow)" : "transparent",
                     border: active ? "1px solid var(--border-accent)" : "1px solid transparent",
                     color: active ? "var(--orange)" : "var(--text-faint)",
-                    transition: "all 200ms ease",
+                    transition: "background 150ms ease, border-color 150ms ease, color 150ms ease",
                   }}
                 >
                   <span className="relative shrink-0">
@@ -1610,7 +1663,7 @@ export default function Home() {
           }
 
           {/* Divider */}
-          <div className="nav-rail-hide mx-auto my-1" style={{ width: railExpanded ? 148 : 24, height: 1, background: "var(--border)", transition: "width 200ms ease" }} />
+          <div className="nav-rail-hide mx-auto my-1" style={{ width: railExpanded ? 148 : 24, height: 1, background: "var(--border)" }} />
 
           {/* Flyout icons */}
           {([
@@ -1625,6 +1678,8 @@ export default function Home() {
                   key={item.id}
                   onClick={() => setFlyout(active ? null : item.id)}
                   title={railExpanded ? undefined : item.label}
+                  aria-label={item.badge > 0 ? `${item.label}, ${item.badge} upgrades ready` : item.label}
+                  aria-expanded={active}
                   className="cursor-pointer flex items-center gap-2.5 rounded-md mx-auto relative"
                   style={{
                     width: railExpanded ? 164 : 42,
@@ -1634,7 +1689,7 @@ export default function Home() {
                     background: active ? "var(--orange-glow)" : "transparent",
                     border: active ? "1px solid var(--border-accent)" : "1px solid transparent",
                     color: active ? "var(--orange)" : "var(--text-faint)",
-                    transition: "all 200ms ease",
+                    transition: "background 150ms ease, border-color 150ms ease, color 150ms ease",
                   }}
                 >
                   <span className="relative shrink-0">
@@ -1689,7 +1744,7 @@ export default function Home() {
               background: "transparent",
               border: "1px solid transparent",
               color: "var(--text-faint)",
-              transition: "all 200ms ease",
+              transition: "background 150ms ease, border-color 150ms ease, color 150ms ease",
             }}
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
@@ -1719,7 +1774,6 @@ export default function Home() {
               style={{
                 left: railExpanded ? 180 : 56,
                 width: 360,
-                transition: "left 200ms ease",
                 background: "var(--bg-raised)",
                 borderRight: "1px solid var(--border)",
                 zIndex: 45,
@@ -1828,14 +1882,15 @@ export default function Home() {
                                 const isRecommended = skillAdvice?.upgrades[0]?.skillId === Number(tree.docId) && skillAdvice.upgrades[0]?.statId === stat.id;
                                 return (
                                   <div key={stat.id} className="flex items-center gap-2">
-                                    <span className="flex-1 text-[12px] truncate" style={{ color: isRecommended ? "var(--gold)" : "var(--text-dim)" }} title={stat.desc}>
+                                    <span className="flex-1 min-w-0 text-[12px] truncate" style={{ color: isRecommended ? "var(--gold)" : "var(--text-dim)" }} title={stat.desc}>
                                       {stat.name}
-                                      {isRecommended && <span className="font-bold"> ★</span>}
                                     </span>
+                                    {isRecommended && <RecBadge />}
                                     <span className="text-[12px] tabular-nums" style={{ color: "var(--text-faint)" }}>Lv {lvl}</span>
                                     <button
                                       onClick={() => applySkillUpgrades([{ skillId: Number(tree.docId), statId: stat.id, statName: stat.name }])}
                                       disabled={!canUpgrade || applyingSkills}
+                                      aria-label={`Upgrade ${stat.name} to level ${lvl + 1}`}
                                       className="btn-press text-[11px] font-bold px-2 py-0.5 rounded cursor-pointer disabled:opacity-25 disabled:cursor-not-allowed"
                                       style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", color: canUpgrade ? "var(--green)" : "var(--text-faint)" }}
                                     >
@@ -1866,8 +1921,8 @@ export default function Home() {
                         href={`https://ko-fi.com/${DONATIONS.kofi}`}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="btn-press flex items-center justify-center gap-2 w-full py-2.5 rounded-lg text-[13px] font-bold"
-                        style={{ background: "linear-gradient(135deg, var(--orange), var(--orange-dim))", color: "var(--text-inverse)", textDecoration: "none" }}
+                        className="btn-press cta-orange flex items-center justify-center gap-2 w-full py-2.5 rounded-lg text-[13px] font-bold"
+                        style={{ textDecoration: "none" }}
                       >
                         <Heart size={15} /> Ko-fi
                       </a>
@@ -1901,6 +1956,7 @@ export default function Home() {
                 {flyout === "log" && (
                   <div
                     className="log-area"
+                    role="log"
                     style={{
                       maxHeight: "calc(100vh - 140px)",
                       overflowY: "auto",
@@ -1910,22 +1966,7 @@ export default function Home() {
                       border: "1px solid var(--border)",
                     }}
                   >
-                    {log.length === 0 ? (
-                      <p className="text-[12px] italic" style={{ color: "var(--text-faint)" }}>Waiting for actions.</p>
-                    ) : (
-                      log.map((entry, i) => (
-                        <div
-                          key={entry.id}
-                          className="text-[12px] leading-relaxed py-0.5 font-[family-name:monospace]"
-                          style={{
-                            color: i === 0 ? "var(--text-dim)" : "var(--text-faint)",
-                            opacity: Math.max(0.3, 1 - i * 0.05),
-                          }}
-                        >
-                          {entry.text}
-                        </div>
-                      ))
-                    )}
+                    <LogFeed entries={log} emptyText="Waiting for actions." fade />
                   </div>
                 )}
               </div>
@@ -1943,7 +1984,6 @@ export default function Home() {
               addLog={addLog}
               handleVote={handleVote}
               hasVoted={hasVoted}
-              voting={voting}
               refreshRunStats={refreshRunStats}
             />
           )}
@@ -1952,7 +1992,6 @@ export default function Home() {
           {activePage === "stats" && (
             <StatsPage
               runStats={runStats}
-              enemyMoveRecords={giga.enemyMoveRecords}
               enemyNames={giga.enemyNames}
               itemInfo={giga.itemInfo}
             />
@@ -2008,15 +2047,6 @@ export default function Home() {
                 </div>
               )}
             </div>
-            <div className="flex items-center gap-2.5">
-              <button
-                onClick={() => giga.refreshAll()}
-                className="btn-press text-[11px] font-semibold px-3 py-1.5 rounded-md cursor-pointer"
-                style={{ background: "var(--bg-raised)", border: "1px solid var(--border)", color: "var(--text-dim)" }}
-              >
-                Refresh
-              </button>
-            </div>
           </div>
 
           {/* Auto-play controls */}
@@ -2033,8 +2063,8 @@ export default function Home() {
               disabled={!inRun && !autoPlay}
               className="btn-press text-[12px] font-bold px-5 py-2 rounded-md cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
               style={{
-                background: autoPlay ? "linear-gradient(135deg, var(--orange), var(--orange-dim))" : "var(--bg-inset)",
-                color: autoPlay ? "var(--text-inverse)" : "var(--text-dim)",
+                background: autoPlay ? "linear-gradient(135deg, var(--orange-lite), var(--orange))" : "var(--bg-inset)",
+                color: autoPlay ? "var(--on-orange)" : "var(--text-dim)",
                 border: autoPlay ? "none" : "1px solid var(--border)",
                 boxShadow: autoPlay ? "0 2px 8px var(--orange-glow)" : "none",
                 minWidth: 110,
@@ -2065,11 +2095,29 @@ export default function Home() {
                 )}
               </div>
               {inRun && (
-                <div className="text-[10px] mt-0.5 tabular-nums" style={{ color: "var(--text-faint)" }}>
-                  eval: {stateScore.toFixed(2)}
+                <div
+                  className="text-[10px] mt-0.5 tabular-nums"
+                  style={{ color: "var(--text-faint)" }}
+                  title="The auto-battler's read on the current fight — positive means you're ahead"
+                >
+                  advantage: {stateScore.toFixed(2)}
                 </div>
               )}
             </div>
+            <label className="flex items-center gap-1.5 text-[11px] shrink-0" style={{ color: "var(--text-faint)" }}>
+              Chain cap
+              <input
+                type="number"
+                min={1}
+                placeholder="∞"
+                value={chainCap}
+                onChange={(e) => setChainCap(e.target.value)}
+                disabled={autoPlay}
+                title="Stop chaining after this many runs (blank = until energy runs out)"
+                className="w-14 px-2 py-1 rounded text-[12px] tabular-nums"
+                style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text)" }}
+              />
+            </label>
           </div>
 
           {/* Run summary */}
@@ -2255,9 +2303,9 @@ export default function Home() {
                           disabled={giga.loading || notEnough}
                           className="btn-press text-[14px] font-bold px-5 py-3 rounded-lg cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                           style={{
-                            background: notEnough ? "var(--bg-inset)" : "linear-gradient(135deg, var(--orange), var(--orange-dim))",
+                            background: notEnough ? "var(--bg-inset)" : "linear-gradient(135deg, var(--orange-lite), var(--orange))",
                             border: notEnough ? "1px solid var(--border)" : "none",
-                            color: notEnough ? "var(--text-faint)" : "var(--text-inverse)",
+                            color: notEnough ? "var(--text-faint)" : "var(--on-orange)",
                             boxShadow: notEnough ? "none" : "0 3px 12px var(--orange-glow)",
                           }}
                         >
@@ -2434,8 +2482,7 @@ export default function Home() {
                           className="btn-press flex-1 text-left p-3.5 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
                           style={{
                             background: "var(--bg-raised)",
-                            border: `1px solid ${isRecommended ? "var(--border-accent)" : "var(--border)"}`,
-                            borderLeft: `3px solid ${rarityColor}`,
+                            border: `1px solid ${isRecommended ? "var(--border-accent)" : rarityColor}`,
                             boxShadow: isRecommended
                               ? `0 0 20px var(--orange-glow), inset 0 1px 0 rgba(255,255,255,0.02)`
                               : rarityGlow !== "none" ? `0 0 15px ${rarityGlow}` : "none",
@@ -2451,9 +2498,7 @@ export default function Home() {
                             }
                           </div>
                           {isRecommended && (
-                            <div className="text-[10px] mt-1.5 font-bold uppercase" style={{ color: "var(--orange)" }}>
-                              recommended
-                            </div>
+                            <div className="mt-1.5"><RecBadge /></div>
                           )}
                         </button>
                       );
@@ -2477,7 +2522,7 @@ export default function Home() {
                           addLog(MOVE_LABELS[move]);
                           const r = await giga.performAction(move);
                           if (r) {
-                            trackEnemyMove(r);
+                            trackEnemyMove(giga.dungeonState, r);
                             trackItemDrops(r);
                             const p = r.data?.run?.players?.[0], e = r.data?.run?.players?.[1];
                             if (p && e) addLog(`${p.health.current}hp vs ${e.health.current}hp`);
@@ -2513,7 +2558,7 @@ export default function Home() {
                               ? `0 4px 12px ${MOVE_BG[move]}, 0 2px 0 var(--bg-inset)`
                               : "0 2px 0 var(--bg-inset)",
                           opacity: off ? 0.35 : 1,
-                          transition: "all 150ms ease",
+                          transition: "background 150ms ease, border-color 150ms ease, color 150ms ease",
                           textAlign: "left",
                         }}
                       >
@@ -2525,14 +2570,7 @@ export default function Home() {
                             <span className="text-[14px] font-bold uppercase tracking-wide" style={{ color: MOVE_COLORS[move] }}>
                               {MOVE_LABELS[move]}
                             </span>
-                            {isRec && !autoPlay && (
-                              <span
-                                className="text-[8px] font-bold uppercase tracking-wider py-0.5 px-1.5 rounded"
-                                style={{ color: "var(--orange)", background: "var(--orange-glow)" }}
-                              >
-                                best
-                              </span>
-                            )}
+                            {isRec && !autoPlay && <RecBadge />}
                           </div>
                           <div className="text-[12px] mt-0.5 font-medium tabular-nums" style={{ color: "var(--text-dim)" }}>
                             <span className="font-bold" style={{ color: "var(--text)" }}>{s.currentATK}</span>
@@ -2560,17 +2598,34 @@ export default function Home() {
       </div>
 
       {/* Error toast */}
-      {giga.error && (
+      {giga.error && giga.error !== dismissedError && (
         <div
-          className="fixed bottom-4 right-4 text-[12px] font-semibold px-4 py-2.5 rounded-lg"
+          role="alert"
+          className="error-toast fixed bottom-4 right-4 flex items-center gap-3 text-[12px] font-semibold px-4 py-2.5 rounded-lg"
           style={{
-            background: "var(--red)",
+            background: "var(--red-cta)",
             color: "var(--text-inverse)",
             boxShadow: "0 4px 20px var(--red-glow)",
             zIndex: 60,
+            maxWidth: 360,
           }}
         >
-          {giga.error}
+          <span className="flex-1">{giga.error}</span>
+          <button
+            onClick={() => { setDismissedError(giga.error); giga.refreshAll(); }}
+            className="shrink-0 text-[11px] font-bold px-2 py-1 rounded cursor-pointer"
+            style={{ background: "rgba(0,0,0,0.25)", border: "none", color: "var(--text-inverse)" }}
+          >
+            Retry
+          </button>
+          <button
+            onClick={() => setDismissedError(giga.error)}
+            aria-label="Dismiss error"
+            className="shrink-0 flex items-center justify-center cursor-pointer"
+            style={{ background: "none", border: "none", color: "var(--text-inverse)", width: 20, height: 20 }}
+          >
+            <X size={14} />
+          </button>
         </div>
       )}
     </div>
@@ -2579,17 +2634,17 @@ export default function Home() {
 
 /* ─── Fishing Page ──────────────────────────────────────── */
 
-const CAST_NODES = [
+const CLASSIC_CAST_NODES = [
   { nodeId: "0", label: "Small", energyKey: "node0Energy" as const, cost: 12 },
   { nodeId: "1", label: "Normal", energyKey: "node1Energy" as const, cost: 16 },
   { nodeId: "2", label: "Big", energyKey: "node2Energy" as const, cost: 20 },
 ] as const;
 
-const GRID_LABELS = [
-  [1, 2, 3],
-  [4, 5, 6],
-  [7, 8, 9],
-];
+// The Dendren Grove is a fourth node drawing on the same daily cast pool. It
+// has no nodeNEnergy field of its own, so its cost comes from the constant.
+const CAST_NODES = isAwakeningActive()
+  ? [...CLASSIC_CAST_NODES, { ...AWAKENING.pond, energyKey: "node0Energy" as const }]
+  : [...CLASSIC_CAST_NODES];
 
 const RARITY_FISH_COLORS = [
   "var(--text-faint)",   // 0 - common
@@ -2606,8 +2661,14 @@ function FishingPage({ giga, addLog }: {
 }) {
   const [autoFish, setAutoFish] = useState(false);
   const [autoCastNode, setAutoCastNode] = useState("auto");
-  const [sessionStats, setSessionStats] = useState({ casts: 0, caught: 0, escaped: 0, seaweed: 0 });
+  // `catches` keeps the actual fish, not just a tally — an auto-fish run that
+  // reports "7 caught" says nothing about whether they were worth the energy.
+  const [sessionStats, setSessionStats] = useState<{
+    casts: number; caught: number; escaped: number; seaweed: number;
+    catches: { name: string; rarity: number; quality: number; size: string; seaweed: number }[];
+  }>({ casts: 0, caught: 0, escaped: 0, seaweed: 0, catches: [] });
   const [fishingLog, setFishingLog] = useState<string[]>([]);
+  const [confirmSellAll, setConfirmSellAll] = useState(false);
   const autoFishRef = useRef(false);
 
   // Keep ref in sync
@@ -2622,7 +2683,7 @@ function FishingPage({ giga, addLog }: {
   const fs = giga.fishingState;
   const gameData = fs?.gameState?.data;
   const isInGame = fs?.gameState && !fs.gameState.COMPLETE_CID;
-  const castsToday = fs?.dayDoc?.UINT256_CID ?? 0;
+  const castsToday = castsUsedToday(fs);
   const fishJuiced = giga.energy?.entities?.[0]?.parsedData?.isPlayerJuiced ?? false;
   const maxCasts = fishJuiced
     ? (fs?.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
@@ -2638,7 +2699,9 @@ function FishingPage({ giga, addLog }: {
     if (nodeId === "0") return fs.node0Energy;
     if (nodeId === "1") return fs.node1Energy;
     if (nodeId === "2") return fs.node2Energy;
-    return 0;
+    // The Grove has no nodeNEnergy field of its own, so its cost comes from the
+    // node table. Returning 0 here showed it as a free cast.
+    return CAST_NODES.find((n) => n.nodeId === nodeId)?.cost ?? 0;
   }, [fs]);
 
   // Get the current energy entity to check available energy
@@ -2646,7 +2709,7 @@ function FishingPage({ giga, addLog }: {
 
   const startCast = useCallback(async (nodeId: string) => {
     addFishLog(`Starting cast (node ${nodeId})...`);
-    const result = await giga.fishingAction("start_run", { cards: [], nodeId });
+    const result = await giga.fishingAction("start_run", { cards: [], nodeId, tierId: castTierForNode(nodeId) });
     if (result) {
       setSessionStats((s) => ({ ...s, casts: s.casts + 1 }));
       addFishLog(`Cast started! Fish HP: ${result.data.doc.data.fishHp}/${result.data.doc.data.fishMaxHp}`);
@@ -2654,15 +2717,39 @@ function FishingPage({ giga, addLog }: {
     return result;
   }, [giga, addFishLog]);
 
-  const playCard = useCallback(async (handIndex: number) => {
-    const result = await giga.fishingAction("play_cards", { cards: [handIndex], nodeId: "" });
+  // `snapshot` is the state the decision was made from. The auto-fish loop
+  // holds a fresher copy than this closure does, and the probe has to score the
+  // prediction against what the AI actually saw — a stale snapshot would
+  // silently grade the wrong move.
+  const playCard = useCallback(async (
+    handIndex: number,
+    focusPoint?: number[],
+    snapshot?: FishingGameData,
+  ) => {
+    const beforeMove = snapshot ?? gameData;
+    // The Grove commits a lure move through this same call, so the caller may
+    // pass a new focus point; everywhere else it stays where it is.
+    const result = await giga.fishingAction("play_cards", {
+      cards: [handIndex], nodeId: "",
+      focusPoint: focusPoint ?? beforeMove?.focusPoint ?? [],
+    });
     if (result) {
       const d = result.data.doc.data;
+      probeFishMove(beforeMove, d);
       const isComplete = result.data.doc.COMPLETE_CID;
       if (isComplete) {
         if (result.data.doc.SUCCESS_CID && d.caughtFish) {
-          addFishLog(`Caught ${d.caughtFish.name} (${d.caughtFish.size})! +${d.caughtFish.seaweedEarned} seaweed`);
-          setSessionStats((s) => ({ ...s, caught: s.caught + 1, seaweed: s.seaweed + (d.caughtFish?.seaweedEarned ?? 0) }));
+          const fish = d.caughtFish;
+          addFishLog(`Caught ${fish.name} (${fish.size}, Q${fish.quality})! +${fish.seaweedEarned} seaweed`);
+          setSessionStats((s) => ({
+            ...s,
+            caught: s.caught + 1,
+            seaweed: s.seaweed + (fish.seaweedEarned ?? 0),
+            catches: [
+              { name: fish.name, rarity: fish.rarity, quality: fish.quality, size: fish.size, seaweed: fish.seaweedEarned },
+              ...s.catches,
+            ].slice(0, 40),
+          }));
         } else {
           addFishLog(`Fish escaped! HP was ${d.fishHp}/${d.fishMaxHp}`);
           setSessionStats((s) => ({ ...s, escaped: s.escaped + 1 }));
@@ -2672,7 +2759,7 @@ function FishingPage({ giga, addLog }: {
       }
     }
     return result;
-  }, [giga, addFishLog]);
+  }, [giga, addFishLog, gameData]);
 
   // Auto-fish loop
   useEffect(() => {
@@ -2725,13 +2812,35 @@ function FishingPage({ giga, addLog }: {
           continue;
         }
 
+        // The Grove is a different game: cards are lure-anchored stamps, so the
+        // card and the lure position have to be chosen together.
+        if (data.focusMechanicEnabled) {
+          const move = pickGroveMove(data);
+          if (!move) {
+            addFishLog("AI: no playable card");
+            await delay(300);
+            continue;
+          }
+          if (move.redraw) {
+            // Recommendation only — the redraw action name is still unknown, so
+            // the best reachable card is played rather than stalling the cast.
+            addFishLog(`AI: ${move.reason} (redraw not automated yet)`);
+          } else {
+            addFishLog(`AI: ${move.reason}`);
+          }
+          await playCard(move.handIndex, move.focusPoint, data);
+          await delay(300);
+          continue;
+        }
+
         // Pick and play best card
         const { handIndex, reason } = pickBestCard(
           data.hand, data.deckCardData, data.fishPosition,
-          data.previousFishPosition, data.nextPosition
+          data.previousFishPosition, data.nextPosition,
+          resolveGrid(data)
         );
         addFishLog(`AI: ${reason}`);
-        await playCard(handIndex);
+        await playCard(handIndex, undefined, data);
         await delay(300);
       }
 
@@ -2745,7 +2854,7 @@ function FishingPage({ giga, addLog }: {
         // Check daily limit
         const state = await giga.fetchFishingState();
         if (!state || cancelled) break;
-        const today = state.dayDoc?.UINT256_CID ?? 0;
+        const today = castsUsedToday(state);
         const max = fishJuiced
           ? (state.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
           : (state.maxPerDay ?? FISHING.maxCastsPerDay);
@@ -2793,9 +2902,40 @@ function FishingPage({ giga, addLog }: {
     gameData?.deckCardData.find((c) => c.id === id)
   );
 
+  // Pond dimensions. The Dendren Grove is bigger than the original 3x3, and
+  // the API never states the size, so it comes out of the deck's zone IDs.
+  //
+  // The reading is pinned for the duration of a cast. The zone IDs are only a
+  // lower bound on the board, so a later sighting can widen it — but the board
+  // itself never changes shape mid-cast, and letting the inference wobble would
+  // re-target the AI and redraw the grid in the middle of a fight.
+  const fishGridRef = useRef<{ castId: string; grid: GridDims } | null>(null);
+  const fishGrid = useMemo(() => {
+    if (!gameData) return DEFAULT_GRID;
+    // When the server states the board size there is nothing to pin or guess.
+    if (typeof gameData.gridSize === "number" && gameData.gridSize > 0) {
+      return { cols: gameData.gridSize, rows: gameData.gridSize };
+    }
+    const castId = fs?.gameState?.docId ?? "";
+    const inferred = inferGrid(
+      gameData.deckCardData, gameData.fishPosition,
+      gameData.previousFishPosition, gameData.nextPosition
+    );
+    const pinned = fishGridRef.current;
+    if (
+      pinned &&
+      pinned.castId === castId &&
+      pinned.grid.cols * pinned.grid.rows >= inferred.cols * inferred.rows
+    ) {
+      return pinned.grid;
+    }
+    fishGridRef.current = { castId, grid: inferred };
+    return inferred;
+  }, [gameData, fs?.gameState?.docId]);
+
   const noHit = gameData ? shouldRedraw(
     gameData.hand, gameData.deckCardData, gameData.fishPosition,
-    gameData.previousFishPosition, gameData.nextPosition
+    gameData.previousFishPosition, gameData.nextPosition, fishGrid
   ) : false;
 
   // Recommend best cast type based on energy budget and remaining casts
@@ -2846,16 +2986,96 @@ function FishingPage({ giga, addLog }: {
         </div>
       </div>
 
-      <div className="grid gap-5" style={{ gridTemplateColumns: "1fr 1fr" }}>
+      <div className="fishing-grid grid gap-5">
 
         {/* ── Left Column: Cast Controls + Grid ── */}
         <div className="flex flex-col gap-4">
 
-          {/* Cast Buttons */}
+          {/* Auto-Fish Controls */}
           <div className="card p-4">
             <h3 className="text-[11px] font-bold uppercase tracking-wider mb-3" style={{ color: "var(--text-faint)" }}>
-              Cast Line
+              Auto-Fish
             </h3>
+            <div className="flex items-center gap-3 mb-3">
+              <button
+                onClick={() => setAutoFish(!autoFish)}
+                className="btn-press flex-1 rounded-md py-2.5 px-4 cursor-pointer font-semibold text-[13px]"
+                style={{
+                  background: autoFish ? "var(--red-glow)" : "var(--green-glow)",
+                  border: `1px solid ${autoFish ? "var(--red)" : "var(--green-dim)"}`,
+                  color: autoFish ? "var(--red)" : "var(--green)",
+                }}
+              >
+                {autoFish ? "Stop" : "Start Auto-Fish"}
+              </button>
+            </div>
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-[12px]" style={{ color: "var(--text-faint)" }}>Cast type:</span>
+              {[{ nodeId: "auto", label: "Auto" }, ...CAST_NODES].map((node) => (
+                <button
+                  key={node.nodeId}
+                  onClick={() => setAutoCastNode(node.nodeId)}
+                  disabled={autoFish}
+                  className="btn-press text-[11px] font-medium px-2.5 py-1 rounded cursor-pointer"
+                  style={{
+                    background: autoCastNode === node.nodeId ? "var(--orange-glow)" : "var(--bg-inset)",
+                    border: `1px solid ${autoCastNode === node.nodeId ? "var(--orange)" : "var(--border)"}`,
+                    color: autoCastNode === node.nodeId ? "var(--orange)" : "var(--text-faint)",
+                    opacity: autoFish ? 0.5 : 1,
+                  }}
+                  title={node.nodeId === "auto" ? "Automatically picks the best cast type based on your energy and remaining daily casts" : undefined}
+                >
+                  {node.label}
+                  {node.nodeId === "auto" && <span className="ml-1 text-[10px]" style={{ color: "var(--green)" }}>({CAST_NODES.find(n => n.nodeId === recommendedCast)?.label})</span>}
+                </button>
+              ))}
+            </div>
+
+            {/* Session Stats */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
+              {[
+                { label: "Casts", value: fmt(sessionStats.casts), color: "var(--text)" },
+                { label: "Caught", value: fmt(sessionStats.caught), color: "var(--green)" },
+                { label: "Escaped", value: fmt(sessionStats.escaped), color: "var(--red)" },
+                { label: "Seaweed", value: fmt(sessionStats.seaweed), color: "var(--green)" },
+              ].map((stat) => (
+                <div key={stat.label} className="text-center">
+                  <div className="text-[11px] font-bold uppercase" style={{ color: "var(--text-faint)" }}>{stat.label}</div>
+                  <div className="text-[18px] font-bold tabular-nums" style={{ color: stat.color }}>{stat.value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* What actually came out of the water this session */}
+            {sessionStats.catches.length > 0 && (
+              <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
+                <div className="text-[11px] font-bold uppercase mb-2" style={{ color: "var(--text-faint)" }}>
+                  Caught this session
+                </div>
+                <div className="flex flex-col gap-1" style={{ maxHeight: 180, overflowY: "auto" }}>
+                  {sessionStats.catches.map((c, i) => (
+                    <div key={i} className="flex items-center justify-between text-[12px]">
+                      <span className="truncate" style={{ color: RARITY_FISH_COLORS[c.rarity] ?? "var(--text)" }}>
+                        {c.name}
+                      </span>
+                      <span className="tabular-nums shrink-0 ml-2" style={{ color: "var(--text-faint)" }}>
+                        Q{c.quality} &middot; {c.size} &middot; <span style={{ color: "var(--green)" }}>+{fmt(c.seaweed)}</span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Cast Buttons — manual play, deliberately below Auto-Fish */}
+          <div className="card p-4">
+            <h3 className="text-[11px] font-bold uppercase tracking-wider mb-1" style={{ color: "var(--text-faint)" }}>
+              Manual Cast
+            </h3>
+            <p className="text-[11px] mb-3" style={{ color: "var(--text-faint)" }}>
+              Starts a cast you play card by card. For hands-off fishing use Auto-Fish above.
+            </p>
             <div className="flex gap-2.5">
               {CAST_NODES.map((node) => {
                 const nodeEnergy = getNodeEnergy(node.nodeId);
@@ -2881,7 +3101,7 @@ function FishingPage({ giga, addLog }: {
                       {!disabled && <span className="ml-1">({Math.floor(energyAvailable / nodeEnergy)} casts)</span>}
                     </div>
                     {isRec && !disabled && (
-                      <div className="text-[10px] font-bold mt-0.5" style={{ color: "var(--orange)" }}>BEST</div>
+                      <div className="mt-1 flex justify-center"><RecBadge /></div>
                     )}
                   </button>
                 );
@@ -2897,34 +3117,44 @@ function FishingPage({ giga, addLog }: {
             </div>
           </div>
 
-          {/* 3x3 Grid */}
+          {/* Pond grid — 3x3 on the original ponds, larger in the Dendren Grove */}
           <div className="card p-4">
             <h3 className="text-[11px] font-bold uppercase tracking-wider mb-3" style={{ color: "var(--text-faint)" }}>
               Fishing Grid
+              {(fishGrid.cols !== 3 || fishGrid.rows !== 3) && (
+                <span className="ml-2 font-normal normal-case tracking-normal" style={{ color: "var(--orange)" }}>
+                  {fishGrid.cols}&times;{fishGrid.rows}
+                </span>
+              )}
             </h3>
             {(() => {
-              // Convert API [col,row] coordinates to cell IDs (1-9)
-              const fishCell = gameData ? coordToCell(gameData.fishPosition) : 0;
-              const prevCell = gameData ? coordToCell(gameData.previousFishPosition) : 0;
+              // Convert API [col,row] coordinates to cell IDs
+              const fishCell = gameData ? coordToCell(gameData.fishPosition, fishGrid) : 0;
+              const prevCell = gameData ? coordToCell(gameData.previousFishPosition, fishGrid) : 0;
               const hasFintuition = gameData?.nextPosition && gameData.nextPosition.length === 2;
-              const nextCell = hasFintuition ? coordToCell(gameData!.nextPosition!) : 0;
+              const nextCell = hasFintuition ? coordToCell(gameData!.nextPosition!, fishGrid) : 0;
 
               // Predicted cells — where the fish is GOING (likely cells only)
               const predicted = hasFintuition
                 ? [nextCell]
                 : gameData
-                ? predictNextPositionsWeighted(fishCell, prevCell)
+                ? predictNextPositionsWeighted(fishCell, prevCell, fishGrid)
                     .filter((e) => e.p >= 0.12)
                     .map((e) => e.cell)
                 : [];
+
+              const cells = Array.from({ length: fishGrid.cols * fishGrid.rows }, (_, i) => i + 1);
 
               return (
                 <>
                   <div
                     className="grid gap-1.5 mx-auto"
-                    style={{ gridTemplateColumns: "repeat(3, 1fr)", maxWidth: 200 }}
+                    style={{
+                      gridTemplateColumns: `repeat(${fishGrid.cols}, 1fr)`,
+                      maxWidth: Math.max(200, fishGrid.cols * 66),
+                    }}
                   >
-                    {GRID_LABELS.flat().map((pos) => {
+                    {cells.map((pos) => {
                       const hasFish = pos === fishCell;
                       const isPredicted = predicted.includes(pos);
                       // Check which hand cards cover this PREDICTED position
@@ -2951,7 +3181,7 @@ function FishingPage({ giga, addLog }: {
                               : coveredBy.length > 0
                               ? `1px solid ${isCritZone ? "var(--gold)" : "var(--border-lite)"}`
                               : "1px solid var(--border)",
-                            transition: "all 200ms ease",
+                            transition: "background 150ms ease, border-color 150ms ease, color 150ms ease",
                           }}
                         >
                           {hasFish && (
@@ -3006,11 +3236,12 @@ function FishingPage({ giga, addLog }: {
                 </div>
                 <div className="rounded-full overflow-hidden" style={{ height: 8, background: "var(--bg-inset)" }}>
                   <div
-                    className="h-full rounded-full"
+                    className="h-full w-full rounded-full"
                     style={{
-                      width: `${Math.max(0, (gameData.fishHp / gameData.fishMaxHp) * 100)}%`,
+                      transform: `scaleX(${Math.max(0, gameData.fishHp / gameData.fishMaxHp)})`,
+                      transformOrigin: "left",
                       background: "linear-gradient(90deg, var(--orange-dim), var(--orange))",
-                      transition: "width 300ms ease",
+                      transition: "transform 300ms ease",
                     }}
                   />
                 </div>
@@ -3025,11 +3256,12 @@ function FishingPage({ giga, addLog }: {
                 </div>
                 <div className="rounded-full overflow-hidden" style={{ height: 8, background: "var(--bg-inset)" }}>
                   <div
-                    className="h-full rounded-full"
+                    className="h-full w-full rounded-full"
                     style={{
-                      width: `${Math.max(0, (gameData.playerHp / gameData.playerMaxHp) * 100)}%`,
+                      transform: `scaleX(${Math.max(0, gameData.playerHp / gameData.playerMaxHp)})`,
+                      transformOrigin: "left",
                       background: "linear-gradient(90deg, var(--blue-dim), var(--blue))",
-                      transition: "width 300ms ease",
+                      transition: "transform 300ms ease",
                     }}
                   />
                 </div>
@@ -3064,7 +3296,7 @@ function FishingPage({ giga, addLog }: {
                   // auto-fish would play
                   const scored = scoreHand(
                     gameData.hand, gameData.deckCardData, gameData.fishPosition,
-                    gameData.previousFishPosition, gameData.nextPosition
+                    gameData.previousFishPosition, gameData.nextPosition, fishGrid
                   );
                   const bestIdx = scored.reduce((best, s, i) => (s.ev > scored[best].ev ? i : best), 0);
 
@@ -3106,14 +3338,7 @@ function FishingPage({ giga, addLog }: {
                             }}>
                               {hitPct}% hit{likelyCrit ? " CRIT" : ""}
                             </span>
-                            {isBest && (
-                              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded" style={{
-                                background: likelyHit ? "var(--green)" : "var(--text-dim)",
-                                color: "var(--bg)",
-                              }}>
-                                BEST
-                              </span>
-                            )}
+                            {isBest && <RecBadge />}
                           </div>
                           <span className="text-[11px] tabular-nums" style={{ color: "var(--blue)" }}>
                             {card.manaCost} mana
@@ -3174,62 +3399,6 @@ function FishingPage({ giga, addLog }: {
             </div>
           )}
 
-          {/* Auto-Fish Controls */}
-          <div className="card p-4">
-            <h3 className="text-[11px] font-bold uppercase tracking-wider mb-3" style={{ color: "var(--text-faint)" }}>
-              Auto-Fish
-            </h3>
-            <div className="flex items-center gap-3 mb-3">
-              <button
-                onClick={() => setAutoFish(!autoFish)}
-                className="btn-press flex-1 rounded-md py-2.5 px-4 cursor-pointer font-semibold text-[13px]"
-                style={{
-                  background: autoFish ? "var(--red-glow)" : "var(--green-glow)",
-                  border: `1px solid ${autoFish ? "var(--red)" : "var(--green-dim)"}`,
-                  color: autoFish ? "var(--red)" : "var(--green)",
-                }}
-              >
-                {autoFish ? "Stop" : "Start Auto-Fish"}
-              </button>
-            </div>
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-[12px]" style={{ color: "var(--text-faint)" }}>Cast type:</span>
-              {[{ nodeId: "auto", label: "Auto" }, ...CAST_NODES].map((node) => (
-                <button
-                  key={node.nodeId}
-                  onClick={() => setAutoCastNode(node.nodeId)}
-                  disabled={autoFish}
-                  className="btn-press text-[11px] font-medium px-2.5 py-1 rounded cursor-pointer"
-                  style={{
-                    background: autoCastNode === node.nodeId ? "var(--orange-glow)" : "var(--bg-inset)",
-                    border: `1px solid ${autoCastNode === node.nodeId ? "var(--orange)" : "var(--border)"}`,
-                    color: autoCastNode === node.nodeId ? "var(--orange)" : "var(--text-faint)",
-                    opacity: autoFish ? 0.5 : 1,
-                  }}
-                  title={node.nodeId === "auto" ? "Automatically picks the best cast type based on your energy and remaining daily casts" : undefined}
-                >
-                  {node.label}
-                  {node.nodeId === "auto" && <span className="ml-1 text-[10px]" style={{ color: "var(--green)" }}>({CAST_NODES.find(n => n.nodeId === recommendedCast)?.label})</span>}
-                </button>
-              ))}
-            </div>
-
-            {/* Session Stats */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
-              {[
-                { label: "Casts", value: fmt(sessionStats.casts), color: "var(--text)" },
-                { label: "Caught", value: fmt(sessionStats.caught), color: "var(--green)" },
-                { label: "Escaped", value: fmt(sessionStats.escaped), color: "var(--red)" },
-                { label: "Seaweed", value: fmt(sessionStats.seaweed), color: "var(--green)" },
-              ].map((stat) => (
-                <div key={stat.label} className="text-center">
-                  <div className="text-[11px] font-bold uppercase" style={{ color: "var(--text-faint)" }}>{stat.label}</div>
-                  <div className="text-[18px] font-bold tabular-nums" style={{ color: stat.color }}>{stat.value}</div>
-                </div>
-              ))}
-            </div>
-          </div>
-
           {/* Fish Inventory + Sell */}
           <div className="card p-4">
             <div className="flex items-center justify-between mb-3">
@@ -3253,10 +3422,15 @@ function FishingPage({ giga, addLog }: {
                 const plus50 = fish.filter((f: { pct: number }) => f.pct >= 50);
                 const totalPlus50Seaweed = plus50.reduce((s: number, f: { value: number; qty: number }) => s + f.value * f.qty, 0);
 
+                const totalFish = plus50.reduce((s: number, f: { qty: number }) => s + f.qty, 0);
                 return plus50.length > 0 ? (
                   <button
                     onClick={async () => {
-                      const totalFish = plus50.reduce((s: number, f: { qty: number }) => s + f.qty, 0);
+                      if (!confirmSellAll) {
+                        setConfirmSellAll(true);
+                        return;
+                      }
+                      setConfirmSellAll(false);
                       addFishLog(`Selling ${totalFish} fish at +50%...`);
                       let totalSold = 0;
                       let totalEarned = 0;
@@ -3276,10 +3450,17 @@ function FishingPage({ giga, addLog }: {
                       addFishLog(`*** Sold ${totalSold} fish for ${totalEarned} seaweed ***`);
                       await giga.refreshAll();
                     }}
+                    onBlur={() => setConfirmSellAll(false)}
                     className="btn-press text-[11px] font-bold px-3 py-1.5 rounded cursor-pointer"
-                    style={{ background: "var(--green)", border: "none", color: "var(--bg)" }}
+                    style={{
+                      background: confirmSellAll ? "var(--red-cta)" : "var(--green)",
+                      border: "none",
+                      color: confirmSellAll ? "var(--text-inverse)" : "var(--bg)",
+                    }}
                   >
-                    Sell All +50% ({totalPlus50Seaweed} seaweed)
+                    {confirmSellAll
+                      ? `Sell ${totalFish} fish — sure?`
+                      : `Sell All +50% (${totalPlus50Seaweed} seaweed)`}
                   </button>
                 ) : null;
               })()}
@@ -3351,16 +3532,11 @@ function FishingPage({ giga, addLog }: {
             <h3 className="text-[11px] font-bold uppercase tracking-wider mb-2" style={{ color: "var(--text-faint)" }}>
               Log
             </h3>
-            <div className="flex-1 overflow-y-auto log-area" style={{ minHeight: 0 }}>
-              {fishingLog.length === 0 ? (
-                <div className="text-[12px]" style={{ color: "var(--text-faint)" }}>No activity yet</div>
-              ) : (
-                fishingLog.map((msg, i) => (
-                  <div key={i} className="text-[11px] py-0.5 tabular-nums" style={{ color: "var(--text-dim)" }}>
-                    {msg}
-                  </div>
-                ))
-              )}
+            <div className="flex-1 overflow-y-auto log-area" role="log" style={{ minHeight: 0 }}>
+              <LogFeed
+                entries={fishingLog.map((msg, i) => ({ id: fishingLog.length - i, text: msg }))}
+                emptyText="No activity yet"
+              />
             </div>
           </div>
         </div>
@@ -3370,6 +3546,46 @@ function FishingPage({ giga, addLog }: {
 }
 
 /* ─── Shared pieces ──────────────────────────────────────── */
+
+/** The one way "recommended" is spelled across the app */
+function RecBadge() {
+  return (
+    <span
+      className="text-[9px] font-bold uppercase tracking-wider py-0.5 px-1.5 rounded shrink-0"
+      style={{ color: "var(--orange)", background: "var(--orange-glow)", border: "1px solid var(--border-accent)" }}
+    >
+      Best
+    </span>
+  );
+}
+
+/** Shared plain-text log list — newest first, optional fade tail */
+function LogFeed({ entries, emptyText, fade }: {
+  entries: { id: string | number; text: string }[];
+  emptyText: string;
+  fade?: boolean;
+}) {
+  if (entries.length === 0) {
+    return <p className="text-[12px] italic" style={{ color: "var(--text-faint)" }}>{emptyText}</p>;
+  }
+  return (
+    <>
+      {entries.map((entry, i) => (
+        <div
+          key={entry.id}
+          className="text-[12px] leading-relaxed py-0.5"
+          style={{
+            fontFamily: "monospace",
+            color: i === 0 ? "var(--text-dim)" : "var(--text-faint)",
+            opacity: fade ? Math.max(0.55, 1 - i * 0.04) : 1,
+          }}
+        >
+          {entry.text}
+        </div>
+      ))}
+    </>
+  );
+}
 
 /* ─── World Page (Pots & Chests) ──────────────────────────── */
 
@@ -3408,12 +3624,24 @@ function WorldPage({ giga, addLog, eng }: {
     return { text: days > 0 ? `${days}d ${hours % 24}h` : `${hours}h`, onCooldown: true, remainingSec: remaining };
   };
 
-  const items = [
-    { id: "Recipe#700000", label: "Weekly Chest", color: "var(--gold)", energy: 0, needsJuice: false, handsType: null as string | null, desc: "Free weekly loot chest" },
-    { id: "Recipe#700003", label: "Juiced Chest", color: "var(--orange)", energy: 0, needsJuice: true, handsType: null as string | null, desc: "Bonus chest for juiced players" },
-    { id: "Recipe#700001", label: "Blue Pot", color: "var(--blue)", energy: 5, needsJuice: false, handsType: "Paper Hands", desc: "Break with Paper Hands — materials + shards" },
-    { id: "Recipe#700002", label: "Tan Pot", color: "var(--red)", energy: 5, needsJuice: false, handsType: "Rock Hands", desc: "Break with Rock Hands — materials + bones + consumables" },
-  ];
+  // Colour is the only per-claim detail that is presentation rather than game
+  // fact, so it stays here; anything missing falls back rather than vanishing.
+  const claimColors: Record<string, string> = {
+    chest: "var(--gold)",
+    juiceChest: "var(--orange)",
+    juiceChestForest: "var(--orange)",
+    bluePot: "var(--blue)",
+    tanPot: "var(--red)",
+  };
+  const items = CLAIM_RECIPES.map((r) => ({
+    id: r.id,
+    label: r.label,
+    color: claimColors[r.key] ?? "var(--text)",
+    energy: r.energy,
+    needsJuice: r.needsJuice,
+    handsType: r.handsType as string | null,
+    desc: r.desc,
+  }));
 
   const handleUse = async (item: typeof items[0]) => {
     const gearId = item.handsType ? findHandsGear(item.handsType) : "";
@@ -3490,7 +3718,11 @@ function WorldPage({ giga, addLog, eng }: {
                 disabled={disabled}
                 className="btn-press w-full text-[14px] font-bold py-2.5 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
                 style={{
-                  background: disabled ? "var(--bg-inset)" : `linear-gradient(135deg, ${item.color}, var(--bg-raised))`,
+                  // Darkened toward black so white text clears 4.5:1 at both
+                  // gradient stops — the raw accents measure 1.9–2.8:1.
+                  background: disabled
+                    ? "var(--bg-inset)"
+                    : `linear-gradient(135deg, color-mix(in srgb, ${item.color} 35%, #000), var(--bg-raised))`,
                   border: disabled ? "1px solid var(--border)" : "none",
                   color: disabled ? "var(--text-faint)" : "var(--text-inverse)",
                   boxShadow: disabled ? "none" : `0 3px 12px color-mix(in srgb, ${item.color} 30%, transparent)`,
