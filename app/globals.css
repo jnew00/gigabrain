@@ -43,6 +43,9 @@
   --blue-glow: rgba(96, 165, 250, 0.1);
   --gold: #fbbf24;
   --gold-glow: rgba(251, 191, 36, 0.1);
+  /* Fate, which is neither a currency nor a warning and needed its own hue */
+  --purple: #a78bfa;
+  --purple-glow: rgba(167, 139, 250, 0.1);
 }
 
 @theme inline {

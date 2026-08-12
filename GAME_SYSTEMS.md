@@ -499,14 +499,72 @@ Pets system. Eggs hatch into Giglings (mounts/companions).
 - **ROM Eggs**: Given to ROM holders based on tier, produce Inaugural Steed + ROMling
 
 ### Hatching
-- Balance temperature + comfort
-- Resources: Biofuels + Incube (soulbound)
-- Feed faction dust (5-25) for faction probability (up to 95%)
-- Can hatch multiple eggs simultaneously
+Three dials, and they are not interchangeable:
 
-### Automation Potential: **LOW-MEDIUM**
-- Monitor and adjust temperature/comfort
-- Auto-feed eggs
+- **Temperature** drives **Progress**. At 0 the egg makes no progress at all.
+- **Comfort** plus Progress drive **Quality**. Quality is banked as Progress
+  accrues, so progress earned at low comfort is permanently worse — this is why
+  a short inventory should fund comfort before temperature.
+- **Fate** is faction dust fed before the hatch. Without it the Gigling hatches
+  factionless, and it cannot be changed afterwards.
+
+Bounds, verified from `/api/offchain/static` → `hatchery` (2026-08-11):
+
+| Field | Value |
+|---|---|
+| `temperatureConfig` | 0–100, increment 10 |
+| `comfortConfig` | 0–5, increment 1 |
+| `maxProgress` | 100 |
+| `maxRarity` (Quality) | 100 |
+| `maxPetsInHatchery` | 300 |
+
+Per-feed stat deltas and the decay rate are **not published anywhere** and are
+not in static data. GigaBrain therefore feeds one unit at a time rather than
+guessing a batch size.
+
+**Materials** (soulbound; traded from base dungeon materials at Vilhelm's, all
+verified from static `recipes` tagged `vilhelm`):
+
+| Recipe | Trade | Raises |
+|---|---|---|
+| 500001 | 3 Wood → 3 Biofuel (576) | Temperature |
+| 500002 | 3 Coal → 3 Biofuel+ (577) | Temperature |
+| 500003 | 2 Bone → 1 Incube (578) | Comfort |
+| 500004 | 2 Fiber → 1 Incube+ (579) | Comfort |
+| 500005 | 5 Stone → 1 Incube++ (580) | Comfort |
+| 500006-8 | Faction Silver Ring → Hatchard Kit (581) | Weekly, 2-3 completions |
+
+These run through the ordinary `/api/offchain/recipes/start` endpoint, so
+crafting incubation materials needs no new API surface.
+
+**Fate math**: each influence adds +4.75% to the fed faction and +0.25% Gigus.
+20 influences = 100% chance of a faction trait. The dust ladder is **per
+faction** — 5 for that faction's first influence, +1 for each subsequent one —
+so it resets when you switch factions:
+
+- 20 influences on one named faction: 5+6+…+24 = **290 dust**
+- 20 influences spread over all seven: **119 dust**, same guarantee, random faction
+
+**Eggspeditors** set Progress to 100 and raise Quality to a floor if it is below
+(id → floor): 584 → 10, 585 → 30, 586 → 50, 587 → 70, 589 → 90.
+
+### API Endpoints (verified to exist 2026-08-11)
+- `GET /api/pets/player?id={address}` — egg/pet inventory. Unauthenticated.
+  Entities carry `docId`, `DESCRIPTION_CID` ("Egg"/"Pet"), `COMPLETE_CID`,
+  `data.eggType`, `data.hatchedAt`. **No incubation stats.**
+- `GET /api/pets/hatchery` — incubation state. Authenticated; response shape
+  unobserved, so GigaBrain matches its fields by pattern.
+- `POST /api/pets/feed` — feed an egg. Authenticated; request shape unconfirmed.
+- `POST /api/pets/feedpet` — feed a hatched Gigling (hunger/factory). Not used.
+
+Route existence was established by status-code discrimination: unknown paths
+under `/api/pets/` return `400 {"error":"Invalid path"}`, while these return
+`401`. Note `/api/game/*` returns 401 for *any* path, so the same test does not
+work there.
+
+### Automation Potential: **MEDIUM** (built)
+- Advisor plans feeds, fate purchases and hatch alerts (`lib/hatchery-advisor.ts`)
+- Material shortfalls resolve to a runnable Vilhelm trade
 
 ---
 

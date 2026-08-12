@@ -7,6 +7,7 @@ import { probeEnemyMove } from "@/lib/enemy-probe";
 import { pickBestCard, pickGroveMove, resolveGrid } from "@/lib/fishing-ai";
 import { beginHaulCapture, endHaulCapture } from "@/lib/use-gigaverse";
 import { probeFishMove } from "@/lib/fishing-probe";
+import { pendingCatchCards } from "@/lib/fishing-state";
 import { Sword, Package, Fish, AlertTriangle, Info, Lightbulb } from "lucide-react";
 import { recordRunAction, recordCastAction, getDungeonPerformanceAction, getPondYieldsAction } from "./actions";
 import { getMaxRunsPerDay, findDungeonInfo, isEventDungeon, isAwakeningActive, pickEntryTier, CLAIM_RECIPES, CLAIM_RECIPE_IDS, AWAKENING, FISHING } from "@/lib/game-data";
@@ -859,6 +860,40 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     return repaired;
   }, [addLog]);
 
+  /**
+   * Restore one gear instance — the flow repair itself points at once an
+   * instance is out of repairs.
+   *
+   * What restore costs has never been observed and is published nowhere, so
+   * this is deliberately one instance per click rather than a "restore all":
+   * the first one tells you the price before the rest of the bag spends it.
+   * On success the instance leaves the exhausted list and becomes repairable
+   * again, since its repair count is the thing restore is expected to clear.
+   */
+  const [restoring, setRestoring] = useState<string | null>(null);
+
+  const restoreOne = useCallback(async (item: { docId: string; name: string }) => {
+    setRestoring(item.docId);
+    try {
+      const r = await gigaRef.current.restoreGear(item.docId);
+      const ok = r != null && r.success !== false;
+      if (ok) {
+        addLog(`Restored ${item.name}${r?.message ? `: ${r.message}` : ""}`);
+        setUnrepairable((prev) => {
+          const next = new Set(prev);
+          next.delete(item.docId);
+          return next;
+        });
+      } else {
+        // The server's own words. This is the only place the cost of a restore
+        // has ever been visible, so it is not summarised away.
+        addLog(`Restore ${item.name}: ${r?.message || gigaRef.current.lastErrorRef.current || "failed"}`);
+      }
+    } finally {
+      setRestoring(null);
+    }
+  }, [addLog]);
+
   // Traveling merchant (Hugis/Munis) deals — read-only until the trade POST
   // is captured; shape probed defensively since only the GET is verified
   const merchantDeals = useMemo(() => {
@@ -1140,7 +1175,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     if (freeActions.romEnergyMode === "convert" && totalRomE > 0)
       stepList.push({ id: "convert-energy", label: "Convert ROM energy to dust", status: "pending", detail: `${fmt(totalRomE)}E` });
     if (freeActions.romEnergyMode === "claim" && totalRomE > 0)
-      stepList.push({ id: "claim-energy", label: "Claim ROM energy", status: "pending", detail: `${fmt(totalRomE)}E` });
+      stepList.push({
+        id: "claim-energy",
+        label: "Claim ROM energy",
+        status: "pending",
+        // Says up front what the run will do with a full pool, rather than
+        // listing 168E as if it were about to arrive.
+        detail: romEnergyClaimable > 0
+          ? `${fmt(romEnergyClaimable)}E`
+          : `${fmt(totalRomE)}E — will be skipped, the pool is already at ${fmt(maxEnergy)}E`,
+      });
     if (freeActions.openChests && chestsReady)
       stepList.push({ id: "open-chests", label: "Open chests", status: "pending", detail: "" });
     if (freeActions.breakPots && potsActuallyReady)
@@ -1346,18 +1390,61 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       if (stepList.find((s) => s.id === "claim-energy")) {
         if (cancelRef.current) throw new Error("cancelled");
         updateStep("claim-energy", { status: "running" });
-        let count = 0;
-        for (const rom of g().roms?.entities ?? []) {
-          if (cancelRef.current) break;
-          const amt = Math.floor(rom.factoryStats.energyCollectable);
-          if (amt <= 0) continue;
-          try {
-            const r = await g().claimRom(rom.docId, "energy");
-            if (r?.success) { count++; log(`claimed energy #${rom.factoryStats.serialNumber}`); }
-          } catch { /* already claimed or rate limited */ }
-          await delay(200);
+
+        // Energy claimed into a full pool is either refused or lost over the
+        // cap, and this step has no way to tell which. Not attempting it is the
+        // only outcome that is definitely not a loss — and the energy keeps
+        // accruing on the ROM meanwhile.
+        const pool = g().energy?.entities?.[0]?.parsedData;
+        const headroom = Math.max(0, (pool?.maxEnergy ?? 0) - Math.floor(pool?.energyValue ?? 0));
+        const onRoms = (g().roms?.entities ?? []).reduce(
+          (s, r) => s + Math.floor(r.factoryStats.energyCollectable), 0
+        );
+
+        if (pool && headroom <= 0) {
+          const why =
+            `pool is full at ${Math.floor(pool.energyValue)}/${pool.maxEnergy}E — ${fmt(onRoms)}E left on the ROMs rather than risking it over the cap. Spend energy first, then claim.`;
+          log(`ROM energy not claimed: ${why}`, "error");
+          updateStep("claim-energy", { status: "skipped", detail: why });
+        } else {
+          let claimed = 0;
+          let refused = 0;
+          for (const rom of g().roms?.entities ?? []) {
+            if (cancelRef.current) break;
+            const amt = Math.floor(rom.factoryStats.energyCollectable);
+            if (amt <= 0) continue;
+            try {
+              const r = await g().claimRom(rom.docId, "energy");
+              // claimRom resolves to null on a rejected request rather than
+              // throwing, so a refusal and a success both used to land here as
+              // a silent non-increment and the step still reported "done".
+              if (r?.success) {
+                claimed++;
+                log(`claimed energy #${rom.factoryStats.serialNumber}`);
+              } else {
+                refused++;
+                log(
+                  `ROM #${rom.factoryStats.serialNumber} refused the ${fmt(amt)}E claim: ${g().error || "no reason given"}`,
+                  "error"
+                );
+              }
+            } catch (e) {
+              refused++;
+              log(
+                `ROM #${rom.factoryStats.serialNumber} refused the ${fmt(amt)}E claim: ${e instanceof Error ? e.message : "unknown"}`,
+                "error"
+              );
+            }
+            await delay(200);
+          }
+          const detail = refused > 0
+            ? `${claimed} claimed, ${refused} refused — that energy is still on the ROMs`
+            : `${claimed} ROMs`;
+          updateStep("claim-energy", {
+            status: cancelRef.current ? "skipped" : refused > 0 && claimed === 0 ? "failed" : "done",
+            detail,
+          });
         }
-        updateStep("claim-energy", { status: cancelRef.current ? "skipped" : "done", detail: `${count} ROMs` });
       }
 
       // 2b. Convert ROM energy to dust
@@ -1787,9 +1874,22 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       if (plannedFishing.length > 0) {
         // Check if there's a completed game needing loot (card pick + collect)
         const preFish = await g().fetchFishingState();
-        if (preFish?.gameState?.COMPLETE_CID && preFish.gameState.SUCCESS_CID) {
-          pendingCardsToAdd = preFish.gameState.data?.cardsToAdd ?? null;
-          log(`Previous catch pending, cards to pick: ${pendingCardsToAdd?.map(c => c.id).join(", ") ?? "none"}`, "fishing");
+        const owed = pendingCatchCards(preFish?.gameState);
+        if (owed) {
+          pendingCardsToAdd = owed;
+          log(`Previous catch pending, cards to pick: ${owed.map((c) => c.id).join(", ")}`, "fishing");
+          // A catch left over from an earlier fishing day. Every cast below
+          // opens with the loot that collects it, so if the server won't take
+          // that loot, nothing else in the plan can run either — worth naming
+          // before the first failure rather than after the twentieth.
+          const catchDay = preFish?.gameState?.DAY_CID;
+          const today = g().currentDay;
+          if (typeof catchDay === "number" && typeof today === "number" && catchDay < today) {
+            log(
+              `That catch is from fishing day ${catchDay} and today is ${today}. If the loot is refused, collect it in the game client — casts can't start while it's outstanding.`,
+              "error"
+            );
+          }
         } else if (preFish?.gameState?.data && !preFish.gameState.COMPLETE_CID) {
             // Active in-progress game — play through it first
             log(`Active fishing game found, finishing it...`, "fishing");
@@ -1798,9 +1898,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               if (cancelRef.current) break;
               const fs = await g().fetchFishingState();
               if (!fs?.gameState?.data || fs.gameState.COMPLETE_CID) {
-                if (fs?.gameState?.SUCCESS_CID) {
-                  pendingCardsToAdd = fs.gameState.data?.cardsToAdd ?? null;
-                }
+                pendingCardsToAdd = pendingCatchCards(fs?.gameState);
                 break;
               }
               const gd = fs.gameState.data;
@@ -1833,9 +1931,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               if (!cr) break;
               probeFishMove(gd, cr.data.doc.data);
               if (cr.data.doc.COMPLETE_CID) {
-                if (cr.data.doc.SUCCESS_CID) {
-                  pendingCardsToAdd = cr.data.doc.data?.cardsToAdd ?? null;
-                }
+                pendingCardsToAdd = pendingCatchCards(cr.data.doc);
                 break;
               }
               await delay(300);
@@ -1844,9 +1940,26 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
       }
 
+      /**
+       * Why fishing gave up, if it did.
+       *
+       * The server's fishing state is one global slot, not one per pond, so a
+       * loot it refuses is refused for every pond in the plan. Carrying the
+       * reason out here is what stops the second pond from rediscovering the
+       * same blockage cast by cast.
+       */
+      let fishingBlocked: string | null = null;
+      /** Consecutive failures of the loot that opens a cast. */
+      let lootFailures = 0;
+      const MAX_LOOT_FAILURES = 2;
+
       for (const alloc of plannedFishing) {
         const stepId = `fishing-${alloc.castNodeId}`;
         if (cancelRef.current) { updateStep(stepId, { status: "skipped" }); continue; }
+        if (fishingBlocked) {
+          updateStep(stepId, { status: "skipped", detail: fishingBlocked });
+          continue;
+        }
 
         const pond = pondById(alloc.pondId);
         updateStep(stepId, { status: "running", detail: "starting..." });
@@ -1943,10 +2056,32 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               }
 
               if (!startResult) {
-                log(`Fishing cast failed to start: ${g().lastErrorRef.current || "unknown"}`, "error");
+                const why = g().lastErrorRef.current || "unknown";
+                log(`Fishing cast failed to start: ${why}`, "error");
+                // A failed loot is the one failure that repeats. The catch it
+                // was collecting is still outstanding, so the next cast opens
+                // with the identical call and fails identically — twenty casts
+                // burned discovering one thing once. Two attempts covers a
+                // stale action token; past that the blockage is real and the
+                // rest of the plan is not worth trying.
+                if (pendingCardsToAdd && pendingCardsToAdd.length > 0) {
+                  lootFailures++;
+                  if (lootFailures >= MAX_LOOT_FAILURES) {
+                    fishingBlocked =
+                      `stopped after ${cast + 1} of ${alloc.casts} casts — the outstanding catch can't be collected (${why}). ` +
+                      `Collect it in the game client; no cast can start until it's cleared.`;
+                    log(`Fishing stopped: ${fishingBlocked}`, "error");
+                    break;
+                  }
+                } else {
+                  // A start_run failure with nothing outstanding is a different
+                  // animal — the next cast is a fresh attempt, so it retries.
+                  lootFailures = 0;
+                }
                 escaped++;
                 continue;
               }
+              lootFailures = 0;
 
               summaryStats.fishCasts++;
 
@@ -1973,7 +2108,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                     const fish = gameData?.caughtFish;
                     const earned = fish?.currencyEarned ?? 0;
                     addCurrency(alloc.pondId, earned);
-                    pendingCardsToAdd = gameData?.cardsToAdd ?? null;
+                    pendingCardsToAdd = pendingCatchCards(stateResult?.gameState);
                     log(`Caught ${fish?.name ?? "fish"} (+${earned} ${pondCurrencyLabel(alloc.pondId)})`, "fishing");
                   } else {
                     escaped++;
@@ -2041,7 +2176,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                     const fish = doc.data?.caughtFish;
                     const earned = fish?.currencyEarned ?? 0;
                     addCurrency(alloc.pondId, earned);
-                    pendingCardsToAdd = doc.data?.cardsToAdd ?? null;
+                    pendingCardsToAdd = pendingCatchCards(doc);
                     log(`Caught ${fish?.name ?? "fish"} (+${earned} ${pondCurrencyLabel(alloc.pondId)})`, "fishing");
                   } else {
                     escaped++;
@@ -2074,14 +2209,54 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           // Outside the cast loop: this used to run per cast against a running
           // total, so three catches reported as six.
           summaryStats.fishCaught += caught;
+          // A blocked pond is not a done pond. Reporting it as done with a
+          // count of escapes reads as bad luck with the fish, which is the one
+          // thing it isn't.
+          const reason = fishingBlocked || stoppedShort;
           updateStep(stepId, {
-            status: cancelRef.current ? "skipped" : "done",
-            detail: stoppedShort
-              ? `${caught} caught / ${escaped} escaped — ${stoppedShort}`
+            status: fishingBlocked ? "failed" : cancelRef.current ? "skipped" : "done",
+            detail: reason
+              ? `${caught} caught / ${escaped} escaped — ${reason}`
               : `${caught} caught / ${escaped} escaped`,
           });
           await g().refreshAll();
       }
+
+      // Collect the last catch without casting again. In the client the fish
+      // is claimed first, the spell is picked second, and only then does the
+      // pond offer another cast next to a "Leave" button — so the payout is
+      // reachable without paying for a cast nobody planned. An empty nodeId is
+      // that Leave: loot with nothing to cast into.
+      //
+      // This is what keeps the final cast of a run measurable. Without it the
+      // payout never arrives before the run ends and the cast is discarded.
+      // Not attempted when the run already established the server won't take
+      // this loot — a third identical refusal proves nothing new.
+      if (!cancelRef.current && !fishingBlocked && pendingCardsToAdd && pendingCardsToAdd.length > 0) {
+        const chosenCard = pendingCardsToAdd[0].id;
+        log(`Collecting the last catch (card ${chosenCard}), not casting again`, "fishing");
+        const collected = await g().fishingAction("loot", { cards: [chosenCard], nodeId: "" });
+        if (collected) {
+          if (pendingCastRecord) mergeGains(pendingCastRecord.gains, collected.gameItemBalanceChanges);
+          pendingCardsToAdd = null;
+          // If the server opened a cast anyway, the energy is already gone and
+          // the game is left mid-flight. Say so loudly — the next run's
+          // pre-fish cleanup is what plays it out.
+          const doc = collected.data?.doc;
+          if (doc && !doc.COMPLETE_CID && doc.data?.hand) {
+            log(
+              "Collect started another cast despite an empty node — that energy is spent, and the next run will finish the cast.",
+              "error"
+            );
+          }
+        } else {
+          log(
+            `Final collect failed: ${g().lastErrorRef.current || "unknown"} — the catch stays on the server for the next run.`,
+            "error"
+          );
+        }
+      }
+
       // Nothing left to loot, so any still-open record is as complete as it gets.
       flushCastRecord();
 
@@ -2449,16 +2624,28 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             </span>
           </div>
           <div className="text-[12px] mb-2" style={{ color: "var(--text-dim)", lineHeight: 1.5 }}>
-            These have hit their repair limit. Repairing them is refused, so the plan skips
-            them — restore them in Gigaverse to keep using them.
+            These have hit their repair limit, so the plan skips them. Restore resets that
+            limit — what it charges has never been observed, so it goes one piece at a time
+            and the server&apos;s reply is logged verbatim.
           </div>
           <div className="space-y-1">
             {exhaustedGear.map((g) => (
-              <div key={g.docId} className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-                <span className="font-semibold" style={{ color: "var(--text)" }}>{g.name}</span>
-                {" — "}
-                {g.durability <= 0 ? "broken" : "1 use left"}
-                {g.equipped && " (equipped)"}
+              <div key={g.docId} className="flex items-center gap-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                <span className="flex-1">
+                  <span className="font-semibold" style={{ color: "var(--text)" }}>{g.name}</span>
+                  {" — "}
+                  {g.durability <= 0 ? "broken" : "1 use left"}
+                  {g.equipped && " (equipped)"}
+                </span>
+                <button
+                  onClick={() => restoreOne(g)}
+                  disabled={restoring !== null || executing}
+                  aria-label={`Restore ${g.name}`}
+                  className="btn-press touch-target text-[11px] font-bold px-3 py-1.5 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                  style={{ background: "var(--bg-raised)", border: "1px solid var(--gold)", color: "var(--gold)" }}
+                >
+                  {restoring === g.docId ? "Restoring..." : "Restore"}
+                </button>
               </div>
             ))}
           </div>

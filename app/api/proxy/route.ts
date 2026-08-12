@@ -22,10 +22,17 @@ const ALLOWED_EXACT = new Set([
   "/api/items/balances",
   "/api/gear/items",
   "/api/gear/repair",
+  // What repair sends you to once an instance is out of repairs. Verified on
+  // 2026-08-12: GET answers 405 the way /api/gear/repair does, while invented
+  // sibling paths answer 404.
+  "/api/gear/restore",
   "/api/fishing/cards",
   "/api/fishing/action",
   "/api/fishing/sell",
   "/api/vendor/listings",
+  "/api/pets/player",
+  "/api/pets/hatchery",
+  "/api/pets/feed",
 ]);
 
 // Prefixes for endpoints with a path parameter — every entry ends in "/"
@@ -42,6 +49,9 @@ const ALLOWED_PREFIXES = [
   "/api/factions/player/",
   "/api/fishing/state/",
   "/api/marketplace/item/listing/item/",
+  // The hatchery read takes the player either from the JWT or from a path
+  // param depending on the call; both forms are read-only.
+  "/api/pets/hatchery/",
 ];
 
 function isEndpointAllowed(endpoint: string): boolean {

@@ -220,9 +220,13 @@ gigaverse-controller/
 - [ ] Monitor territory control and leaderboard
 
 #### 5.3 Hatchery
-- [ ] Display egg status (temperature, comfort, progress)
-- [ ] Auto-feed eggs with faction dust
-- [ ] Alert when eggs ready to hatch
+- [x] Display egg status (temperature, comfort, progress, quality, fate)
+- [x] Advise and apply feeds to hold temperature and comfort at max
+- [x] Plan the cheapest faction dust route to a guaranteed faction trait
+- [x] Alert when eggs are ready to hatch, stalled cold, or about to hatch factionless
+- [x] Resolve material shortfalls to a runnable Vilhelm trade
+- [ ] Confirm the `/api/pets/feed` request shape against a live session
+- [ ] Measure per-feed temperature/comfort deltas and the decay rate, then batch feeds
 
 #### 5.4 Multi-Account Support
 - [ ] Switch between multiple accounts (multi-accounting is allowed)

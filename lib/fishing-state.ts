@@ -16,6 +16,7 @@
 import type {
   FishExchangeRate,
   FishingActionResponse,
+  FishingCard,
   FishingGameDoc,
   FishingGameData,
   FishingGameState,
@@ -109,4 +110,39 @@ export function nodeIdForGame(
 ): string | undefined {
   const id = game?.ID_CID;
   return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+/* ─── Is a catch still owed? ───────────────────────────────── */
+
+/**
+ * The spells a finished game still owes the player, or null if it owes nothing.
+ *
+ * A completed, successful game is not the same thing as an uncollected one. The
+ * payout is claimed by taking one of the three spells, and the game records
+ * which was taken in `cardChosenId` — but it keeps `cardsToAdd` either way, as
+ * the record of what was offered. Reading `cardsToAdd` alone therefore reports
+ * every catch ever made as outstanding.
+ *
+ * That is not hypothetical: on 2026-08-12 a Grove catch whose spell had been
+ * picked in the game client still carried all three cards, so the runner opened
+ * every cast with a `loot` the server answered "Card already chosen" — twenty
+ * casts, no energy spent, no fish. The check is `cardChosenId`, not the
+ * presence of cards.
+ */
+export function pendingCatchCards(
+  game:
+    | {
+        COMPLETE_CID?: boolean;
+        SUCCESS_CID?: boolean;
+        data?: { cardsToAdd?: FishingCard[]; cardChosenId?: number | null };
+      }
+    | null
+    | undefined
+): FishingCard[] | null {
+  if (!game?.COMPLETE_CID || !game.SUCCESS_CID) return null;
+  // 0 is not a card id anywhere in the deck, so it reads as "none chosen"
+  // alongside null and undefined rather than as a chosen card.
+  if (game.data?.cardChosenId) return null;
+  const cards = game.data?.cardsToAdd;
+  return cards && cards.length > 0 ? cards : null;
 }

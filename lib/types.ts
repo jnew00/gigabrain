@@ -539,7 +539,16 @@ export interface FishingGameData {
   cardInDrawPile: number;
   nextPosition: number[] | null;  // Fintuition skill: where fish will move next
   caughtFish?: CaughtFish;
+  /** The three spells offered after a successful catch. */
   cardsToAdd?: FishingCard[];
+  /**
+   * The spell already taken from `cardsToAdd`, once one has been.
+   *
+   * This is what separates a catch still owed from one already collected:
+   * `cardsToAdd` stays on the document forever as the record of what was
+   * offered, so it says nothing about whether the payout has been claimed.
+   */
+  cardChosenId?: number | null;
 }
 
 export interface WireFishingGameData extends Omit<FishingGameData, "caughtFish"> {

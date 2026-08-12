@@ -25,8 +25,9 @@ import type {
   GearInstancesResponse,
   VendorListingsResponse,
 } from "./types";
-import { normalizeFishingState, normalizeActionResponse } from "./fishing-state";
+import { normalizeFishingState, normalizeActionResponse, pendingCatchCards } from "./fishing-state";
 import { pondById } from "./ponds";
+import { HATCHERY_FALLBACK_CONFIG, readHatcheryConfig, type HatcheryConfig } from "./hatchery";
 const STORAGE_KEY = "giga-auth";
 
 interface StoredAuth {
@@ -162,6 +163,10 @@ export function useGigaverse() {
   const [juiceExpiry, setJuiceExpiry] = useState<number | null>(null); // unix timestamp
   const [gearInstances, setGearInstances] = useState<GearInstancesResponse | null>(null);
   const [vendorListings, setVendorListings] = useState<VendorListingsResponse | null>(null);
+  const [pets, setPets] = useState<unknown>(null);
+  const [hatcheryConfig, setHatcheryConfig] = useState<HatcheryConfig>(
+    HATCHERY_FALLBACK_CONFIG
+  );
   const [fishingActionToken, setFishingActionToken] = useState<number>(Date.now());
   const fishingActionTokenRef = useRef(fishingActionToken);
   fishingActionTokenRef.current = fishingActionToken;
@@ -265,6 +270,9 @@ export function useGigaverse() {
         if (typeof staticData?.currentDay === "number") {
           setCurrentDay(staticData.currentDay);
         }
+        // Hatchery bounds ship inside the same payload, so the advisor tracks
+        // the game rather than a copy of it.
+        setHatcheryConfig(readHatcheryConfig(staticData));
         setPlayerRecipes(playerRecipeData);
 
         // Store item balances as a lookup map
@@ -679,6 +687,55 @@ export function useGigaverse() {
     [token, noobId, address]
   );
 
+  /**
+   * Read the hatchery.
+   *
+   * One call does it: `/api/pets/player?id=` lists the eggs and carries the
+   * live incubation stats on each placed one, under `data.hatcheryStatus`.
+   * There is no separate hatchery read to pair it with — on 2026-08-12
+   * `/api/pets/hatchery` answered 400 and the address-suffixed form 405 — so
+   * the normalizer's second source is left empty rather than pointing at
+   * endpoints that don't answer.
+   */
+  const fetchHatchery = useCallback(async () => {
+    if (!token || !address) return null;
+    const petsData = await proxy<unknown>(
+      `/api/pets/player?id=${address.toLowerCase()}`,
+      token
+    ).catch(() => null);
+    if (petsData) setPets(petsData);
+    return { pets: petsData, hatchery: null };
+  }, [token, address]);
+
+  /**
+   * Feed one unit of one material to one egg.
+   *
+   * Deliberately one unit per call, and deliberately not batched. How much a
+   * single Biofuel or Incube moves its stat is not published anywhere and could
+   * not be observed without an authenticated session, so a batched call could
+   * overshoot and burn materials on a stat that was already full. One unit at a
+   * time is correct whatever the real delta turns out to be, and re-reading the
+   * egg between feeds is what will eventually measure it.
+   *
+   * The request body is the shape every other POST in this API uses (flat,
+   * camelCase, domain-named). It has not been confirmed against a live feed, so
+   * the server's own error is passed through untouched rather than being
+   * flattened into "feed failed" — that message is the thing that will tell us
+   * the real shape.
+   */
+  const feedEgg = useCallback(
+    async (petId: string, itemId: number) => {
+      if (!token) return null;
+      return proxy<{ success?: boolean; message?: string; gameItemBalanceChanges?: { id: number; amount: number }[] }>(
+        "/api/pets/feed",
+        token,
+        "POST",
+        { petId, itemId, amount: 1 }
+      );
+    },
+    [token]
+  );
+
   /** Fetch current fishing game state */
   const fetchFishingState = useCallback(async () => {
     if (!token || !address) return null;
@@ -806,10 +863,16 @@ export function useGigaverse() {
             const state = normalizeFishingState(
               await proxy<WireFishingGameState>(`/api/fishing/state/${address}`, token)
             );
-            if (state?.gameState?.COMPLETE_CID && state.gameState.data?.cardsToAdd?.length) {
-              // Use loot action: pick first card + start next cast
-              const cardId = state.gameState.data.cardsToAdd[0].id;
-              return await doRequest("loot", String(actionTokenRef.current), { cards: [cardId], nodeId: data.nodeId });
+            // A catch still owed — collect it, which also opens the cast the
+            // failed start_run was after. `cardsToAdd` alone is not that test:
+            // it stays on a game whose spell was already taken, and looting one
+            // of those is answered "Card already chosen".
+            const owed = pendingCatchCards(state?.gameState);
+            if (owed) {
+              return await doRequest("loot", String(actionTokenRef.current), {
+                cards: [owed[0].id],
+                nodeId: data.nodeId,
+              });
             }
             // A cast is already open — the server refuses a second start_run,
             // and retrying it just fails the same way. Adopt the running cast
@@ -852,13 +915,25 @@ export function useGigaverse() {
     [token, address]
   );
 
-  /** Repair a gear instance at the Gear Station (POST captured Aug 2026) */
-  const repairGear = useCallback(
-    async (gearInstanceId: string) => {
+  /**
+   * Repair or restore one gear instance at the Gear Station.
+   *
+   * The two are the same request against different paths — verified on
+   * 2026-08-12 by sending the same instance under two field names: only
+   * `gearInstanceId` reached it, `docId` came back "Gear instance not found".
+   *
+   * Restore is where repair sends you once an instance is out of repairs
+   * ("already at max repair count 2 of 2. Use restore endpoint instead"). What
+   * it charges is not published anywhere and has never been observed, so
+   * nothing here assumes it is free — the server's own message is returned
+   * intact for the caller to show.
+   */
+  const gearStationAction = useCallback(
+    async (path: "repair" | "restore", gearInstanceId: string) => {
       if (!token) return null;
       try {
         const result = await proxy<{ success?: boolean; message?: string }>(
-          "/api/gear/repair",
+          `/api/gear/${path}`,
           token,
           "POST",
           { gearInstanceId }
@@ -871,13 +946,23 @@ export function useGigaverse() {
         }
         return result;
       } catch (e) {
-        const msg = e instanceof Error ? e.message : "Repair failed";
+        const msg = e instanceof Error ? e.message : `${path} failed`;
         lastErrorRef.current = msg;
         setError(msg);
         return null;
       }
     },
     [token, address]
+  );
+
+  const repairGear = useCallback(
+    (gearInstanceId: string) => gearStationAction("repair", gearInstanceId),
+    [gearStationAction]
+  );
+
+  const restoreGear = useCallback(
+    (gearInstanceId: string) => gearStationAction("restore", gearInstanceId),
+    [gearStationAction]
   );
 
   /** Refetch skill progress + currency balances (after level-ups) */
@@ -987,6 +1072,8 @@ export function useGigaverse() {
     juiceExpiry,
     gearInstances,
     vendorListings,
+    pets,
+    hatcheryConfig,
     restoringSession,
     // Actions
     connect,
@@ -1003,9 +1090,12 @@ export function useGigaverse() {
     fetchFishingState,
     fishingAction,
     sellFish,
+    fetchHatchery,
+    feedEgg,
     levelUpSkill,
     refreshSkills,
     repairGear,
+    restoreGear,
     setToken,
   };
 }

@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   nodeIdForGame,
+  pendingCatchCards,
   normalizeActionResponse,
   normalizeCaughtFish,
   normalizeExchangeRates,
   normalizeFishingState,
 } from "./fishing-state";
-import type { WireFishingGameState } from "./types";
+import type { FishingCard, WireFishingGameState } from "./types";
 
 describe("the wire's seaweedEarned is renamed at the boundary", () => {
   it("becomes currencyEarned and the old name does not survive", () => {
@@ -132,5 +133,43 @@ describe("whole-response normalisation", () => {
     });
     expect(res.data.doc.data.caughtFish?.currencyEarned).toBe(120);
     expect(res.gameItemBalanceChanges?.[0]).toEqual({ id: 845, amount: 12 });
+  });
+});
+
+describe("a catch already collected is not a catch still owed", () => {
+  const cards = [{ id: 38 }, { id: 49 }, { id: 9 }] as FishingCard[];
+  const game = (
+    over: Record<string, unknown> = {},
+    data: Record<string, unknown> = {}
+  ) => ({
+    COMPLETE_CID: true,
+    SUCCESS_CID: true,
+    ...over,
+    data: { cardsToAdd: cards, ...data },
+  });
+
+  it("offers the cards while none has been taken", () => {
+    expect(pendingCatchCards(game())?.map((c) => c.id)).toEqual([38, 49, 9]);
+    expect(pendingCatchCards(game({}, { cardChosenId: null }))).not.toBeNull();
+    expect(pendingCatchCards(game({}, { cardChosenId: 0 }))).not.toBeNull();
+  });
+
+  it("owes nothing once a spell has been taken", () => {
+    // The live case: a Grove catch collected in the game client kept all three
+    // cards on the document, so every loot the runner sent was answered
+    // "Card already chosen" — twenty casts that never started.
+    expect(pendingCatchCards(game({}, { cardChosenId: 38 }))).toBeNull();
+  });
+
+  it("owes nothing on a game that is unfinished, lost, or absent", () => {
+    expect(pendingCatchCards(game({ COMPLETE_CID: false }))).toBeNull();
+    expect(pendingCatchCards(game({ SUCCESS_CID: false }))).toBeNull();
+    expect(pendingCatchCards(null)).toBeNull();
+    expect(pendingCatchCards(undefined)).toBeNull();
+  });
+
+  it("owes nothing when the game carries no cards at all", () => {
+    expect(pendingCatchCards({ COMPLETE_CID: true, SUCCESS_CID: true, data: {} })).toBeNull();
+    expect(pendingCatchCards({ COMPLETE_CID: true, SUCCESS_CID: true })).toBeNull();
   });
 });

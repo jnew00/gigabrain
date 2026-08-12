@@ -7,7 +7,7 @@ import { authenticateWithSignature, recordRunAction, getRunStatsAction, getDunge
 import { useLoginWithAbstract, useAbstractClient } from "@abstract-foundation/agw-react";
 import { useAccount, useSignMessage, useReadContract } from "wagmi";
 import { ABSTRACT_VOTING_ADDRESS, ABSTRACT_VOTING_ABI, GIGAVERSE_APP_ID } from "@/lib/voting-contract";
-import { Sword, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote, Fish, Rocket, Heart, Copy } from "lucide-react";
+import { Sword, Skull, BarChart3, HardDrive, Package, Star, ScrollText, X, Vote, Fish, Rocket, Heart, Copy, Egg } from "lucide-react";
 import { MissionControlPage } from "./mission-control";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import type { Player, DungeonAction, DungeonActionResponse, RomEntity, FishingCard, FishingGameData } from "@/lib/types";
@@ -20,6 +20,8 @@ import {
 } from "@/lib/ponds";
 import { nodeIdForGame } from "@/lib/fishing-state";
 import { buildSkillAdvice } from "@/lib/skill-advisor";
+import { buildHatcheryAdvice, type EggPlan } from "@/lib/hatchery-advisor";
+import { FACTION_DUSTS, MAX_INFLUENCES, collectEggs } from "@/lib/hatchery";
 
 // Donations — GigaBrain is free; these fund the coffee
 const DONATIONS = {
@@ -590,7 +592,7 @@ export default function Home() {
   const [connected, setConnected] = useState(false);
   const [log, setLog] = useState<{ id: number; text: string }[]>([]);
   const logIdRef = useRef(0);
-  const [activePage, setActivePage] = useState<"mission" | "dungeon" | "stats" | "roms" | "fishing" | "world">("mission");
+  const [activePage, setActivePage] = useState<"mission" | "dungeon" | "stats" | "roms" | "fishing" | "world" | "hatchery">("mission");
   const [flyout, setFlyout] = useState<"skills" | "log" | "support" | null>(null);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [railExpanded, setRailExpanded] = useState(false);
@@ -1166,6 +1168,29 @@ export default function Home() {
     }).length;
   }, [giga.skillTrees, giga.skillProgress, giga.itemBalances]);
 
+  // Which faction the Giglings should hatch as. "any" is the default because
+  // it reaches a guaranteed faction trait for roughly 40% of the dust; picking
+  // a named faction is only worth it if you want that specific one.
+  const [fateTarget, setFateTarget] = useState<number | "any">("any");
+
+  const hatchery = useMemo(() => {
+    // One source: /api/pets/player carries the incubation block per egg.
+    const eggs = collectEggs(giga.pets, null, giga.hatcheryConfig);
+    const balances: Record<number, number> = {};
+    for (const [id, count] of Object.entries(giga.itemBalances)) balances[Number(id)] = count;
+    return buildHatcheryAdvice({
+      eggs,
+      balances,
+      config: giga.hatcheryConfig,
+      fateTarget,
+    });
+  }, [giga.pets, giga.itemBalances, giga.hatcheryConfig, fateTarget]);
+
+  // The badge counts eggs that need a hand: ready to hatch, or stalled cold.
+  // A merely-imperfect egg is not an interruption.
+  const hatcheryBadge = hatchery.readyToHatch.length +
+    hatchery.eggs.filter((e) => e.status === "stalled").length;
+
   // Daily completion strip — one glance answers "am I done for today?"
   const daily = useMemo(() => {
     const juiced = eng?.isPlayerJuiced ?? false;
@@ -1609,6 +1634,7 @@ export default function Home() {
               { id: "stats" as const, icon: BarChart3, label: "Stats & Intel", badge: 0 },
               { id: "roms" as const, icon: HardDrive, label: "ROMs", badge: 0 },
               { id: "world" as const, icon: Package, label: "Pots & Chests", badge: worldBadge },
+              { id: "hatchery" as const, icon: Egg, label: "Hatchery", badge: hatcheryBadge },
             ] as const).map((item) => {
               const Icon = item.icon;
               const active = activePage === item.id && !flyout;
@@ -2024,6 +2050,17 @@ export default function Home() {
           {/* ── World (Pots & Chests) Page ── */}
           {activePage === "world" && (
             <WorldPage giga={giga} addLog={addLog} eng={eng} />
+          )}
+
+          {/* ── Hatchery Page ── */}
+          {activePage === "hatchery" && (
+            <HatcheryPage
+              giga={giga}
+              advice={hatchery}
+              fateTarget={fateTarget}
+              setFateTarget={setFateTarget}
+              addLog={addLog}
+            />
           )}
 
           {/* ── Dungeon Page ── */}
@@ -3917,6 +3954,442 @@ function WorldPage({ giga, addLog, eng }: {
               </div>
             ))}
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A labelled bar. `value` of null means the API didn't say, which is not zero. */
+function StatMeter({ label, value, max, color, hint }: {
+  label: string;
+  value: number | null;
+  max: number;
+  color: string;
+  hint?: string;
+}) {
+  const pct = value === null ? 0 : Math.max(0, Math.min(100, (value / max) * 100));
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-1">
+        <span className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
+          {label}
+        </span>
+        <span className="text-[12px] tabular-nums font-medium" style={{ color: value === null ? "var(--text-faint)" : "var(--text)" }}>
+          {value === null ? "not reported" : `${value}/${max}`}
+        </span>
+      </div>
+      <div className="rounded-full overflow-hidden" style={{ height: 6, background: "var(--bg-inset)" }}>
+        <div
+          className="h-full rounded-full"
+          style={{
+            width: `${pct}%`,
+            background: color,
+            transition: "width 250ms ease",
+            // A null reading gets no bar at all rather than an empty one that
+            // reads as "this stat is at zero, go feed it".
+            opacity: value === null ? 0 : 1,
+          }}
+        />
+      </div>
+      {hint && (
+        <p className="text-[11px] mt-1" style={{ color: "var(--text-faint)" }}>{hint}</p>
+      )}
+    </div>
+  );
+}
+
+function HatcheryPage({ giga, advice, fateTarget, setFateTarget, addLog }: {
+  giga: ReturnType<typeof useGigaverse>;
+  advice: ReturnType<typeof buildHatcheryAdvice>;
+  fateTarget: number | "any";
+  setFateTarget: (t: number | "any") => void;
+  addLog: (msg: string) => void;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [results, setResults] = useState<{ label: string; ok: boolean; detail: string }[]>([]);
+  const loaded = useRef(false);
+
+  useEffect(() => {
+    if (loaded.current || !giga.token || !giga.address) return;
+    loaded.current = true;
+    giga.fetchHatchery();
+  }, [giga]);
+
+  const config = giga.hatcheryConfig;
+  const say = (label: string, ok: boolean, detail: string) => {
+    setResults((prev) => [...prev, { label, ok, detail }].slice(-12));
+    addLog(`${label}: ${detail}`);
+  };
+
+  /**
+   * Apply a plan one feed at a time, re-reading between each.
+   *
+   * The loop stops on the first error rather than pushing on through the rest.
+   * Since the per-feed stat delta is unmeasured, a run of failures would
+   * otherwise burn the whole plan discovering the same thing repeatedly.
+   */
+  const applyFeeds = async (plans: EggPlan[]) => {
+    const label = plans.length === 1 ? plans[0].name : `${plans.length} eggs`;
+    setBusy(label);
+    let fed = 0;
+    outer: for (const plan of plans) {
+      for (const feed of plan.feeds) {
+        for (let i = 0; i < feed.amount; i++) {
+          try {
+            const res = await giga.feedEgg(plan.petId, feed.itemId);
+            if (res?.success === false) {
+              say(plan.name, false, res.message || `${feed.name} was rejected`);
+              break outer;
+            }
+            fed++;
+          } catch (e) {
+            // The server's own words, not a summary of them — this is the
+            // message that says whether the request shape is right.
+            say(plan.name, false, e instanceof Error ? e.message : "feed failed");
+            break outer;
+          }
+        }
+      }
+    }
+    if (fed > 0) say(label, true, `Fed ${fed} unit${fed === 1 ? "" : "s"}`);
+    await giga.fetchHatchery();
+    await giga.refreshAll();
+    setBusy(null);
+  };
+
+  const runCraft = async (recipeId: string, name: string, runs: number) => {
+    setBusy(name);
+    for (let i = 0; i < runs; i++) {
+      try {
+        const r = await giga.useRecipe(recipeId);
+        if (r?.success === false) {
+          say(name, false, (r as { message?: string }).message || "trade failed");
+          break;
+        }
+      } catch (e) {
+        say(name, false, e instanceof Error ? e.message : "trade failed");
+        break;
+      }
+    }
+    say(name, true, `Traded for ${runs}x`);
+    await giga.refreshAll();
+    setBusy(null);
+  };
+
+  const totalFeeds = advice.feedOrder.reduce((s, f) => s + f.feed.amount, 0);
+  const feedable = advice.eggs.filter((e) => e.feeds.length > 0);
+
+  return (
+    <div className="anim-in space-y-6">
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h2 className="text-[18px] font-bold">Hatchery</h2>
+          <p className="text-[12px] mt-0.5" style={{ color: "var(--text-faint)" }}>
+            Temperature drives progress. Comfort decides the quality banked along the way.
+            Fate has to be bought before the hatch.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => giga.fetchHatchery()}
+            disabled={!!busy}
+            className="btn-press text-[13px] font-medium px-3 py-2 rounded-lg cursor-pointer disabled:opacity-40"
+            style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
+          >
+            Refresh
+          </button>
+          {feedable.length > 0 && (
+            <button
+              onClick={() => applyFeeds(feedable)}
+              disabled={!!busy}
+              className="btn-press text-[14px] font-bold px-4 py-2 rounded-lg cursor-pointer disabled:opacity-40"
+              style={{
+                background: "linear-gradient(135deg, color-mix(in srgb, var(--green) 35%, #000), var(--bg-raised))",
+                color: "var(--text-inverse)",
+                border: "none",
+              }}
+            >
+              {busy ? "Feeding…" : `Maintain all (${totalFeeds} feed${totalFeeds === 1 ? "" : "s"})`}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Fate target — a real choice, not a preference, so it says what it costs */}
+      <div className="p-4 rounded-lg" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
+        <SectionLabel>Fate target</SectionLabel>
+        <div className="flex flex-wrap gap-2 mt-2">
+          <button
+            onClick={() => setFateTarget("any")}
+            className="text-[12px] font-medium px-3 py-1.5 rounded-full cursor-pointer"
+            style={{
+              background: fateTarget === "any" ? "var(--orange-glow)" : "var(--bg-inset)",
+              border: `1px solid ${fateTarget === "any" ? "var(--border-accent)" : "var(--border)"}`,
+              color: fateTarget === "any" ? "var(--orange)" : "var(--text-faint)",
+            }}
+          >
+            Any faction — 119 dust
+          </button>
+          {FACTION_DUSTS.map((d) => (
+            <button
+              key={d.factionId}
+              onClick={() => setFateTarget(d.factionId)}
+              className="text-[12px] font-medium px-3 py-1.5 rounded-full cursor-pointer"
+              style={{
+                background: fateTarget === d.factionId ? "var(--orange-glow)" : "var(--bg-inset)",
+                border: `1px solid ${fateTarget === d.factionId ? "var(--border-accent)" : "var(--border)"}`,
+                color: fateTarget === d.factionId ? "var(--orange)" : "var(--text-faint)",
+              }}
+            >
+              {d.faction} — 290 dust
+            </button>
+          ))}
+        </div>
+        <p className="text-[11px] mt-2.5" style={{ color: "var(--text-faint)" }}>
+          Both routes end at a guaranteed faction trait. Spreading across all seven ladders
+          costs 119 dust because each faction&apos;s price resets at 5; one named faction has to
+          climb a single ladder from 5 to 24.
+        </p>
+      </div>
+
+      {advice.warnings.length > 0 && (
+        <div className="p-4 rounded-lg space-y-1.5" style={{ background: "var(--bg-raised)", border: "1px solid var(--red)" }}>
+          <SectionLabel>Needs attention</SectionLabel>
+          {advice.warnings.map((w, i) => (
+            <p key={i} className="text-[13px]" style={{ color: "var(--text)" }}>{w}</p>
+          ))}
+        </div>
+      )}
+
+      {/* Eggs */}
+      {advice.eggs.length === 0 ? (
+        <div className="p-6 rounded-lg text-center" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
+          <p className="text-[14px] font-medium">No eggs incubating</p>
+          <p className="text-[12px] mt-1" style={{ color: "var(--text-faint)" }}>
+            {giga.pets === null
+              ? "The hatchery hasn't been read yet — hit Refresh."
+              : "Nothing in the hatchery to maintain."}
+          </p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {advice.eggs.map((plan) => {
+            const ready = plan.status === "ready";
+            const accent =
+              ready ? "var(--green)" :
+              plan.status === "stalled" ? "var(--red)" :
+              plan.status === "unreadable" || plan.status === "idle"
+                ? "var(--text-faint)" : "var(--orange)";
+            return (
+              <div
+                key={plan.petId}
+                className="p-5 rounded-lg space-y-4"
+                style={{ background: "var(--bg-raised)", border: `1px solid ${ready ? "var(--green)" : "var(--border)"}` }}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-[15px] font-bold">{plan.name}</div>
+                    <div className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+                      {plan.eggType ?? "Egg"}
+                    </div>
+                  </div>
+                  <span
+                    className="text-[11px] font-bold uppercase tracking-wider px-2 py-1 rounded"
+                    style={{ background: "var(--bg-inset)", color: accent }}
+                  >
+                    {plan.status === "ready" ? "Hatch now" :
+                     plan.status === "stalled" ? "Stalled" :
+                     plan.status === "idle" ? "In the bag" :
+                     plan.status === "unreadable" ? "No data" : "Incubating"}
+                  </span>
+                </div>
+
+                <div className="space-y-3">
+                  <StatMeter
+                    label="Progress"
+                    value={plan.progress}
+                    max={config.maxProgress}
+                    color="var(--green)"
+                    hint={plan.progressPerDay !== null ? `+${plan.progressPerDay}%/day at this temperature.` : undefined}
+                  />
+                  <StatMeter
+                    label="Quality"
+                    value={plan.quality}
+                    max={config.maxQuality}
+                    color="var(--gold)"
+                    hint={plan.qualityPerDay !== null ? `+${plan.qualityPerDay}%/day at this comfort.` : undefined}
+                  />
+                  <StatMeter
+                    label="Temperature"
+                    value={plan.temperature}
+                    max={config.temperature.maxValue}
+                    color="var(--orange)"
+                    hint="Sets how fast progress moves."
+                  />
+                  <StatMeter
+                    label="Comfort"
+                    value={plan.comfort}
+                    max={config.comfort.maxValue}
+                    color="var(--blue)"
+                    hint="Sets the quality banked as progress accrues — not recoverable later."
+                  />
+                  {plan.fate && (
+                    <StatMeter
+                      label="Fate"
+                      value={plan.fate.influencesAfter - plan.fate.influencesGained}
+                      max={MAX_INFLUENCES}
+                      color="var(--purple)"
+                      hint={
+                        plan.fate.influencesGained > 0
+                          ? `${plan.fate.totalDust} dust would take it to ${plan.fate.influencesAfter}/${MAX_INFLUENCES} (${plan.fate.factionChanceAfter}% faction).`
+                          : plan.fate.shortfall ?? "Fully influenced."
+                      }
+                    />
+                  )}
+                </div>
+
+                {plan.alerts.map((a, i) => (
+                  <p key={i} className="text-[13px] font-medium" style={{ color: accent }}>{a}</p>
+                ))}
+                {plan.notes.map((n, i) => (
+                  <p key={i} className="text-[12px]" style={{ color: "var(--text-faint)" }}>{n}</p>
+                ))}
+
+                {plan.feeds.length > 0 && (
+                  <div className="pt-1">
+                    <div className="flex flex-wrap gap-1.5 mb-3">
+                      {plan.feeds.map((f, i) => (
+                        <span
+                          key={i}
+                          className="text-[12px] px-2 py-1 rounded tabular-nums"
+                          style={{ background: "var(--bg-inset)", color: "var(--text)" }}
+                          title={f.reason}
+                        >
+                          {f.amount}x {f.name}
+                        </span>
+                      ))}
+                    </div>
+                    <button
+                      onClick={() => applyFeeds([plan])}
+                      disabled={!!busy}
+                      className="btn-press w-full text-[14px] font-bold py-2.5 rounded-lg cursor-pointer disabled:opacity-30"
+                      style={{
+                        background: busy ? "var(--bg-inset)" : "linear-gradient(135deg, color-mix(in srgb, var(--orange) 35%, #000), var(--bg-raised))",
+                        border: busy ? "1px solid var(--border)" : "none",
+                        color: busy ? "var(--text-faint)" : "var(--text-inverse)",
+                      }}
+                    >
+                      {busy === plan.name ? "Feeding…" : "Feed this egg"}
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Vilhelm's trades, when the shelf is bare */}
+      {advice.craft.length > 0 && (
+        <div className="p-4 rounded-lg space-y-3" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
+          <SectionLabel>Trade for more at Vilhelm&apos;s</SectionLabel>
+          {advice.craft.map((c) => {
+            const affordable = c.inputHeld >= c.inputTotal;
+            return (
+              <div key={c.recipeId} className="flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  <div className="text-[13px] font-medium">
+                    {c.runs}x {c.name}
+                    <span style={{ color: "var(--text-faint)" }}>
+                      {" "}— {c.inputTotal} {c.input.name} (you have {c.inputHeld})
+                    </span>
+                  </div>
+                  <div className="text-[12px]" style={{ color: "var(--text-faint)" }}>{c.reason}</div>
+                </div>
+                <button
+                  onClick={() => runCraft(c.recipeId, c.name, c.runs)}
+                  disabled={!!busy || !affordable}
+                  className="btn-press text-[13px] font-bold px-3 py-2 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                  style={{ background: "var(--bg-inset)", border: "1px solid var(--border)" }}
+                >
+                  {affordable ? `Trade ${c.runs}x` : "Not enough"}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {advice.notes.length > 0 && (
+        <div className="p-4 rounded-lg space-y-1.5" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
+          <SectionLabel>Reasoning</SectionLabel>
+          {advice.notes.map((n, i) => (
+            <p key={i} className="text-[12px]" style={{ color: "var(--text-faint)" }}>{n}</p>
+          ))}
+        </div>
+      )}
+
+      {/* Field inspector.
+          The incubation response shape has never been observed, so every stat on
+          this page is read by matching key names. When a number here disagrees
+          with the game, this panel is the answer: it shows which field was
+          believed and every other field that matched. */}
+      {advice.eggs.length > 0 && (
+        <details className="rounded-lg" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
+          <summary className="p-4 cursor-pointer text-[13px] font-bold">
+            Where these numbers came from
+            <span className="ml-2 font-normal" style={{ color: "var(--text-faint)" }}>
+              — open this if a stat disagrees with the game
+            </span>
+          </summary>
+          <div className="px-4 pb-4 space-y-4">
+            {advice.eggs.map((plan) => (
+              <div key={plan.petId} className="space-y-1">
+                <div className="text-[12px] font-bold">{plan.name}</div>
+                {(["temperature", "comfort", "progress", "quality"] as const).map((key) => {
+                  const r = plan.readings[key];
+                  return (
+                    <div key={key} className="text-[11px] flex gap-2 flex-wrap" style={{ color: "var(--text-faint)" }}>
+                      <span style={{ minWidth: 88, display: "inline-block" }}>{key}</span>
+                      <span style={{ color: r.chosen ? "var(--text)" : "var(--red)" }}>
+                        {r.chosen ? `${r.chosen} = ${r.value}` : "no field matched"}
+                      </span>
+                      {r.candidates.length > 1 && (
+                        <span style={{ color: "var(--gold)" }}>
+                          also matched: {r.candidates.filter((c) => c.path !== r.chosen).map((c) => `${c.path}=${c.value}`).join(", ")}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+                <details>
+                  <summary className="text-[11px] cursor-pointer" style={{ color: "var(--text-faint)" }}>
+                    Raw response for this egg
+                  </summary>
+                  <pre
+                    className="text-[10px] mt-1 p-2 rounded overflow-auto"
+                    style={{ background: "var(--bg-inset)", maxHeight: 260 }}
+                  >
+                    {JSON.stringify(plan.raw, null, 2)}
+                  </pre>
+                </details>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {results.length > 0 && (
+        <div className="space-y-1.5">
+          <SectionLabel>Results</SectionLabel>
+          {results.map((r, i) => (
+            <div key={i} className="flex items-center gap-2 px-3 py-2 rounded" style={{ background: "var(--bg-inset)" }}>
+              <span style={{ color: r.ok ? "var(--green)" : "var(--red)" }}>{r.ok ? "✓" : "✗"}</span>
+              <span className="text-[13px] font-medium">{r.label}</span>
+              <span className="text-[12px]" style={{ color: "var(--text-faint)" }}>{r.detail}</span>
+            </div>
+          ))}
         </div>
       )}
     </div>

@@ -24,6 +24,7 @@ Gigaverse's fair play rules [explicitly allow](https://docs.gigaverse.io/general
 - **Fishing AI** — probability-weighted card scoring against predicted fish movement (near-100% hit rate with Fintuition). Auto-fish to the daily cap.
 - **Energy advisor** — allocates your daily energy across dungeons and fishing by value-per-energy, warns when you're capped and wasting regen, and knows when to claim ROM energy instead of dusting it.
 - **Skill advisor** — recommended upgrade paths per tree (combat tuned to how the auto-battler plays, fishing tuned to the card AI), one-click batch apply, respec flagged with the math when your allocation fights the build.
+- **Hatchery advisor** — holds every incubating egg at full temperature and comfort, funding comfort first because quality is banked as the egg progresses and cannot be recovered later. Plans the cheapest faction dust route to a guaranteed faction trait (119 dust spread across seven ladders, against 290 for one named faction), turns material shortfalls into a runnable Vilhelm trade, and alerts when an egg is ready to hatch, stalled cold, or about to hatch factionless.
 - **Intel** — enemy move patterns, run history, win rates, and loot totals persisted per wallet.
 
 ## Quickstart
