@@ -128,8 +128,76 @@ describe("event spends are ordered by measured yield", () => {
         ponds: [CLASSIC, GROVE], // Grove yield never measured
       })
     );
-    expect(r.dungeonRuns.find((d) => d.dungeonId === 7)?.runs).toBe(12);
+    // The measured source still leads — it just no longer eats the budget
+    // whole. 240E - 36E probe = 200E of runs, then the probe itself.
+    expect(r.dungeonRuns.find((d) => d.dungeonId === 7)?.runs).toBe(10);
+    expect(r.fishing.find((f) => f.pondId === 2)?.casts).toBe(3);
     expect(r.notes.some((n) => /no recorded Core yield/i.test(n))).toBe(true);
+  });
+
+  // Left to itself the ranking starves what it cannot rank: the unmeasured
+  // source is funded last, the measured one spends everything, so no rate is
+  // ever recorded and it is funded last again tomorrow. Jason hit this with a
+  // full 20-cast allowance and 7E left over — every cast expired unused.
+  it("never lets a measured source starve an unmeasured one to zero", () => {
+    const r = buildRecommendation(
+      input({
+        currentEnergy: 247,
+        dungeons: [{ ...woods, coresPerRun: 164 }],
+        ponds: [GROVE],
+        fishingCastsLeft: 20,
+      })
+    );
+    const casts = r.fishing.find((f) => f.pondId === 2)?.casts ?? 0;
+    expect(casts).toBeGreaterThan(0);
+    expect(
+      r.warnings.some((w) => /isn't 12E for even one/i.test(w))
+    ).toBe(false);
+  });
+
+  it("says what it is holding back and why", () => {
+    const r = buildRecommendation(
+      input({
+        currentEnergy: 247,
+        dungeons: [{ ...woods, coresPerRun: 164 }],
+        ponds: [GROVE],
+        fishingCastsLeft: 20,
+      })
+    );
+    expect(r.notes.some((n) => /Holding \d+E back/i.test(n))).toBe(true);
+  });
+
+  it("reserves nothing when every source already has a measured rate", () => {
+    const r = buildRecommendation(
+      input({
+        currentEnergy: 240,
+        dungeons: [{ ...woods, coresPerRun: 210 }],
+        ponds: [{ ...GROVE, coresPerCast: 12 }],
+        fishingCastsLeft: 20,
+      })
+    );
+    expect(r.notes.some((n) => /Holding \d+E back/i.test(n))).toBe(false);
+  });
+
+  it("reserves nothing when there is no measured source to starve it", () => {
+    const r = buildRecommendation(
+      input({ currentEnergy: 240, dungeons: [woods], ponds: [GROVE], fishingCastsLeft: 20 })
+    );
+    expect(r.notes.some((n) => /Holding \d+E back/i.test(n))).toBe(false);
+  });
+
+  it("does not reserve more than the source could actually spend", () => {
+    // One cast left in the pool: the probe is one cast, not three.
+    const r = buildRecommendation(
+      input({
+        currentEnergy: 247,
+        dungeons: [{ ...woods, coresPerRun: 164 }],
+        ponds: [GROVE],
+        fishingCastsLeft: 1,
+      })
+    );
+    expect(r.fishing.find((f) => f.pondId === 2)?.casts).toBe(1);
+    expect(r.dungeonRuns.find((d) => d.dungeonId === 7)?.runs).toBe(11);
   });
 
   it("admits when nothing is measured instead of implying the order is advice", () => {

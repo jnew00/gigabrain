@@ -16,6 +16,17 @@ function getPool(): Pool {
   return pool;
 }
 
+/**
+ * Wallet addresses are case-insensitive; EIP-55 mixed case is a checksum, not
+ * identity. Postgres `=` is not, so a checksummed address written one day and a
+ * lowercase one read the next look like two different players and silently
+ * orphan the entire history — the reader sees "no data" with nothing to
+ * explain it. Every address crossing this module is folded to one case.
+ */
+function normAddr(address: string): string {
+  return address.toLowerCase();
+}
+
 let initialized = false;
 
 async function ensureTables() {
@@ -90,7 +101,7 @@ export async function insertRun(
   await getPool().query(
     `INSERT INTO run_history (dungeon_name, won, rooms_cleared, final_hp, max_hp, items_json, boons_json, timestamp, user_address)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [dungeonName, won ? 1 : 0, roomsCleared, finalHp, maxHp, JSON.stringify(items), JSON.stringify(boons), Date.now(), userAddress]
+    [dungeonName, won ? 1 : 0, roomsCleared, finalHp, maxHp, JSON.stringify(items), JSON.stringify(boons), Date.now(), normAddr(userAddress)]
   );
 }
 
@@ -143,7 +154,7 @@ export async function getDungeonPerformance(
      FROM run_history
      WHERE user_address = $1 AND timestamp > $2
      GROUP BY dungeon_name`,
-    [userAddress, cutoff]
+    [normAddr(userAddress), cutoff]
   );
   const perf = rows as DungeonPerformanceRow[];
   if (yieldItemId === undefined) return perf;
@@ -151,7 +162,7 @@ export async function getDungeonPerformance(
   const { rows: lootRows } = await getPool().query(
     `SELECT dungeon_name, items_json FROM run_history
      WHERE user_address = $1 AND timestamp > $2`,
-    [userAddress, cutoff]
+    [normAddr(userAddress), cutoff]
   );
   // Every run counts, including the ones that dropped nothing.
   //
@@ -190,7 +201,7 @@ export async function insertCast(
   await getPool().query(
     `INSERT INTO cast_history (pond_id, node_id, energy_cost, entry_multiplier, caught, items_json, timestamp, user_address)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [pondId, nodeId, energyCost, entryMultiplier, caught ? 1 : 0, JSON.stringify(items), Date.now(), userAddress]
+    [pondId, nodeId, energyCost, entryMultiplier, caught ? 1 : 0, JSON.stringify(items), Date.now(), normAddr(userAddress)]
   );
 }
 
@@ -224,7 +235,7 @@ export async function getPondYields(
     `SELECT pond_id, energy_cost, entry_multiplier, caught, items_json
      FROM cast_history
      WHERE user_address = $1 AND timestamp > $2`,
-    [userAddress, cutoff]
+    [normAddr(userAddress), cutoff]
   );
 
   const byPond = new Map<
@@ -281,26 +292,26 @@ export async function getRunStats(userAddress: string): Promise<{
   const p = getPool();
   const { rows: [{ c: total }] } = await p.query(
     `SELECT COUNT(*) as c FROM run_history WHERE user_address = $1`,
-    [userAddress]
+    [normAddr(userAddress)]
   );
   const { rows: [{ c: wins }] } = await p.query(
     `SELECT COUNT(*) as c FROM run_history WHERE won = 1 AND user_address = $1`,
-    [userAddress]
+    [normAddr(userAddress)]
   );
   const { rows: avgResult } = await p.query(
     `SELECT AVG(rooms_cleared) as a FROM run_history WHERE user_address = $1`,
-    [userAddress]
+    [normAddr(userAddress)]
   );
   const avgRooms = Number(total) > 0 ? Number(avgResult[0].a) : 0;
   const { rows: recent } = await p.query(
     `SELECT * FROM run_history WHERE user_address = $1 ORDER BY timestamp DESC LIMIT 20`,
-    [userAddress]
+    [normAddr(userAddress)]
   );
 
   // Aggregate all items across all runs
   const { rows: allRuns } = await p.query(
     `SELECT items_json FROM run_history WHERE user_address = $1`,
-    [userAddress]
+    [normAddr(userAddress)]
   );
   const totalItems: Record<string, { name: string; amount: number }> = {};
   for (const row of allRuns) {

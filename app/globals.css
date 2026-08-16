@@ -185,12 +185,81 @@ body {
   border-color: var(--border-lite);
 }
 
+/* ─── Disclosure sections ───────────────────────────────── */
+
+/* A summary laid out with flex stops being a list-item, which takes the
+   native triangle with it and leaves a header that opens on click with
+   nothing saying so. The chevron is drawn explicitly and rotated on open. */
+summary.disclosure {
+  list-style: none;
+}
+summary.disclosure::-webkit-details-marker {
+  display: none;
+}
+.disclosure-chevron {
+  transition: transform 140ms ease;
+}
+details[open] > summary .disclosure-chevron {
+  transform: rotate(90deg);
+}
+
 /* ─── Scrollbar ─────────────────────────────────────────── */
 
+.log-area { scrollbar-width: thin; scrollbar-color: var(--border-lite) transparent; }
 .log-area::-webkit-scrollbar { width: 4px; }
 .log-area::-webkit-scrollbar-track { background: transparent; }
 .log-area::-webkit-scrollbar-thumb { background: var(--border-lite); border-radius: 4px; }
 .log-area::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+
+/* ─── Run modal ─────────────────────────────────────────── */
+
+/* One shape, because there is one state: the run. The review step it used to
+   narrow itself for is gone — the plan card behind the button already lists
+   every step and the energy, so confirming it restated what you had just read.
+
+   Height follows the content rather than the viewport. Pinning both top and
+   bottom made the modal 80% of the screen whatever was in it, which is how a
+   six-step plan became a tall column of nothing. Centred with a max-height, a
+   short run is a short box; a long one fills the screen and scrolls inside. */
+.run-modal {
+  max-width: 960px;
+  top: 50%;
+  transform: translateY(-50%);
+  max-height: 88vh;
+}
+
+/* Outcome pane and detail pane scroll independently. Neither can push the
+   other off the bottom, which is what a single shared scroll column did. */
+.run-panes {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+  overflow: hidden;
+}
+.run-pane {
+  min-height: 0;
+  overflow-y: auto;
+}
+/* Steps then activity, scrolling together: once the run is over that pane is
+   one narrative of how it went, and the log is newest-first so the last thing
+   that happened is already at the top. */
+.run-pane-detail {
+  border-left: 1px solid var(--border);
+}
+
+/* Stacked: one scroll again, but the outcome is on top of it rather than
+   buried under the log, so the order still answers "what did I get" first. */
+@media (max-width: 899px) {
+  .run-modal { max-width: 520px; }
+  .run-panes {
+    display: block;
+    overflow-y: auto;
+  }
+  .run-pane { overflow-y: visible; }
+  .run-pane-detail {
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+}
 
 /* ─── Selection ─────────────────────────────────────────── */
 

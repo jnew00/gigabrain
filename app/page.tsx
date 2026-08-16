@@ -3,6 +3,7 @@
 import { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction, evaluateState, explainAction, MOVE_LABELS } from "@/lib/auto-battle";
 import { probeEnemyMove } from "@/lib/enemy-probe";
+import { didWinRun, isRecordableRun } from "@/lib/run-outcome";
 import { authenticateWithSignature, recordRunAction, getRunStatsAction, getDungeonPerformanceAction } from "./actions";
 import { useLoginWithAbstract, useAbstractClient } from "@abstract-foundation/agw-react";
 import { useAccount, useSignMessage, useReadContract } from "wagmi";
@@ -986,7 +987,7 @@ export default function Home() {
             const finalRoom = result.data?.entity?.ROOM_NUM_CID ?? lastRoomNum;
             return {
               roomsCleared: finalRoom,
-              won: (p?.health.current ?? 0) > 0,
+              won: didWinRun(p?.health.current, finalRoom),
               finalHp: p?.health.current ?? 0,
               maxHp: p?.health.currentMax ?? 0,
               dungeonName: capturedDungeonName,
@@ -1119,14 +1120,22 @@ export default function Home() {
     } else if (wasInRunRef.current && !inRun && !runSummary) {
       // Run just ended without a summary being set — build one from last known state
       wasInRunRef.current = false;
-      const won = (player?.health.current ?? 0) > 0;
       const rooms = entity?.ROOM_NUM_CID ?? 0;
-      const items = buildItemSummary();
-      const boons = [...runBoonsRef.current];
-      setRunSummary({ roomsCleared: rooms, boons, items, finalHp: player?.health.current ?? 0, maxHp: player?.health.currentMax ?? 0, won });
-      recordRunAction(lastDungeonNameRef.current, won, rooms, player?.health.current ?? 0, player?.health.currentMax ?? 0, items, boons, giga.address)
-        .then(() => refreshRunStats()).catch(() => {});
-      addLog("run ended");
+      const maxHp = player?.health.currentMax ?? 0;
+      // A flicker of `inRun` against a stale dungeon state leaves nothing to
+      // record. Filing it anyway wrote an all-zero "Unknown" row that every
+      // stat then counted as a defeat.
+      if (!isRecordableRun(rooms, maxHp)) {
+        addLog("run ended with nothing recorded — not filed");
+      } else {
+        const won = didWinRun(player?.health.current, rooms);
+        const items = buildItemSummary();
+        const boons = [...runBoonsRef.current];
+        setRunSummary({ roomsCleared: rooms, boons, items, finalHp: player?.health.current ?? 0, maxHp, won });
+        recordRunAction(lastDungeonNameRef.current, won, rooms, player?.health.current ?? 0, maxHp, items, boons, giga.address)
+          .then(() => refreshRunStats()).catch(() => {});
+        addLog("run ended");
+      }
       giga.refreshAll();
     }
   }, [inRun, runSummary, entity, player, addLog, giga, buildItemSummary, refreshRunStats]);
@@ -2573,8 +2582,8 @@ export default function Home() {
                             const runOver = r.message === "Run Complete" || !r.data?.run || (p && p.health.current <= 0);
                             if (runOver) {
                               const fp = r.data?.run?.players?.[0];
-                              const won = (fp?.health.current ?? 0) > 0;
                               const rooms = r.data?.entity?.ROOM_NUM_CID ?? 0;
+                              const won = didWinRun(fp?.health.current, rooms);
                               const items = buildItemSummary();
                               const boons = [...runBoonsRef.current];
                               addLog(won ? "victory" : "defeated");

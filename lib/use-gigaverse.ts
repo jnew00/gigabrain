@@ -28,6 +28,14 @@ import type {
 import { normalizeFishingState, normalizeActionResponse, pendingCatchCards } from "./fishing-state";
 import { pondById } from "./ponds";
 import { HATCHERY_FALLBACK_CONFIG, readHatcheryConfig, type HatcheryConfig } from "./hatchery";
+import { indexGearDefs, type GearItemDef } from "./gear";
+import {
+  FEED_PAYLOAD_SHAPES,
+  isRequestShapeComplaint,
+  loadKnownShapeIndex,
+  saveKnownShapeIndex,
+  shapeOrder,
+} from "./hatchery-feed";
 const STORAGE_KEY = "giga-auth";
 
 interface StoredAuth {
@@ -79,11 +87,23 @@ export function beginHaulCapture(): void {
   haulCapture = new Map();
 }
 
-/** Ends the capture and returns the net item deltas collected. */
-export function endHaulCapture(): { id: number; amount: number }[] {
-  const out = haulCapture
+/**
+ * The deltas so far, without closing the capture.
+ *
+ * The run modal shows the haul filling up while the run is still going, which
+ * means reading the same accumulator the summary will later close over. Reading
+ * it must not disturb it — an early `endHaulCapture` would hand the summary an
+ * empty haul and lose everything collected after the peek.
+ */
+export function peekHaulCapture(): { id: number; amount: number }[] {
+  return haulCapture
     ? Array.from(haulCapture, ([id, amount]) => ({ id, amount })).filter((e) => e.amount !== 0)
     : [];
+}
+
+/** Ends the capture and returns the net item deltas collected. */
+export function endHaulCapture(): { id: number; amount: number }[] {
+  const out = peekHaulCapture();
   haulCapture = null;
   return out;
 }
@@ -163,6 +183,13 @@ export function useGigaverse() {
   const [juiceExpiry, setJuiceExpiry] = useState<number | null>(null); // unix timestamp
   const [gearInstances, setGearInstances] = useState<GearInstancesResponse | null>(null);
   const [vendorListings, setVendorListings] = useState<VendorListingsResponse | null>(null);
+  /**
+   * Gear definitions by item id. These carry `repairCost`, whose
+   * RESET_INPUT arrays say whether a gear can be restored at all and at what
+   * price — the difference between "farm more Gear Ember" and "this item is
+   * finished, burn it".
+   */
+  const [gearDefs, setGearDefs] = useState<Record<number, GearItemDef>>({});
   const [pets, setPets] = useState<unknown>(null);
   const [hatcheryConfig, setHatcheryConfig] = useState<HatcheryConfig>(
     HATCHERY_FALLBACK_CONFIG
@@ -203,7 +230,7 @@ export function useGigaverse() {
         setAddress(me.address);
 
         // Fetch everything else in parallel
-        const [acc, eng, ds, dt, rm, items, staticData, playerRecipeData, balancesData, juiceData, gearData, vendorData] = await Promise.all([
+        const [acc, eng, ds, dt, rm, items, staticData, playerRecipeData, balancesData, juiceData, gearData, gearDefsData, vendorData] = await Promise.all([
           proxy<AccountResponse>(`/api/account/${me.address}`, jwt),
           proxy<EnergyResponse>(`/api/offchain/player/energy/${me.address}`, jwt),
           proxy<DungeonActionResponse>("/api/game/dungeon/state", jwt),
@@ -215,6 +242,7 @@ export function useGigaverse() {
           proxy<ItemBalancesResponse>("/api/items/balances", jwt),
           proxy<GigaJuiceResponse>(`/api/gigajuice/player/${me.address}`, jwt).catch(() => null),
           proxy<GearInstancesResponse>(`/api/gear/instances/${me.address}`, jwt).catch(() => null),
+          proxy<unknown>("/api/gear/items", jwt).catch(() => null),
           proxy<VendorListingsResponse>(`/api/vendor/listings?wallet=${me.address}`, jwt).catch(() => null),
         ] as const);
 
@@ -289,6 +317,7 @@ export function useGigaverse() {
 
         // Store gear instances
         if (gearData) setGearInstances(gearData);
+        if (gearDefsData) setGearDefs(indexGearDefs(gearDefsData));
 
         // Store traveling merchant listings
         if (vendorData) setVendorListings(vendorData);
@@ -666,11 +695,27 @@ export function useGigaverse() {
             setItemBalances(bals);
             itemBalancesRef.current = bals;
             const changes: { id: number; amount: number }[] = [];
+            const deltas: { id: number; amount: number }[] = [];
             for (const [id, v] of Object.entries(bals)) {
               const delta = v - (balancesBefore[id] ?? 0);
               if (delta > 0) changes.push({ id: Number(id), amount: delta });
+              if (delta !== 0) deltas.push({ id: Number(id), amount: delta });
             }
             if (changes.length > 0) result.gameItemBalanceChanges = changes;
+            // Hand the deltas to the open haul capture as well.
+            //
+            // recordHaul() runs inside proxy(), which has already returned by
+            // the time this diff exists — so a pot or chest showed its loot in
+            // the activity log, which reads this result object, and contributed
+            // nothing to the haul pane, which reads the capture. Everything
+            // else in a run reports through gameItemBalanceChanges on the
+            // response and was never affected, which is what made the gap look
+            // like the pots not dropping anything.
+            //
+            // The haul takes losses too, unlike the loot line above: a merchant
+            // trade routed through this same call spends items to gain them,
+            // and a net view that counts only the gains is an advert.
+            if (deltas.length > 0) recordHaul({ gameItemBalanceChanges: deltas });
           }
         } catch {
           // Loot itemization is best-effort — the recipe itself succeeded
@@ -717,21 +762,62 @@ export function useGigaverse() {
    * time is correct whatever the real delta turns out to be, and re-reading the
    * egg between feeds is what will eventually measure it.
    *
-   * The request body is the shape every other POST in this API uses (flat,
-   * camelCase, domain-named). It has not been confirmed against a live feed, so
-   * the server's own error is passed through untouched rather than being
-   * flattened into "feed failed" — that message is the thing that will tell us
-   * the real shape.
+   * The request body could never be observed — the endpoint is authenticated —
+   * so the shape is discovered against the server instead of guessed at. The
+   * ladder in hatchery-feed.ts explains why that is safe here and, more
+   * importantly, when it refuses to climb: only a complaint about the request
+   * advances it, so a real refusal ("not enough Incube") is reported once
+   * rather than re-asked in four spellings.
+   *
+   * The winning shape is remembered, so this costs a few round trips once and
+   * nothing afterwards.
    */
   const feedEgg = useCallback(
     async (petId: string, itemId: number) => {
       if (!token) return null;
-      return proxy<{ success?: boolean; message?: string; gameItemBalanceChanges?: { id: number; amount: number }[] }>(
-        "/api/pets/feed",
-        token,
-        "POST",
-        { petId, itemId, amount: 1 }
-      );
+
+      type FeedResponse = {
+        success?: boolean;
+        message?: string;
+        error?: string;
+        gameItemBalanceChanges?: { id: number; amount: number }[];
+      };
+
+      let lastResult: FeedResponse | null = null;
+      let lastError: Error | null = null;
+
+      for (const index of shapeOrder(loadKnownShapeIndex())) {
+        const shape = FEED_PAYLOAD_SHAPES[index];
+        try {
+          const res = await proxy<FeedResponse>(
+            "/api/pets/feed",
+            token,
+            "POST",
+            shape.build(petId, itemId)
+          );
+          if (res?.success !== false) {
+            saveKnownShapeIndex(index);
+            return res;
+          }
+          lastResult = res;
+          if (!isRequestShapeComplaint(res.error ?? res.message)) return res;
+        } catch (e) {
+          lastError = e instanceof Error ? e : new Error(String(e));
+          // A proxy-level throw carries the upstream body, which is where the
+          // validation message lives on a 400.
+          const body = (lastError as Error & { responseData?: FeedResponse }).responseData;
+          const message = body?.error ?? body?.message ?? lastError.message;
+          if (!isRequestShapeComplaint(message)) throw lastError;
+          lastResult = body ?? null;
+        }
+      }
+
+      // Every candidate was rejected as malformed. Surfacing the last message
+      // beats inventing one: it is the only description of what the endpoint
+      // actually wants.
+      if (lastResult) return lastResult;
+      if (lastError) throw lastError;
+      return null;
     },
     [token]
   );
@@ -1071,6 +1157,7 @@ export function useGigaverse() {
     fishingState,
     juiceExpiry,
     gearInstances,
+    gearDefs,
     vendorListings,
     pets,
     hatcheryConfig,

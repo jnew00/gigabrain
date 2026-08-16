@@ -226,6 +226,107 @@ export function castsUsedToday(state: DayCountState | null | undefined): number 
   return sum;
 }
 
+/** The day-counter state plus the caps that apply to it. */
+export interface CastAllowanceState extends DayCountState {
+  maxPerDay?: number;
+  maxPerDayJuiced?: number;
+}
+
+export interface CastAllowance {
+  /** Have the day's counters actually been seen? */
+  known: boolean;
+  /** Casts the day has left. Always 0 while `known` is false. */
+  left: number;
+  /** The cap in force, for display. */
+  max: number;
+  /** Casts already spent across every pond. */
+  used: number;
+}
+
+/**
+ * What the day's cast allowance actually is, and whether we know yet.
+ *
+ * The `known` flag is the point. Nothing fetches the fishing state on the way
+ * into the app, so callers routinely hold `null` — and the obvious arithmetic
+ * on `null` produces a confident full allowance, because no counters seen reads
+ * as none used. That is how a juiced player got a firm 20 casts against a
+ * server that had been refusing since the first one, and the plan ended up
+ * showing "Dendren Grove ×20" beside "no casts left in today's allowance".
+ *
+ * An unknown allowance is 0 here, never the cap. Planning nothing until the
+ * numbers arrive costs a moment; planning twenty casts that cannot run costs
+ * the whole fishing phase.
+ */
+export function castAllowance(
+  state: CastAllowanceState | null | undefined,
+  isJuiced: boolean,
+  fallback: { maxCastsPerDay: number; juicedMaxCastsPerDay: number }
+): CastAllowance {
+  const max = isJuiced
+    ? (state?.maxPerDayJuiced ?? fallback.juicedMaxCastsPerDay)
+    : (state?.maxPerDay ?? fallback.maxCastsPerDay);
+  if (state == null) return { known: false, left: 0, max, used: 0 };
+  const used = castsUsedToday(state);
+  return { known: true, left: Math.max(0, max - used), max, used };
+}
+
+export interface SavedCastAlloc {
+  casts: number;
+  castCost: number;
+}
+
+/**
+ * Clamp a restored plan's casts by both budgets that bind them.
+ *
+ * A saved plan is a record of what was intended earlier, not of what is still
+ * possible. Two things can have moved since: energy, and the day's cast
+ * allowance. Clamping only by energy restored the earlier run's cast count in
+ * full whenever the casts had been spent but the energy had not — the plan then
+ * showed a number of casts the server had been refusing since the first one.
+ *
+ * Both budgets are shared pools walked across the list, because entries can sit
+ * on different nodes at different prices and the daily allowance is one pool for
+ * every pond.
+ *
+ * Extracted from the component so the clamp is testable on its own. The
+ * equivalent dungeon clamp has always applied both limits; this one is here to
+ * make sure the fishing side cannot drift away from that again.
+ */
+export function clampRestoredCasts<T extends SavedCastAlloc>(
+  saved: T[],
+  budgets: { energy: number; castsLeftToday: number }
+): T[] {
+  let energy = budgets.energy;
+  let allowance = Math.max(0, budgets.castsLeftToday);
+  const out: T[] = [];
+  for (const alloc of saved) {
+    const affordable = alloc.castCost > 0 ? Math.floor(energy / alloc.castCost) : 0;
+    const casts = Math.max(0, Math.min(alloc.casts, affordable, allowance));
+    energy -= casts * alloc.castCost;
+    allowance -= casts;
+    if (casts > 0) out.push({ ...alloc, casts });
+  }
+  return out;
+}
+
+/**
+ * Does this server error mean "no more casts today", rather than "not now"?
+ *
+ * The distinction decides whether the executor retries or stops. A cap refusal
+ * cannot become false before the daily reset, so every further attempt has a
+ * known answer; a token or network failure is worth another try.
+ *
+ * This exists because our own count of casts-remaining has been wrong more than
+ * once — a per-pond counter read as a global one, a plan built before the day
+ * rolled over — and each fix only closed that instance. The count is a
+ * prediction; this is the server's verdict. Deferring to the verdict is what
+ * caps the cost of the next miscount at one wasted cast instead of twenty.
+ */
+export function isDailyCapError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return /max runs|reached max|daily limit|no runs left|max casts/i.test(message);
+}
+
 /* ─── Entry tiers ──────────────────────────────────────────── */
 
 /**

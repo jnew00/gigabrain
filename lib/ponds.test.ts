@@ -6,8 +6,11 @@ import {
   castNodeById,
   castsUsedByPond,
   castsUsedToday,
+  castAllowance,
+  clampRestoredCasts,
   findPond,
   findPondForNode,
+  isDailyCapError,
   isPondOpen,
   openCastNodes,
   openPonds,
@@ -122,6 +125,78 @@ describe("the daily cast pool is shared across ponds", () => {
   });
 });
 
+describe("an unknown cast allowance is not a full one", () => {
+  const CAPS = { maxCastsPerDay: 10, juicedMaxCastsPerDay: 20 };
+  // Real counters from /api/fishing/state on 2026-08-15: the Grove's twenty
+  // casts spent, the classic pond untouched.
+  const spent = {
+    maxPerDay: 10,
+    maxPerDayJuiced: 20,
+    dayDocs: [
+      { pondId: 1, doc: { UINT256_CID: 0 } },
+      { pondId: 2, doc: { UINT256_CID: 20 } },
+    ],
+  };
+
+  // The bug this function exists for. Nothing fetches the fishing state on the
+  // way into the app, so `null` is the state callers routinely hold, and the
+  // arithmetic on it — cap minus zero-counters-seen — handed back a confident
+  // full allowance. The plan then showed twenty Grove casts the server had been
+  // refusing since the first one.
+  it("reports 0 left and known=false when the state has not loaded", () => {
+    for (const missing of [null, undefined]) {
+      const a = castAllowance(missing, true, CAPS);
+      expect(a.known).toBe(false);
+      expect(a.left).toBe(0);
+      expect(a.used).toBe(0);
+    }
+  });
+
+  it("still reports the cap while unknown, so the UI can say which cap applies", () => {
+    expect(castAllowance(null, true, CAPS).max).toBe(20);
+    expect(castAllowance(null, false, CAPS).max).toBe(10);
+  });
+
+  it("subtracts every pond's casts once the state is in", () => {
+    const a = castAllowance(spent, true, CAPS);
+    expect(a.known).toBe(true);
+    expect(a.used).toBe(20);
+    expect(a.left).toBe(0);
+  });
+
+  it("counts a state with counters but no casts spent as a full allowance", () => {
+    const a = castAllowance({ ...spent, dayDocs: [] }, true, CAPS);
+    expect(a.known).toBe(true);
+    expect(a.left).toBe(20);
+  });
+
+  it("uses the juiced cap only when juiced", () => {
+    const fresh = { ...spent, dayDocs: [{ pondId: 1, doc: { UINT256_CID: 3 } }] };
+    expect(castAllowance(fresh, true, CAPS).left).toBe(17);
+    expect(castAllowance(fresh, false, CAPS).left).toBe(7);
+  });
+
+  it("prefers the server's caps over the fallback constants", () => {
+    const generous = { maxPerDay: 12, maxPerDayJuiced: 24, dayDocs: [] };
+    expect(castAllowance(generous, true, CAPS).max).toBe(24);
+    expect(castAllowance(generous, false, CAPS).max).toBe(12);
+  });
+
+  it("never reports a negative allowance when the counters exceed the cap", () => {
+    const over = { ...spent, dayDocs: [{ pondId: 2, doc: { UINT256_CID: 25 } }] };
+    expect(castAllowance(over, true, CAPS).left).toBe(0);
+  });
+
+  // The two readings the app actually makes have to agree: the planner's
+  // number and the executor's recount are the same call on different states,
+  // and they disagreeing is precisely what put an impossible plan on screen.
+  it("feeds clampRestoredCasts a budget that zeroes a spent day", () => {
+    const saved = [{ casts: 20, castCost: 12 }];
+    const left = castAllowance(spent, true, CAPS).left;
+    expect(clampRestoredCasts(saved, { energy: 10_000, castsLeftToday: left })).toEqual([]);
+  });
+});
+
 describe("pond entry offerings", () => {
   // Verified shape from pondEntryTiers on 2026-08-11: three Grove tiers with
   // dropMultiplier 1, 2 and 4; tiers 2 and 3 each want one faction ring.
@@ -175,5 +250,88 @@ describe("pond entry offerings", () => {
   it("ignores tiers outside their day window", () => {
     expect(pondEntryOptions(tiers, 2, { "243": 1 }, 20800).payable).toBeNull();
     expect(pondEntryOptions(tiers, 2, { "243": 1 }, 20676).payable?.tier).toBe(3);
+  });
+});
+
+describe("telling a spent allowance apart from a transient failure", () => {
+  it("recognises the server's own cap refusal", () => {
+    // Verbatim from a run that burned all 18 planned casts on this message.
+    expect(isDailyCapError("Player has reached max runs for fishing")).toBe(true);
+  });
+
+  it("recognises the other phrasings the server uses for a spent allowance", () => {
+    expect(isDailyCapError("Daily limit reached")).toBe(true);
+    expect(isDailyCapError("no runs left today")).toBe(true);
+    expect(isDailyCapError("max casts reached")).toBe(true);
+  });
+
+  it("does not stop the run for a failure that a retry could clear", () => {
+    // These have to stay retryable: treating them as terminal would abandon
+    // the day's remaining casts over one stale token.
+    expect(isDailyCapError("Invalid action token")).toBe(false);
+    expect(isDailyCapError("Not enough energy")).toBe(false);
+    expect(isDailyCapError("fetch failed")).toBe(false);
+  });
+
+  it("treats a missing message as retryable rather than terminal", () => {
+    expect(isDailyCapError(null)).toBe(false);
+    expect(isDailyCapError(undefined)).toBe(false);
+    expect(isDailyCapError("")).toBe(false);
+  });
+});
+
+describe("a restored plan is clamped by the day, not just by energy", () => {
+  it("drops casts that were already spent since the plan was saved", () => {
+    // The failure from the log: 18 Grove casts saved from an earlier run that
+    // day, still affordable, and every one already spent. Clamping on energy
+    // alone restored all 18 and the server refused all 18.
+    const restored = clampRestoredCasts([{ casts: 18, castCost: 12 }], {
+      energy: 500,
+      castsLeftToday: 0,
+    });
+    expect(restored).toHaveLength(0);
+  });
+
+  it("restores the part of the plan the day can still pay for", () => {
+    const restored = clampRestoredCasts([{ casts: 18, castCost: 12 }], {
+      energy: 500,
+      castsLeftToday: 5,
+    });
+    expect(restored[0].casts).toBe(5);
+  });
+
+  it("still clamps by energy when the allowance is untouched", () => {
+    const restored = clampRestoredCasts([{ casts: 18, castCost: 12 }], {
+      energy: 36,
+      castsLeftToday: 20,
+    });
+    expect(restored[0].casts).toBe(3);
+  });
+
+  it("spends the allowance as one pool across ponds", () => {
+    // Not four casts each: the daily cap is shared, so the first entry takes
+    // what it needs and the second gets the remainder.
+    const restored = clampRestoredCasts(
+      [
+        { casts: 4, castCost: 10 },
+        { casts: 4, castCost: 10 },
+      ],
+      { energy: 1000, castsLeftToday: 6 }
+    );
+    expect(restored.map((r) => r.casts)).toEqual([4, 2]);
+  });
+
+  it("returns nothing rather than negatives when both budgets are gone", () => {
+    expect(
+      clampRestoredCasts([{ casts: 9, castCost: 10 }], { energy: 0, castsLeftToday: -3 })
+    ).toEqual([]);
+  });
+
+  it("preserves the other fields on each entry", () => {
+    const restored = clampRestoredCasts(
+      [{ casts: 5, castCost: 10, castNodeId: "5", pondId: 2 }],
+      { energy: 1000, castsLeftToday: 2 }
+    );
+    expect(restored[0]).toMatchObject({ castNodeId: "5", pondId: 2, casts: 2 });
   });
 });

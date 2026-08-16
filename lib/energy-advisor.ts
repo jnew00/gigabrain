@@ -254,6 +254,40 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
     );
   }
 
+  /**
+   * Units of an unmeasured event source held back from a measured one.
+   *
+   * Without this the ranking eats itself: an unmeasured source is funded last,
+   * a measured source spends the whole budget first, so the unmeasured one
+   * never gets a single unit, never gets measured, and is funded last again
+   * tomorrow. The note above calls the ordering "a placeholder until it's
+   * measured" — a placeholder that nothing can ever lift is just a permanent
+   * demotion dressed up as a temporary one.
+   *
+   * Three units, because one is noise. It is a probe, not a hedge: the point is
+   * to learn the rate, and the cost of learning it is bounded and paid once.
+   */
+  const PROBE_UNITS = 3;
+
+  const unitsAvailable = (s: EventSpend) =>
+    s.kind === "pond" ? Math.min(s.unitsLeft, castsLeft) : s.unitsLeft;
+
+  // Only worth reserving when something measured would otherwise take it all.
+  let probeReserve = ranked.some((s) => coresPerEnergy(s) != null)
+    ? ranked.reduce(
+        (sum, s) =>
+          coresPerEnergy(s) == null && s.energyPerUnit > 0
+            ? sum + Math.min(PROBE_UNITS, unitsAvailable(s)) * s.energyPerUnit
+            : sum,
+        0
+      )
+    : 0;
+  if (probeReserve > 0) {
+    notes.push(
+      `Holding ${probeReserve}E back so the unmeasured source above gets a few units — otherwise it never earns a rate and stays last forever.`
+    );
+  }
+
   for (const spend of ranked) {
     if (spend.energyPerUnit <= 0) {
       notes.push(
@@ -263,8 +297,18 @@ export function buildRecommendation(input: AdvisorInput): AdvisorResult {
     }
     // A pond's units are the shared pool as it stands now, not as it stood when
     // the list was built — an earlier pond may already have taken from it.
-    const available = spend.kind === "pond" ? Math.min(spend.unitsLeft, castsLeft) : spend.unitsLeft;
-    const units = Math.min(available, Math.floor(budget / spend.energyPerUnit));
+    const available = unitsAvailable(spend);
+    const measured = coresPerEnergy(spend) != null;
+    // A measured source spends everything except the probe; an unmeasured one
+    // is what the probe was being held for, so it draws on the full budget.
+    if (!measured) {
+      probeReserve = Math.max(
+        0,
+        probeReserve - Math.min(PROBE_UNITS, available) * spend.energyPerUnit
+      );
+    }
+    const spendable = measured ? Math.max(0, budget - probeReserve) : budget;
+    const units = Math.min(available, Math.floor(spendable / spend.energyPerUnit));
 
     if (units <= 0) {
       if (available <= 0) continue;

@@ -4,15 +4,21 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { useGigaverse } from "@/lib/use-gigaverse";
 import { pickBestAction } from "@/lib/auto-battle";
 import { probeEnemyMove } from "@/lib/enemy-probe";
+import { didWinRun } from "@/lib/run-outcome";
 import { pickBestCard, pickGroveMove, resolveGrid } from "@/lib/fishing-ai";
-import { beginHaulCapture, endHaulCapture } from "@/lib/use-gigaverse";
+import { beginHaulCapture, endHaulCapture, peekHaulCapture } from "@/lib/use-gigaverse";
 import { probeFishMove } from "@/lib/fishing-probe";
 import { pendingCatchCards } from "@/lib/fishing-state";
-import { Sword, Package, Fish, AlertTriangle, Info, Lightbulb } from "lucide-react";
+import type { FishingGameState } from "@/lib/types";
+import { restoreVerdict, isRepairExhausted } from "@/lib/gear";
+import { suggestGear, deadSlotsWithoutOptions, describeEffects, type GearRecipe } from "@/lib/gear-advisor";
+import { buildLoadout, loadoutWarnings, emptyWoodsSlots, usableHands } from "@/lib/loadout";
+import { Sword, Package, Fish, AlertTriangle, Info, Lightbulb, ChevronRight } from "lucide-react";
 import { recordRunAction, recordCastAction, getDungeonPerformanceAction, getPondYieldsAction } from "./actions";
 import { getMaxRunsPerDay, findDungeonInfo, isEventDungeon, isAwakeningActive, pickEntryTier, CLAIM_RECIPES, CLAIM_RECIPE_IDS, AWAKENING, FISHING } from "@/lib/game-data";
 import {
-  openCastNodes, openPonds, pondById, pondCurrencyLabel, castsUsedToday, pondEntryOptions,
+  openCastNodes, openPonds, pondById, pondCurrencyLabel, castAllowance, pondEntryOptions,
+  isDailyCapError, clampRestoredCasts,
 } from "@/lib/ponds";
 import { buildRecommendation } from "@/lib/energy-advisor";
 import type { AdvisorResult } from "@/lib/energy-advisor";
@@ -385,7 +391,6 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   const modalRef = useRef<HTMLDivElement>(null);
   const adjustRef = useRef<HTMLDivElement>(null);
   const [showModal, setShowModal] = useState(false);
-  const [reviewing, setReviewing] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [adjusting, setAdjusting] = useState(false);
   const [adjustSection, setAdjustSection] = useState<"energy" | "free" | "merchant" | "presets">("energy");
@@ -393,6 +398,11 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   const [confirmTrade, setConfirmTrade] = useState<string | null>(null);
   const [confirmRepairAll, setConfirmRepairAll] = useState(false);
   const restoredEmptyRef = useRef(false);
+  /**
+   * Dungeon count the saved plan was last restored for, or null when a restore
+   * is still pending. Stops the restore re-running on unrelated data changes.
+   */
+  const restoredOnceRef = useRef<number | null>(null);
   const autoAppliedRef = useRef(false);
 
   // Restore the last run's summary so a reload mid-run or after one doesn't
@@ -496,7 +506,27 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   // Initialize dungeon allocs when data arrives
   useEffect(() => {
     if (dungeons.length === 0) return;
+    // Keyed on the dungeon count rather than a plain boolean so a genuine change
+    // to the dungeon list still rebuilds the rows, which is what this effect did
+    // before deferral existed.
+    if (restoredOnceRef.current === dungeons.length) return;
     const last = loadLastAlloc();
+
+    // Saved casts can only be clamped against the day's allowance once the
+    // fishing state is in, so when it isn't they are deferred to a later pass.
+    //
+    // Deferred, not blocking: an earlier version of this returned here and took
+    // the dungeon restore down with it, so a missing fishing state emptied the
+    // whole plan and left `restoredEmptyRef` unset — which is the flag the
+    // advisor's auto-apply reads, so no plan appeared at all. Fishing readiness
+    // has no business gating dungeon allocation.
+    const hasSavedCasts = migrateFishingAllocs(
+      last?.fishingAllocs ?? last?.fishingAlloc
+    ).some((a) => a.casts > 0);
+    const castsDeferred = hasSavedCasts && !giga.fishingState;
+    // Left unset while casts are deferred, so the effect runs again when the
+    // fishing state lands and the casts can finally be clamped.
+    restoredOnceRef.current = castsDeferred ? null : dungeons.length;
 
     // Filter out item-cost dungeons (like Temporal Void) that don't use energy
     const currentEnergy = Math.floor(eng?.energyValue ?? 0);
@@ -524,19 +554,24 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     });
     setDungeonAllocs(allocs);
 
-    // Saved casts, clamped by the energy actually available. The clamp walks the
-    // list rather than dividing once, because the entries can be on different
-    // nodes at different prices and the budget is shared between them.
+    // Saved casts, clamped by the energy actually available AND by the casts the
+    // day has left. The clamp walks the list rather than dividing once, because
+    // the entries can be on different nodes at different prices and both budgets
+    // are shared between them.
+    //
+    // The daily clamp is the one the dungeon branch above has always had and
+    // this one lacked. Without it, running the plan a second time in one day
+    // restored the first run's cast count verbatim: 18 saved casts, all still
+    // affordable, every one already spent. The plan showed 18, the server
+    // refused 18. It was never intermittent — it happened every second run.
+    const castsLeftToday = castAllowance(
+      giga.fishingState, eng?.isPlayerJuiced ?? false, FISHING
+    ).left;
+
     const savedCasts = migrateFishingAllocs(last?.fishingAllocs ?? last?.fishingAlloc);
-    let castBudget = energyBudget;
-    const restoredCasts = savedCasts
-      .map((a) => {
-        const affordable = a.castCost > 0 ? Math.floor(castBudget / a.castCost) : 0;
-        const casts = Math.min(a.casts, affordable);
-        castBudget -= casts * a.castCost;
-        return { ...a, casts };
-      })
-      .filter((a) => a.casts > 0);
+    const restoredCasts = castsDeferred
+      ? []
+      : clampRestoredCasts(savedCasts, { energy: energyBudget, castsLeftToday });
     setFishingAllocs(restoredCasts);
 
     if (last?.freeActions) {
@@ -547,16 +582,27 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     restoredEmptyRef.current =
       allocs.every((a) => a.runs === 0) && restoredCasts.length === 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dungeons.length]);
+  }, [dungeons.length, giga.fishingState]);
 
   // Fishing state
   const fs = giga.fishingState;
   const isJuiced = eng?.isPlayerJuiced ?? false;
-  const castsToday = castsUsedToday(fs);
-  const maxCasts = isJuiced
-    ? (fs?.maxPerDayJuiced ?? FISHING.juicedMaxCastsPerDay)
-    : (fs?.maxPerDay ?? FISHING.maxCastsPerDay);
-  const remainingCasts = Math.max(0, maxCasts - castsToday);
+  const allowance = castAllowance(fs, isJuiced, FISHING);
+  const castsKnown = allowance.known;
+  const remainingCasts = allowance.left;
+
+  // Mission Control plans against the cast allowance, but nothing on the way in
+  // fetches it — `connect` deliberately skips the fishing state, and the
+  // Fishing tab is what usually loads it. Land here first and the plan would
+  // wait on a number that was never going to be asked for.
+  const castsRequestedRef = useRef(false);
+  useEffect(() => {
+    if (!giga.token || !giga.address || giga.fishingState || castsRequestedRef.current) return;
+    // Once per mount: a failed fetch returns null without setting state, and
+    // retrying on every render would hammer the endpoint.
+    castsRequestedRef.current = true;
+    giga.fetchFishingState();
+  }, [giga]);
 
   // Casts already planned, which the steppers cap against. One number because
   // the allowance is one pool — a pond does not have casts of its own.
@@ -604,15 +650,19 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     !chestCd.onCooldown ||
     (juicedNow && (!juiceChestCd.onCooldown || !juiceChestForestCd.onCooldown));
 
-  // Find hands gear for pots
+  // Find hands gear for pots.
+  //
+  // Durability is part of the test, not an afterthought. Matching on name alone
+  // returned whichever pair was found first — including one at zero uses — so
+  // the panel reported the pot ready and the break then failed against hands
+  // that had nothing left in them.
   const findHandsGear = (handsType: "Paper Hands" | "Rock Hands"): string => {
-    if (!giga.gearInstances?.entities) return "";
-    for (const g of giga.gearInstances.entities) {
-      const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || "";
-      if (handsType === "Paper Hands" && name.toLowerCase().includes("paper")) return g.docId;
-      if (handsType === "Rock Hands" && name.toLowerCase().includes("rock")) return g.docId;
-    }
-    return "";
+    const owned = giga.gearInstances?.entities ?? [];
+    const match = handsType === "Paper Hands" ? "paper" : "rock";
+    return (
+      usableHands(owned, giga.gearDefs, (id) => giga.itemInfo[String(id)]?.name || "", match)
+        ?.docId ?? ""
+    );
   };
   const paperHandsId = findHandsGear("Paper Hands");
   const rockHandsId = findHandsGear("Rock Hands");
@@ -801,7 +851,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   // Gear that's broken or one use from it — only gear the daily loop needs
   // (equipped dungeon gear, hands for pots, rods/lures for fishing)
   const allWornGear = useMemo(() => {
-    const out: { docId: string; name: string; durability: number; equipped: boolean }[] = [];
+    const out: {
+      docId: string; name: string; gameItemId: number; durability: number;
+      equipped: boolean; spent: boolean;
+    }[] = [];
     for (const g of giga.gearInstances?.entities ?? []) {
       const name = giga.itemInfo[String(g.GAME_ITEM_ID_CID)]?.name || `Gear #${g.GAME_ITEM_ID_CID}`;
       const lower = name.toLowerCase();
@@ -810,22 +863,114 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         ["hand", "rod", "lure"].some((k) => lower.includes(k));
       if (!relevant) continue;
       if (g.DURABILITY_CID <= 1) {
-        out.push({ docId: g.docId, name, durability: g.DURABILITY_CID, equipped: g.EQUIPPED_TO_SLOT_CID >= 0 });
+        out.push({
+          docId: g.docId, name, gameItemId: g.GAME_ITEM_ID_CID,
+          durability: g.DURABILITY_CID, equipped: g.EQUIPPED_TO_SLOT_CID >= 0,
+          // Read from the definitions rather than waited for. The server will
+          // refuse a repair on these, and it used to be the only thing that
+          // knew: the piece sat under "Gear needs repair", went into the plan,
+          // and moved to the restore section only after the run had already
+          // tried and failed on it.
+          spent: isRepairExhausted(g, giga.gearDefs[g.GAME_ITEM_ID_CID]),
+        });
       }
     }
     return out;
-  }, [giga.gearInstances, giga.itemInfo]);
+  }, [giga.gearInstances, giga.itemInfo, giga.gearDefs]);
 
   // Still worn, but repair will be refused — these need the restore flow, so
   // they stay visible as a warning and out of every repair attempt.
+  //
+  // Two sources, because they cover different gaps: the definitions answer
+  // before anything is attempted, and `unrepairable` catches the pieces whose
+  // definition never loaded, where the server's refusal is the only evidence
+  // there is.
   const exhaustedGear = useMemo(
-    () => allWornGear.filter((g) => unrepairable.has(g.docId)),
+    () => allWornGear.filter((g) => g.spent || unrepairable.has(g.docId)),
     [allWornGear, unrepairable]
   );
   const wornGear = useMemo(
-    () => allWornGear.filter((g) => !unrepairable.has(g.docId)),
+    () => allWornGear.filter((g) => !g.spent && !unrepairable.has(g.docId)),
     [allWornGear, unrepairable]
   );
+
+  /**
+   * Gear worth making next, from the game's own recipes and effect tables.
+   *
+   * Capped at three per activity. The full list runs to dozens and a wall of
+   * craftables is a catalogue, not advice — the ranking already puts a dead
+   * slot above an empty one above an upgrade, so the top of each list is the
+   * part that changes anything.
+   */
+  const gearAdvice = useMemo(() => {
+    const itemName = (id: number) =>
+      giga.itemInfo[String(id)]?.name || giga.itemNames[String(id)] || `#${id}`;
+    const input = {
+      defs: giga.gearDefs,
+      recipes: giga.worldRecipes as GearRecipe[],
+      balances: giga.itemBalances,
+      owned: giga.gearInstances?.entities ?? [],
+      itemName,
+    };
+    const all = suggestGear(input);
+    const dungeon = all.filter((s) => s.purpose === "dungeon").slice(0, 3);
+    const fishing = all.filter((s) => s.purpose === "fishing").slice(0, 3);
+    const shown = [...dungeon, ...fishing];
+    const ready = shown.filter((s) => s.affordable).length;
+    return {
+      dungeon,
+      fishing,
+      stranded: deadSlotsWithoutOptions(input, all),
+      itemName,
+      // Counts what the panel would list, not the whole catalogue — a summary
+      // promising nine suggestions that opens onto six is worse than no summary.
+      summary:
+        ready > 0
+          ? `${ready} you can make now${shown.length > ready ? ` · ${shown.length - ready} short` : ""}`
+          : `${shown.length} short on materials`,
+    };
+  }, [giga.gearDefs, giga.worldRecipes, giga.itemBalances, giga.gearInstances, giga.itemInfo, giga.itemNames]);
+
+  // What is actually worn, and what is wrong with it. Separate from the worn-
+  // gear scan above, which only ever looks at damage — a healthy pair of hands
+  // in the bag is not damaged, and an empty hands slot is why a pot refuses.
+  const loadout = useMemo(
+    () =>
+      buildLoadout(
+        giga.gearInstances?.entities ?? [],
+        giga.gearDefs,
+        (id) => giga.itemInfo[String(id)]?.name || giga.itemNames[String(id)] || `#${id}`
+      ),
+    [giga.gearInstances, giga.gearDefs, giga.itemInfo, giga.itemNames]
+  );
+  const kitWarnings = useMemo(
+    () => loadoutWarnings(loadout, emptyWoodsSlots(loadout)),
+    [loadout]
+  );
+
+  /**
+   * The one line that has to survive the section being shut.
+   *
+   * Both gear panels sit collapsed by default, so the header is the only thing
+   * most days show. It counts problems rather than naming gear: "2 finished"
+   * is a reason to open the panel, where a list of six slot names is just the
+   * panel again, worse.
+   */
+  const kitSummary = useMemo(() => {
+    const count = (kind: string) => kitWarnings.filter((w) => w.kind === kind).length;
+    const parts: string[] = [];
+    const woods = count("woods-slot-empty");
+    if (woods > 0) parts.push(`${woods} Woods slot${woods === 1 ? "" : "s"} empty`);
+    const dead = count("equipped-dead");
+    if (dead > 0) parts.push(`${dead} finished`);
+    const low = count("equipped-low");
+    if (low > 0) parts.push(`${low} nearly broken`);
+    const swap = count("bench-beats-equipped") + count("slot-empty-with-bench");
+    if (swap > 0) parts.push(`${swap} to swap`);
+    return parts.length > 0
+      ? parts.join(" · ")
+      : `${loadout.length} slot${loadout.length === 1 ? "" : "s"}, nothing wrong`;
+  }, [kitWarnings, loadout]);
 
   const [repairing, setRepairing] = useState(false);
 
@@ -1106,6 +1251,36 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     currencyByPond: Map<number, number>;
   }
 
+  /**
+   * Name and sort raw item deltas for display.
+   *
+   * Shared by the live haul and the final one so the list never reshuffles or
+   * renames itself at the moment the run ends — the rows you watched arrive are
+   * the rows you keep.
+   */
+  const toHaulRows = useCallback((deltas: { id: number; amount: number }[]) => {
+    const info = gigaRef.current.itemInfo;
+    const names = gigaRef.current.itemNames;
+    return deltas
+      .map((d) => ({
+        id: d.id,
+        name: info[String(d.id)]?.name || names[String(d.id)] || `Item #${d.id}`,
+        amount: d.amount,
+        rarity: info[String(d.id)]?.rarity,
+      }))
+      .sort((a, b) => b.amount - a.amount);
+  }, []);
+
+  // Fill the haul pane while the run is still going. The capture is a plain
+  // module-level accumulator with no change notification, so this samples it;
+  // a second is well under the pace loot actually arrives at and costs a map
+  // over a handful of entries.
+  useEffect(() => {
+    if (!executing) return;
+    const id = setInterval(() => setHaul(toHaulRows(peekHaulCapture())), 1000);
+    return () => clearInterval(id);
+  }, [executing, toHaulRows]);
+
   // The summary has to report what actually happened, including steps that
   // failed or never ran. Reading the live step list from a ref keeps that
   // honest without waiting for a state flush.
@@ -1140,19 +1315,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
       // Close the capture even on error or cancel — a partial run still earned
       // whatever it earned, and that is exactly when you want to see it.
-      const deltas = endHaulCapture();
-      const info = gigaRef.current.itemInfo;
-      const names = gigaRef.current.itemNames;
-      setHaul(
-        deltas
-          .map((d) => ({
-            id: d.id,
-            name: info[String(d.id)]?.name || names[String(d.id)] || `Item #${d.id}`,
-            amount: d.amount,
-            rarity: info[String(d.id)]?.rarity,
-          }))
-          .sort((a, b) => b.amount - a.amount)
-      );
+      setHaul(toHaulRows(endHaulCapture()));
 
       setSummary(text);
       setSummaryFailed(outcome !== "done" || failed > 0);
@@ -1161,7 +1324,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         localStorage.setItem(LAST_RUN_KEY, text);
       } catch { /* private mode / quota — the in-session summary still stands */ }
     },
-    []
+    [toHaulRows]
   );
 
   // Builds the plan's step list from current state. Used three ways: the
@@ -1219,9 +1382,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     // both halves and the executor has something to attach status to for each.
     for (const a of fishingAllocs) {
       if (a.casts <= 0) continue;
+      // The node label is there to tell one node from another, so it only earns
+      // its place on a pond that has more than one. The Grove has a single node
+      // named "Grove", which read as "Dendren Grove Grove x20".
+      const pond = pondById(a.pondId);
+      const label = pond.nodes.length > 1
+        ? `${pond.name} ${a.castLabel} x${a.casts}`
+        : `${pond.name} x${a.casts}`;
       stepList.push({
         id: `fishing-${a.castNodeId}`,
-        label: `${pondById(a.pondId).name} ${a.castLabel} x${a.casts}`,
+        label,
         status: "pending",
         detail: `${a.casts * a.castCost}E`,
       });
@@ -1805,8 +1975,9 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             }
             // Record run to stats DB
             const finalRoom = Number(runResults[runResults.length - 1]) || lastRoom;
-            const won = finalRoom >= 16;
             const player = battleState?.data?.run?.players?.[0];
+            const won = didWinRun(player?.health?.current, finalRoom);
+            if (won) summaryStats.dungeonWins++;
             const items = Array.from(runItems, ([id, v]) => ({ id, amount: v.amount, name: v.name }));
             recordRunAction(
               alloc.name, won, finalRoom,
@@ -1836,7 +2007,6 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           ? `${roomsStr} | ${lootParts.join(", ")}`
           : roomsStr;
 
-        summaryStats.dungeonWins += runResults.filter((r) => Number(r) >= 16).length;
         updateStep(stepId, {
           status: cancelRef.current ? "skipped" : "done",
           detail,
@@ -1871,9 +2041,17 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         (a) => a.casts > 0 && stepList.find((s) => s.id === `fishing-${a.castNodeId}`)
       );
 
+      /**
+       * The fishing state as it was moments before the first cast.
+       *
+       * Hoisted out of the block below because the cast budget is recounted
+       * from it, and that recount has to happen where the casts are spent.
+       */
+      let preFish: FishingGameState | null = null;
+
       if (plannedFishing.length > 0) {
         // Check if there's a completed game needing loot (card pick + collect)
-        const preFish = await g().fetchFishingState();
+        preFish = await g().fetchFishingState();
         const owed = pendingCatchCards(preFish?.gameState);
         if (owed) {
           pendingCardsToAdd = owed;
@@ -1953,6 +2131,28 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       let lootFailures = 0;
       const MAX_LOOT_FAILURES = 2;
 
+      /**
+       * Casts the server will still accept, recounted from the state fetched
+       * moments ago rather than from the plan.
+       *
+       * The plan's per-pond cast counts were fixed when the plan was built,
+       * which may have been before a dungeon phase, before casts spent in the
+       * game client, or before a day rollover. `preFish` is already the live
+       * state; not spending it here is what let a stale plan run its full
+       * allowance into a server that had been refusing since the first cast.
+       *
+       * One budget, not one per pond: the daily allowance is a single pool that
+       * every pond draws from.
+       */
+      let castBudget = castAllowance(preFish, isJuiced, FISHING).left;
+      const plannedTotal = plannedFishing.reduce((s, a) => s + a.casts, 0);
+      if (castBudget < plannedTotal) {
+        log(
+          `Fishing allowance recounted: the plan holds ${plannedTotal} cast${plannedTotal === 1 ? "" : "s"} but the server has ${castBudget} left today. Running ${castBudget}.`,
+          "fishing"
+        );
+      }
+
       for (const alloc of plannedFishing) {
         const stepId = `fishing-${alloc.castNodeId}`;
         if (cancelRef.current) { updateStep(stepId, { status: "skipped" }); continue; }
@@ -1962,6 +2162,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         }
 
         const pond = pondById(alloc.pondId);
+
+        // This pond's share of what is actually left, not what it was promised.
+        const pondCasts = Math.min(alloc.casts, castBudget);
+        if (pondCasts <= 0) {
+          const why = `no casts left in today's allowance — the plan held ${alloc.casts} for ${pond.name}.`;
+          log(`${pond.name} skipped: ${why}`, "fishing");
+          updateStep(stepId, { status: "skipped", detail: why });
+          continue;
+        }
+
         updateStep(stepId, { status: "running", detail: "starting..." });
         let caught = 0;
         let escaped = 0;
@@ -1991,7 +2201,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
         }
 
           let stoppedShort = "";
-          for (let cast = 0; cast < alloc.casts; cast++) {
+          for (let cast = 0; cast < pondCasts; cast++) {
             if (cancelRef.current) break;
 
             // The plan's energy budget was computed before the run started;
@@ -2002,13 +2212,13 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               g().energy?.entities?.[0]?.parsedData?.energyValue ?? 0
             );
             if (liveEnergy < alloc.castCost) {
-              stoppedShort = `out of energy after ${cast} of ${alloc.casts} casts (${liveEnergy}E left, need ${alloc.castCost}E)`;
+              stoppedShort = `out of energy after ${cast} of ${pondCasts} casts (${liveEnergy}E left, need ${alloc.castCost}E)`;
               log(`Fishing stopped: ${stoppedShort}`, "fishing");
               break;
             }
 
-            updateStep(stepId, { detail: `cast ${cast + 1}/${alloc.casts}...` });
-            log(`${pond.name} cast ${cast + 1}/${alloc.casts} (${alloc.castLabel})`, "fishing");
+            updateStep(stepId, { detail: `cast ${cast + 1}/${pondCasts}...` });
+            log(`${pond.name} cast ${cast + 1}/${pondCasts} (${alloc.castLabel})`, "fishing");
 
             // Everything this cast pays out, so the pond's measured yield comes
             // from what actually arrived rather than from an assumed rate.
@@ -2058,6 +2268,27 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               if (!startResult) {
                 const why = g().lastErrorRef.current || "unknown";
                 log(`Fishing cast failed to start: ${why}`, "error");
+
+                // Some refusals are permanent for the rest of the day, and the
+                // server says so in as many words. "Player has reached max runs
+                // for fishing" cannot become false before the reset, so every
+                // remaining cast is a request whose answer is already known.
+                //
+                // This is the check that makes the cap miscount survivable
+                // whatever causes it. Our arithmetic for casts-remaining has
+                // been wrong more than once — a per-pond count read as a global
+                // one, a plan built before the day rolled over — and each fix
+                // only closed that instance. Treating the server's own refusal
+                // as authoritative closes the class: however the count goes
+                // wrong next, it costs one cast to find out rather than twenty.
+                if (isDailyCapError(why)) {
+                  fishingBlocked =
+                    `stopped after ${cast} of ${pondCasts} casts — the server says the daily cast limit is already reached (${why}). ` +
+                    `The plan's count disagreed with the server's; the server wins.`;
+                  log(`Fishing stopped: ${fishingBlocked}`, "error");
+                  break;
+                }
+
                 // A failed loot is the one failure that repeats. The catch it
                 // was collecting is still outstanding, so the next cast opens
                 // with the identical call and fails identically — twenty casts
@@ -2068,7 +2299,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                   lootFailures++;
                   if (lootFailures >= MAX_LOOT_FAILURES) {
                     fishingBlocked =
-                      `stopped after ${cast + 1} of ${alloc.casts} casts — the outstanding catch can't be collected (${why}). ` +
+                      `stopped after ${cast + 1} of ${pondCasts} casts — the outstanding catch can't be collected (${why}). ` +
                       `Collect it in the game client; no cast can start until it's cleared.`;
                     log(`Fishing stopped: ${fishingBlocked}`, "error");
                     break;
@@ -2081,6 +2312,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 escaped++;
                 continue;
               }
+              // The cast is open, so it has come out of the shared allowance.
+              // Decremented here rather than per loop iteration because a cast
+              // the server refused never counted against the day.
+              castBudget = Math.max(0, castBudget - 1);
               lootFailures = 0;
 
               summaryStats.fishCasts++;
@@ -2200,7 +2435,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               escaped++;
             }
 
-            if (cast < alloc.casts - 1) {
+            if (cast < pondCasts - 1) {
               await g().refreshAll();
               await delay(300);
             }
@@ -2342,27 +2577,26 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
     addLog("[MC] stopping after current action...");
   };
 
-  /* ─── Review-before-run ─────────────────────────────────── */
+  /* ─── Run ───────────────────────────────────────────────── */
 
-  const openReview = () => {
+  /**
+   * Run Plan goes straight to running.
+   *
+   * There used to be a review modal in between, listing the same steps and the
+   * same energy the plan card above the button already shows, behind a Confirm.
+   * A confirmation that restates what you were looking at when you pressed the
+   * button is a second click, not a second thought.
+   */
+  const startRun = () => {
     const preview = buildStepList();
     stepsRef.current = preview;
     setSteps(preview);
     setSummary(null);
-    setReviewing(true);
     setShowModal(true);
-  };
-
-  const confirmRun = () => {
-    setReviewing(false);
     void execute();
   };
 
   const closeModal = () => {
-    // Cancelling a review clears the previewed steps so the inline
-    // progress card doesn't show a plan that never ran
-    if (reviewing && !executing) { stepsRef.current = []; setSteps([]); }
-    setReviewing(false);
     setShowModal(false);
   };
   const closeModalRef = useRef(closeModal);
@@ -2384,13 +2618,15 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
 
   /* ─── Render ─────────────────────────────────────────────── */
 
-  const progressContent = (steps.length > 0 || mcLog.length > 0) ? (
+  // Steps and activity are separate blocks, not one, because the run modal
+  // gives them separate scroll panes. Rolled together they shared a scroll
+  // container, and a few hundred log lines pushed everything else off the
+  // bottom — which is exactly how the haul ended up unreachable.
+  const stepsContent = steps.length > 0 ? (
     <>
-      {steps.length > 0 && (
-        <>
           <div className="px-4 py-2.5" style={{ borderBottom: "1px solid var(--border)" }}>
             <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
-              {reviewing ? "Plan" : "Progress"}
+              Progress
             </span>
           </div>
           <div className="divide-y" style={{ borderColor: "var(--border)" }}>
@@ -2443,12 +2679,12 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               </div>
             ))}
           </div>
-        </>
-      )}
+    </>
+  ) : null;
 
-      {mcLog.length > 0 && (
-        <>
-          <div className="px-4 py-2.5" style={{ borderTop: steps.length > 0 ? "1px solid var(--border)" : undefined }}>
+  const activityContent = mcLog.length > 0 ? (
+    <>
+          <div className="px-4 py-2.5 shrink-0">
             <span className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
               Activity
             </span>
@@ -2460,8 +2696,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             role="log"
             aria-label="Run activity, newest first"
             aria-live="off"
-            className="overflow-y-auto px-4 pb-3 flex flex-col gap-1"
-            style={{ scrollbarWidth: "none" }}
+            className="px-4 pb-3 flex flex-col gap-1"
           >
             {[...mcLog].reverse().map((entry, i) => {
               const IconCmp = entry.type === "loot" ? Package
@@ -2493,17 +2728,18 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               );
             })}
           </div>
-        </>
-      )}
     </>
   ) : null;
 
+  // The run's verdict, and the first thing the outcome pane says. Full-bleed
+  // rather than an inset pill: it is the pane's headline, not a notice tucked
+  // inside one.
   const summaryContent = summary ? (
     <div
-      className="mt-3 px-4 py-3 rounded-lg text-[13px] font-medium"
+      className="px-4 py-3.5 text-[13px] font-medium shrink-0"
       style={{
         background: summaryFailed ? "var(--red-glow)" : "var(--green-glow)",
-        border: `1px solid ${summaryFailed ? "var(--red-border)" : "var(--green-border)"}`,
+        borderBottom: `1px solid ${summaryFailed ? "var(--red-border)" : "var(--green-border)"}`,
         color: summaryFailed ? "var(--red)" : "var(--green)",
         lineHeight: 1.5,
       }}
@@ -2515,24 +2751,35 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
   // Everything the run actually put in your bags, itemised. Losses (fish sold,
   // ring spent on an offering) show as negatives rather than being hidden —
   // a net view is the honest one when the plan both earns and spends.
+  //
+  // No card wrapper: this sits inside the modal's own raised surface, and a
+  // card within a card is a border for the sake of a border. The section
+  // label carries the grouping instead.
+  const gained = haul.filter((h) => h.amount > 0).length;
   const haulContent = haul.length > 0 ? (
-    <div className="mt-3 card p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
+    <>
+      <div className="flex items-baseline justify-between px-4 pt-4 pb-2">
+        <h3 className="text-[11px] font-bold uppercase tracking-[0.1em]" style={{ color: "var(--text-faint)" }}>
           Haul
         </h3>
         <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
-          {haul.filter((h) => h.amount > 0).length} item{haul.filter((h) => h.amount > 0).length === 1 ? "" : "s"} gained
+          {gained} item{gained === 1 ? "" : "s"} gained
         </span>
       </div>
-      <div className="flex flex-col gap-1" style={{ maxHeight: 320, overflowY: "auto" }}>
-        {haul.map((h) => (
-          <div key={h.id} className="flex items-center justify-between text-[12px]">
-            <span className="truncate" style={{ color: RARITY_COLORS[h.rarity ?? 0] ?? "var(--text)" }}>
+      <div className="flex flex-col px-4 pb-4">
+        {haul.map((h, i) => (
+          <div
+            key={h.id}
+            className="flex items-center justify-between text-[12.5px] py-[5px]"
+            // Rules separate rows; a rule under the last one is a rule under
+            // nothing.
+            style={{ borderBottom: i < haul.length - 1 ? "1px solid var(--border)" : undefined }}
+          >
+            <span className="truncate pr-3" style={{ color: RARITY_COLORS[h.rarity ?? 0] ?? "var(--text)" }}>
               {h.name}
             </span>
             <span
-              className="tabular-nums shrink-0 ml-3 font-semibold"
+              className="tabular-nums shrink-0 font-semibold"
               style={{ color: h.amount > 0 ? "var(--green)" : "var(--red)" }}
             >
               {h.amount > 0 ? "+" : ""}{fmt(h.amount)}
@@ -2540,8 +2787,41 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           </div>
         ))}
       </div>
-    </div>
+    </>
   ) : null;
+
+  // The left pane, open from the first moment of the run rather than appearing
+  // at the end. During execution it is the haul filling up live; when the run
+  // finishes the verdict lands above it. Either way this side answers "what am
+  // I getting" and the right side answers "what is it doing".
+  const outcomeContent = (
+    <>
+      {summaryContent}
+      {haulContent ?? (
+        <div className="px-4 pt-4">
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.1em] mb-2" style={{ color: "var(--text-faint)" }}>
+            Haul
+          </h3>
+          <p className="text-[12.5px]" style={{ color: "var(--text-faint)", lineHeight: 1.5 }}>
+            {executing
+              ? "Nothing yet — items appear here as they drop."
+              : "This run collected nothing."}
+          </p>
+        </div>
+      )}
+    </>
+  );
+
+  // Live status for the running header: which step is on, how far through the
+  // plan, and what the energy pool is down to. "Settled" counts every step the
+  // run is finished with, not just the successful ones — a failed step is
+  // progress through the plan too, and a bar that stalls on failure would
+  // report the run as stuck when it has moved on.
+  const settledSteps = steps.filter(
+    (s) => s.status === "done" || s.status === "failed" || s.status === "skipped" || s.status === "not-run"
+  ).length;
+  const runningStep = steps.find((s) => s.status === "running");
+  const stepPct = steps.length > 0 ? Math.round((settledSteps / steps.length) * 100) : 0;
 
   // One phrasing for the plan's energy, used by every surface that shows it.
   // Mid-run the pre-run figure is stale, so it switches to the live pool.
@@ -2625,31 +2905,224 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           </div>
           <div className="text-[12px] mb-2" style={{ color: "var(--text-dim)", lineHeight: 1.5 }}>
             These have hit their repair limit, so the plan skips them. Restore resets that
-            limit — what it charges has never been observed, so it goes one piece at a time
-            and the server&apos;s reply is logged verbatim.
+            limit and re-rolls rarity. Not every piece has a restore: the game publishes the
+            reset cost per item, and where it&apos;s empty the piece is simply finished.
           </div>
           <div className="space-y-1">
-            {exhaustedGear.map((g) => (
-              <div key={g.docId} className="flex items-center gap-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
-                <span className="flex-1">
-                  <span className="font-semibold" style={{ color: "var(--text)" }}>{g.name}</span>
-                  {" — "}
-                  {g.durability <= 0 ? "broken" : "1 use left"}
-                  {g.equipped && " (equipped)"}
-                </span>
-                <button
-                  onClick={() => restoreOne(g)}
-                  disabled={restoring !== null || executing}
-                  aria-label={`Restore ${g.name}`}
-                  className="btn-press touch-target text-[11px] font-bold px-3 py-1.5 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
-                  style={{ background: "var(--bg-raised)", border: "1px solid var(--gold)", color: "var(--gold)" }}
+            {exhaustedGear.map((g) => {
+              // The gear's own definition decides this. "Reset items not found"
+              // from the server covers two opposite situations — no recipe at
+              // all, or a recipe you can't afford — so the verdict is read here
+              // rather than inferred from a failed request.
+              const verdict = restoreVerdict(
+                giga.gearDefs[g.gameItemId],
+                giga.itemBalances,
+                (id) => giga.itemInfo[String(id)]?.name || giga.itemNames[String(id)] || `#${id}`
+              );
+              const cost =
+                verdict.kind === "ready" || verdict.kind === "short"
+                  ? verdict.cost
+                      .map((c) => `${c.amount}x ${giga.itemInfo[String(c.itemId)]?.name || `#${c.itemId}`}`)
+                      .join(", ")
+                  : null;
+              return (
+                <div key={g.docId} className="flex items-center gap-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                  <span className="flex-1">
+                    <span className="font-semibold" style={{ color: "var(--text)" }}>{g.name}</span>
+                    {" — "}
+                    {g.durability <= 0 ? "broken" : "1 use left"}
+                    {g.equipped && " (equipped)"}
+                    {verdict.kind !== "ready" && (
+                      <span
+                        className="block"
+                        style={{ color: verdict.kind === "not-restorable" ? "var(--red)" : "var(--text-faint)" }}
+                      >
+                        {verdict.reason}
+                      </span>
+                    )}
+                    {cost && verdict.kind === "ready" && (
+                      <span className="block" style={{ color: "var(--text-faint)" }}>costs {cost}</span>
+                    )}
+                  </span>
+                  {verdict.kind !== "not-restorable" && (
+                    <button
+                      onClick={() => restoreOne(g)}
+                      disabled={restoring !== null || executing || verdict.kind !== "ready"}
+                      aria-label={`Restore ${g.name}`}
+                      className="btn-press touch-target text-[11px] font-bold px-3 py-1.5 rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                      style={{ background: "var(--bg-raised)", border: "1px solid var(--gold)", color: "var(--gold)" }}
+                    >
+                      {restoring === g.docId ? "Restoring..." : "Restore"}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {/* ── Loadout: what is on, and what is wrong with it ── */}
+      {loadout.length > 0 && (
+        <details
+          className="rounded-lg"
+          style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
+        >
+          <summary className="disclosure p-3.5 cursor-pointer flex items-center gap-2">
+            <ChevronRight size={13} className="disclosure-chevron shrink-0" style={{ color: "var(--text-faint)" }} />
+            <Sword size={14} className="shrink-0" style={{ color: "var(--text-dim)" }} />
+            <span className="text-[13px] font-bold shrink-0" style={{ color: "var(--text)" }}>
+              Loadout
+            </span>
+            <span
+              className="text-[12px] truncate"
+              style={{ color: kitWarnings.length > 0 ? "var(--red)" : "var(--text-faint)" }}
+            >
+              {kitSummary}
+            </span>
+          </summary>
+
+          <div className="px-3.5 pb-3.5">
+          <div className="space-y-1.5 mb-2.5">
+            {loadout.map((s) => (
+              <div key={s.slot} className="flex items-baseline gap-2.5 text-[12px]">
+                <span
+                  className="shrink-0 text-[11px] font-bold uppercase tracking-[0.08em] text-right"
+                  style={{ color: "var(--text-faint)", width: 96 }}
                 >
-                  {restoring === g.docId ? "Restoring..." : "Restore"}
-                </button>
+                  {s.label}
+                </span>
+                <span className="flex-1 min-w-0">
+                  {s.equipped.length === 0 ? (
+                    <span style={{ color: s.benched.some((b) => b.durability > 0) ? "var(--red)" : "var(--text-faint)" }}>
+                      empty
+                    </span>
+                  ) : (
+                    s.equipped.map((e, i) => (
+                      <span key={e.docId}>
+                        {i > 0 && <span style={{ color: "var(--text-faint)" }}>, </span>}
+                        <span style={{ color: e.dead ? "var(--red)" : "var(--text)" }}>{e.name}</span>
+                        <span className="tabular-nums" style={{ color: "var(--text-faint)" }}>
+                          {" "}
+                          {e.durability}
+                          {e.maxDurability != null && `/${e.maxDurability}`}
+                          {e.dead && " · finished"}
+                        </span>
+                      </span>
+                    ))
+                  )}
+                  {s.benched.length > 0 && (
+                    <span style={{ color: "var(--text-faint)" }}>
+                      {" · bench: "}
+                      {s.benched.map((b) => `${b.name} (${b.durability})`).join(", ")}
+                    </span>
+                  )}
+                </span>
               </div>
             ))}
           </div>
-        </section>
+
+          {kitWarnings.length > 0 && (
+            <div className="space-y-1">
+              {kitWarnings.map((w, i) => (
+                <div
+                  key={`${w.kind}-${w.slot}-${i}`}
+                  className="text-[12px] px-2.5 py-1.5 rounded"
+                  style={
+                    w.kind === "equipped-low"
+                      ? { background: "var(--gold-glow)", color: "var(--gold)", lineHeight: 1.5 }
+                      : { background: "var(--red-glow)", border: "1px solid var(--red-border)", color: "var(--red)", lineHeight: 1.5 }
+                  }
+                >
+                  {w.message}
+                </div>
+              ))}
+            </div>
+          )}
+          </div>
+        </details>
+      )}
+
+      {/* ── What to make next ── */}
+      {(gearAdvice.dungeon.length > 0 || gearAdvice.fishing.length > 0 || gearAdvice.stranded.length > 0) && (
+        <details
+          className="rounded-lg"
+          style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}
+        >
+          <summary className="disclosure p-3.5 cursor-pointer flex items-center gap-2">
+            <ChevronRight size={13} className="disclosure-chevron shrink-0" style={{ color: "var(--text-faint)" }} />
+            <Lightbulb size={14} className="shrink-0" style={{ color: "var(--orange)" }} />
+            <span className="text-[13px] font-bold shrink-0" style={{ color: "var(--orange)" }}>
+              Gear worth making
+            </span>
+            <span className="text-[12px] truncate" style={{ color: "var(--text-faint)" }}>
+              {gearAdvice.summary}
+            </span>
+          </summary>
+
+          <div className="px-3.5 pb-3.5">
+          <div className="text-[12px] mb-2.5" style={{ color: "var(--text-dim)", lineHeight: 1.5 }}>
+            Read from the game&apos;s recipes and your materials. Costs are what the craft
+            consumes; nothing here is bought or made for you.
+          </div>
+
+          {([["dungeon", "Dungeons"], ["fishing", "Fishing"]] as const).map(([purpose, heading]) => {
+            const rows = gearAdvice[purpose];
+            if (rows.length === 0) return null;
+            return (
+              <div key={purpose} className="mb-2.5 last:mb-0">
+                <h4 className="text-[11px] font-bold uppercase tracking-[0.1em] mb-1.5" style={{ color: "var(--text-faint)" }}>
+                  {heading}
+                </h4>
+                <div className="space-y-1.5">
+                  {rows.map((s) => (
+                    <div key={`${s.recipeId}-${s.purpose}`} className="text-[12px]" style={{ color: "var(--text-dim)" }}>
+                      <div className="flex items-baseline justify-between gap-3">
+                        <span className="font-semibold" style={{ color: "var(--text)" }}>
+                          {s.outputName}
+                        </span>
+                        <span
+                          className="text-[10px] font-bold uppercase tracking-wider shrink-0 px-1.5 py-0.5 rounded"
+                          style={
+                            s.affordable
+                              ? { color: "var(--green)", background: "var(--green-glow)", border: "1px solid var(--green-border)" }
+                              : { color: "var(--text-faint)", background: "var(--bg-inset)", border: "1px solid var(--border)" }
+                          }
+                        >
+                          {s.affordable ? "Can make now" : "Short"}
+                        </span>
+                      </div>
+                      <div style={{ lineHeight: 1.5 }}>
+                        {s.effects.length > 0 ? describeEffects(s.effects) : "no bonuses — durability only"}
+                        {" · "}
+                        {s.reason}
+                      </div>
+                      <div className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+                        {s.affordable
+                          ? `costs ${s.cost.map((c) => `${c.amount}x ${gearAdvice.itemName(c.itemId)}`).join(", ")}`
+                          : `needs ${s.missing.map((m) => `${m.amount} more ${gearAdvice.itemName(m.itemId)}`).join(", ")}`}
+                        {s.energy > 0 && ` · ${s.energy}E to craft`}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+
+          {gearAdvice.stranded.length > 0 && (
+            <div
+              className="mt-2.5 text-[12px] px-2.5 py-2 rounded"
+              style={{ background: "var(--red-glow)", border: "1px solid var(--red-border)", color: "var(--red)", lineHeight: 1.5 }}
+            >
+              {gearAdvice.stranded.map((d) => d.itemName).join(", ")}
+              {gearAdvice.stranded.length === 1 ? " is" : " are"} finished, and no recipe you
+              can reach replaces {gearAdvice.stranded.length === 1 ? "it" : "them"}. That slot
+              stays empty until one drops or the materials show up.
+            </div>
+          )}
+          </div>
+        </details>
       )}
 
       {/* ── Gear durability warning ── */}
@@ -2771,7 +3244,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             <div className="flex gap-2">
               {!executing ? (
                 <button
-                  onClick={openReview}
+                  onClick={startRun}
                   disabled={nothingToRun}
                   aria-describedby={nothingToRun ? "run-plan-blocked" : undefined}
                   className="btn-press cta-orange flex-1 text-[15px] font-bold py-3 rounded-xl cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
@@ -3017,8 +3490,16 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
           >
             <span className="text-[13px] font-semibold">Fishing</span>
             <span className="text-[11px] tabular-nums" style={{ color: "var(--text-faint)" }}>
-              {plannedCasts} of {remainingCasts} casts planned
-              {unplannedCasts > 0 && ` · ${unplannedCasts} unspent`}
+              {/* "0 of 0" would read as a spent allowance, which is a different
+                  thing from one that hasn't loaded. */}
+              {castsKnown ? (
+                <>
+                  {plannedCasts} of {remainingCasts} casts planned
+                  {unplannedCasts > 0 && ` · ${unplannedCasts} unspent`}
+                </>
+              ) : (
+                "checking today's cast allowance…"
+              )}
             </span>
           </div>
           {CAST_NODES.map((node, i) => {
@@ -3408,7 +3889,7 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
       {/* ── Progress + Activity ── */}
       <section>
         {/* Inline Progress + Activity Feed (visible when modal is closed) */}
-        {!showModal && !reviewing && (steps.length > 0 || mcLog.length > 0) && (
+        {!showModal && (steps.length > 0 || mcLog.length > 0) && (
           <div
             ref={progressRef}
             role="button"
@@ -3424,17 +3905,21 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               }
             }}
           >
-            {progressContent}
-            {summaryContent}
-            {haulContent}
+            {/* Outcome leads here too — the minimized card is a glance, and
+                the glance should answer "what did I get", not "what scrolled
+                past last". The log is capped so it can't run off the page. */}
+            {outcomeContent}
+            {stepsContent}
+            <div className="log-area" style={{ maxHeight: 220, overflowY: "auto" }}>
+              {activityContent}
+            </div>
           </div>
         )}
 
         {!showModal && summary && !steps.length && !mcLog.length && (
-          <>
-            {summaryContent}
-            {haulContent}
-          </>
+          <div className="mt-4 rounded-lg overflow-hidden" style={{ background: "var(--bg-raised)", border: "1px solid var(--border)" }}>
+            {outcomeContent}
+          </div>
         )}
       </section>
 
@@ -3450,11 +3935,10 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
             ref={modalRef}
             role="dialog"
             aria-modal="true"
-            aria-label={reviewing ? "Review plan before running" : "Run progress"}
+            aria-label={summary ? "Run results" : "Run progress"}
             tabIndex={-1}
-            className="fixed inset-x-4 top-[10%] bottom-[10%] mx-auto flex flex-col rounded-xl overflow-hidden"
+            className="run-modal fixed inset-x-4 mx-auto flex flex-col rounded-xl overflow-hidden"
             style={{
-              maxWidth: 520,
               background: "var(--bg-raised)",
               border: "1px solid var(--border)",
               zIndex: 51,
@@ -3462,12 +3946,15 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
               outline: "none",
             }}
           >
-            {/* Modal header */}
-            <div className="flex items-center justify-between px-5 py-3 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
-              <span className="text-[15px] font-bold" style={{ color: "var(--text)" }}>
-                {reviewing ? "Review Plan" : stopping ? "Stopping…" : executing ? "Running..." : summary ? "Run Complete" : "Run"}
-              </span>
-              {!reviewing && (
+            {/* Modal header. While the run is going it carries the status:
+                what step is on, how far through the plan, and what the energy
+                pool is down to — the three things you reopen the modal to
+                check, without having to read the log to infer them. */}
+            <div className="shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-[15px] font-bold" style={{ color: "var(--text)" }}>
+                  {stopping ? "Stopping…" : executing ? "Running" : summary ? "Run Complete" : "Run"}
+                </span>
                 <button
                   onClick={closeModal}
                   className="px-3 py-1.5 rounded-md text-[12px] font-medium cursor-pointer"
@@ -3475,86 +3962,90 @@ export function MissionControlPage({ giga, addLog, handleVote, hasVoted, refresh
                 >
                   Minimize
                 </button>
+              </div>
+
+              {executing && steps.length > 0 && (
+                <div className="px-5 pb-3 flex flex-col gap-2">
+                  <div className="flex items-baseline justify-between gap-4">
+                    <span className="text-[12.5px] font-medium truncate" style={{ color: "var(--text-dim)" }}>
+                      {stopping
+                        ? "Finishing the current action, then stopping"
+                        : runningStep?.label ?? "Starting…"}
+                    </span>
+                    <span className="text-[11.5px] tabular-nums shrink-0" style={{ color: "var(--text-faint)" }}>
+                      {settledSteps}/{steps.length} steps · {fmt(currentEnergy)}E left
+                    </span>
+                  </div>
+                  <div
+                    role="progressbar"
+                    aria-valuenow={settledSteps}
+                    aria-valuemin={0}
+                    aria-valuemax={steps.length}
+                    aria-label="Plan progress"
+                    className="rounded-full overflow-hidden"
+                    style={{ height: 3, background: "var(--bg-inset)" }}
+                  >
+                    <div
+                      className="h-full rounded-full"
+                      style={{
+                        width: `${stepPct}%`,
+                        background: stopping ? "var(--red)" : "var(--orange)",
+                      }}
+                    />
+                  </div>
+                </div>
               )}
             </div>
 
-            {/* Modal body — scrollable */}
-            <div
-              className="flex-1 min-h-0 overflow-y-auto"
-              style={{ scrollbarWidth: "none" }}
-            >
-              {reviewing && (
-                <div
-                  className="px-4 pt-3 pb-1 text-[12px]"
-                  style={{ color: "var(--text-dim)", lineHeight: 1.5 }}
-                >
-                  This run spends{" "}
-                  <span className="font-bold tabular-nums" style={{ color: "var(--orange)" }}>
-                    {fmt(allocatedEnergy)}E
-                  </span>{" "}
-                  and executes every step below on your account. Energy spent, items sold, and
-                  trades made can&apos;t be undone.
-                </div>
-              )}
-              {progressContent}
-              {summaryContent && (
-                <div className="px-4 pb-4">
-                  {summaryContent}
-                  {haulContent}
-                </div>
-              )}
+            {/* Modal body.
+                Two panes throughout: what the run is collecting on the left,
+                what it is doing on the right, each with its own scroll. One
+                shared scroll column was the original problem — a few hundred
+                activity lines sat between you and your haul. Below 900px the
+                panes stack, the haul still first. */}
+            <div className="run-panes flex-1 min-h-0">
+              <div className="run-pane log-area">{outcomeContent}</div>
+              <div className="run-pane run-pane-detail log-area">
+                {stepsContent}
+                {activityContent}
+              </div>
             </div>
 
             {/* Modal footer */}
             <div className="shrink-0 px-5 py-3 flex gap-3" style={{ borderTop: "1px solid var(--border)" }}>
-              {reviewing ? (
-                <>
+              {
+                // While the run is going the footer carries only Stop. The
+                // header already offers Minimize, and the two used to sit here
+                // under the same label firing the same handler — two buttons
+                // for one action, which reads as a choice that isn't there.
+                executing ? (
+                  <button
+                    onClick={handleStop}
+                    disabled={stopping}
+                    className="flex-1 py-2 rounded-lg text-[13px] font-semibold cursor-pointer disabled:cursor-not-allowed"
+                    style={{
+                      background: "var(--red-glow)",
+                      border: "1px solid var(--red-border)",
+                      color: "var(--red)",
+                      opacity: stopping ? 0.7 : 1,
+                    }}
+                  >
+                    {stopping ? "Stopping after current action…" : "Stop"}
+                  </button>
+                ) : (
                   <button
                     onClick={closeModal}
                     className="flex-1 py-2 rounded-lg text-[13px] font-medium cursor-pointer"
-                    style={{ background: "var(--bg-inset)", border: "1px solid var(--border)", color: "var(--text-dim)" }}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={confirmRun}
-                    className="btn-press cta-orange flex-1 py-2 rounded-lg text-[13px] font-bold cursor-pointer"
-                  >
-                    Confirm &amp; Run
-                  </button>
-                </>
-              ) : (
-                <>
-                  {executing && (
-                    <button
-                      onClick={handleStop}
-                      disabled={stopping}
-                      className="flex-1 py-2 rounded-lg text-[13px] font-semibold cursor-pointer disabled:cursor-not-allowed"
-                      style={{
-                        background: "var(--red-glow)",
-                        border: "1px solid var(--red-border)",
-                        color: "var(--red)",
-                        opacity: stopping ? 0.7 : 1,
-                      }}
-                    >
-                      {stopping ? "Stopping after current action…" : "Stop"}
-                    </button>
-                  )}
-                  <button
-                    onClick={closeModal}
-                    className={`${executing ? "" : "flex-1 "}py-2 rounded-lg text-[13px] font-medium cursor-pointer`}
                     style={{
-                      flex: executing ? 1 : undefined,
-                      width: executing ? undefined : "100%",
                       background: "var(--bg-inset)",
                       border: "1px solid var(--border)",
                       color: "var(--text-dim)",
                     }}
                   >
-                    {executing ? "Minimize" : "Close"}
+                    Close
                   </button>
-                </>
-              )}
+                )
+              }
             </div>
           </div>
         </div>
