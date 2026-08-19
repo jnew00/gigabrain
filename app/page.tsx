@@ -22,7 +22,17 @@ import {
 import { nodeIdForGame } from "@/lib/fishing-state";
 import { buildSkillAdvice } from "@/lib/skill-advisor";
 import { buildHatcheryAdvice, type EggPlan } from "@/lib/hatchery-advisor";
-import { FACTION_DUSTS, MAX_INFLUENCES, collectEggs } from "@/lib/hatchery";
+import {
+  FACTION_DUSTS,
+  MAX_INFLUENCES,
+  collectEggs,
+  influenceTarget,
+  materialById,
+  materialsFor,
+  type EggStat,
+  type StatConfig,
+  type StatRequirement,
+} from "@/lib/hatchery";
 
 // Donations — GigaBrain is free; these fund the coffee
 const DONATIONS = {
@@ -4008,6 +4018,98 @@ function StatMeter({ label, value, max, color, hint }: {
   );
 }
 
+/**
+ * Hand controls for one stat on one egg.
+ *
+ * The plan buttons only appear when the advisor decided a feed was worth making
+ * *and* the inventory covered it, which left no way to simply put three Biofuel
+ * into an egg. This is that way. The game's own quote drives the step buttons,
+ * so a manual feed costs exactly what the game says the next increment costs;
+ * every grade actually held is offered a unit at a time underneath, because the
+ * quote names one grade and the bag often holds another.
+ */
+function ManualFeed({ label, stat, current, bounds, quote, balances, busy, onStep }: {
+  label: string;
+  stat: EggStat;
+  current: number | null;
+  bounds: StatConfig;
+  quote: StatRequirement | null;
+  balances: Record<string, number>;
+  busy: boolean;
+  /** Raise this stat by N increments. The game prices each one itself. */
+  onStep: (steps: number) => void;
+}) {
+  const held = (itemId: number) => balances[String(itemId)] ?? 0;
+  const atMax = current !== null && current >= bounds.maxValue;
+  const increment = Math.max(1, bounds.increment);
+  const stepsLeft =
+    current === null ? null : Math.max(0, Math.ceil((bounds.maxValue - current) / increment));
+  const quoteName = quote ? materialById(quote.itemId)?.name ?? `#${quote.itemId}` : null;
+  const affordable = quote ? Math.floor(held(quote.itemId) / quote.amount) : 0;
+  // An unknown remaining gap is not a reason to cap at zero — the affordable
+  // count is still a real bound, and the egg's own meter says where it is.
+  const maxSteps = Math.min(affordable, stepsLeft ?? affordable);
+  const stocked = materialsFor(stat).filter((m) => held(m.itemId) > 0);
+
+  const stepButton = (steps: number, text: string) => {
+    const take = Math.min(steps, maxSteps);
+    return (
+      <button
+        key={text}
+        onClick={() => onStep(take)}
+        disabled={busy || atMax || take < 1}
+        className="btn-press text-[12px] font-bold px-2.5 py-1.5 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed tabular-nums"
+        style={{ background: "var(--bg-inset)", border: "1px solid var(--border)" }}
+      >
+        {text}
+      </button>
+    );
+  };
+
+  return (
+    <div className="p-3 rounded-lg" style={{ background: "var(--bg-inset)" }}>
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
+          {label}
+        </span>
+        <span className="text-[12px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+          {current === null ? "not reported" : `${current}/${bounds.maxValue}`}
+        </span>
+      </div>
+
+      <p className="text-[11px] mt-1" style={{ color: "var(--text-faint)" }}>
+        {atMax
+          ? "At max — feeding more of this does nothing."
+          : quote
+            ? `Next +${increment} costs ${quote.amount}x ${quoteName} · you hold ${held(quote.itemId)}`
+            : "The game quoted no price for the next step, so feed a unit below and re-read."}
+      </p>
+
+      {quote && !atMax && (
+        <div className="flex flex-wrap items-center gap-1.5 mt-2">
+          {stepButton(1, `+${increment}`)}
+          {stepButton(5, `+${increment * 5}`)}
+          {maxSteps > 1 && stepButton(maxSteps, `Max +${maxSteps * increment}`)}
+          {maxSteps < 1 && (
+            <span className="text-[11px]" style={{ color: "var(--red)" }}>
+              Not enough {quoteName} for one step.
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* What is on the shelf, reported not offered. The game picks which
+          material an increment burns, so a button naming one could not keep
+          its own promise. */}
+      {stocked.length > 0 && (
+        <p className="text-[11px] mt-2" style={{ color: "var(--text-faint)" }}>
+          You hold {stocked.map((m) => `${held(m.itemId)}x ${m.name}`).join(" · ")}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function HatcheryPage({ giga, advice, fateTarget, setFateTarget, addLog }: {
   giga: ReturnType<typeof useGigaverse>;
   advice: ReturnType<typeof buildHatcheryAdvice>;
@@ -4032,11 +4134,11 @@ function HatcheryPage({ giga, advice, fateTarget, setFateTarget, addLog }: {
   };
 
   /**
-   * Apply a plan one feed at a time, re-reading between each.
+   * Apply a plan one increment at a time, re-reading between each.
    *
-   * The loop stops on the first error rather than pushing on through the rest.
-   * Since the per-feed stat delta is unmeasured, a run of failures would
-   * otherwise burn the whole plan discovering the same thing repeatedly.
+   * The loop stops on the first error rather than pushing on through the rest:
+   * the usual refusal is "Insufficient balance", which the next call would hit
+   * just as surely, so pressing on only spends round trips to be told twice.
    */
   const applyFeeds = async (plans: EggPlan[]) => {
     const label = plans.length === 1 ? plans[0].name : `${plans.length} eggs`;
@@ -4044,24 +4146,104 @@ function HatcheryPage({ giga, advice, fateTarget, setFateTarget, addLog }: {
     let fed = 0;
     outer: for (const plan of plans) {
       for (const feed of plan.feeds) {
-        for (let i = 0; i < feed.amount; i++) {
-          try {
-            const res = await giga.feedEgg(plan.petId, feed.itemId);
-            if (res?.success === false) {
-              say(plan.name, false, res.message || `${feed.name} was rejected`);
-              break outer;
-            }
-            fed++;
-          } catch (e) {
-            // The server's own words, not a summary of them — this is the
-            // message that says whether the request shape is right.
-            say(plan.name, false, e instanceof Error ? e.message : "feed failed");
+        // One call per increment. `feed.amount` counts material units, which
+        // is what the increment costs, not how many increments to buy.
+        try {
+          const res = await giga.hatcheryStep(plan.petId, feed.stat);
+          if (res == null) {
+            say(plan.name, false, giga.lastErrorRef.current || "did not run — not signed in?");
             break outer;
           }
+          if (res.success === false) {
+            say(plan.name, false, res.error ?? res.message ?? `${feed.name} was refused`);
+            break outer;
+          }
+          fed++;
+        } catch (e) {
+          // The server's own words, not a summary of them.
+          say(plan.name, false, e instanceof Error ? e.message : "feed failed");
+          break outer;
         }
       }
     }
-    if (fed > 0) say(label, true, `Fed ${fed} unit${fed === 1 ? "" : "s"}`);
+    if (fed > 0) say(label, true, `Raised ${fed} step${fed === 1 ? "" : "s"}`);
+    await giga.fetchHatchery();
+    await giga.refreshAll();
+    setBusy(null);
+  };
+
+  /**
+   * Feed a chosen item to a chosen egg, however many units were asked for.
+   *
+   * Same one-call-per-unit rule as the plan, and the same stop-on-first-error:
+   * the per-unit stat delta is still unmeasured, so a run that starts failing
+   * would otherwise pay to learn the same thing ten times.
+   */
+  /**
+   * Spend one influence toward a faction.
+   *
+   * One at a time and never batched: each influence costs more than the last,
+   * moves odds that cannot be moved back, and the game gates them per day. A
+   * loop here would turn one decision into several.
+   */
+  const influenceOnce = async (plan: EggPlan, factionId: number, faction: string) => {
+    setBusy(plan.name);
+    try {
+      const res = await giga.hatcheryInfluence(plan.petId, factionId);
+      if (res == null) {
+        say(plan.name, false, giga.lastErrorRef.current || "did not run — not signed in?");
+      } else if (res.success === false) {
+        say(plan.name, false, res.error ?? res.message ?? `${faction} influence was refused`);
+      } else {
+        say(plan.name, true, `Influenced toward ${faction}`);
+      }
+    } catch (e) {
+      say(plan.name, false, e instanceof Error ? e.message : "influence failed");
+    }
+    await giga.fetchHatchery();
+    await giga.refreshAll();
+    setBusy(null);
+  };
+
+  /**
+   * Raise one stat by `steps` increments, re-reading between each.
+   *
+   * Steps, not item units. The endpoint deals in whole increments and prices
+   * each one itself, so a "+10" that costs 4 Biofuel is ONE call — the old code
+   * looped once per item unit and would have asked for four increments to buy
+   * one.
+   */
+  const raiseStat = async (
+    plan: EggPlan,
+    stat: "temperature" | "comfort",
+    steps: number,
+    label: string
+  ) => {
+    if (steps < 1) return;
+    setBusy(plan.name);
+    let done = 0;
+    for (let i = 0; i < steps; i++) {
+      try {
+        const res = await giga.hatcheryStep(plan.petId, stat);
+        // A null return means the call never went out — counting it as done is
+        // how a button that does nothing reports success.
+        if (res == null) {
+          say(plan.name, false, giga.lastErrorRef.current || "did not run — not signed in?");
+          break;
+        }
+        if (res.success === false) {
+          // The refusal arrives under `error` as often as `message`, and it is
+          // the only thing that says why ("Insufficient balance for item 577").
+          say(plan.name, false, res.error ?? res.message ?? `${label} was refused`);
+          break;
+        }
+        done++;
+      } catch (e) {
+        say(plan.name, false, e instanceof Error ? e.message : `${label} failed`);
+        break;
+      }
+    }
+    if (done > 0) say(plan.name, true, `${label} +${done}`);
     await giga.fetchHatchery();
     await giga.refreshAll();
     setBusy(null);
@@ -4069,19 +4251,31 @@ function HatcheryPage({ giga, advice, fateTarget, setFateTarget, addLog }: {
 
   const runCraft = async (recipeId: string, name: string, runs: number) => {
     setBusy(name);
+    // Count what actually went through. This used to report success after the
+    // loop unconditionally, so a trade that failed on the first attempt said
+    // both "trade failed" and "Traded for 7x" — and a null return, which is
+    // what useRecipe gives when there is no token or noobId, said only the
+    // latter. A button that claims to have done nothing wrong is worse than
+    // one that does nothing.
+    let done = 0;
     for (let i = 0; i < runs; i++) {
       try {
         const r = await giga.useRecipe(recipeId);
-        if (r?.success === false) {
+        if (r == null) {
+          say(name, false, giga.lastErrorRef.current || "trade did not run — not signed in?");
+          break;
+        }
+        if (r.success === false) {
           say(name, false, (r as { message?: string }).message || "trade failed");
           break;
         }
+        done++;
       } catch (e) {
         say(name, false, e instanceof Error ? e.message : "trade failed");
         break;
       }
     }
-    say(name, true, `Traded for ${runs}x`);
+    if (done > 0) say(name, true, `Traded for ${done}x`);
     await giga.refreshAll();
     setBusy(null);
   };
@@ -4257,6 +4451,81 @@ function HatcheryPage({ giga, advice, fateTarget, setFateTarget, addLog }: {
                     />
                   )}
                 </div>
+
+                {plan.status !== "ready" && plan.status !== "idle" && (() => {
+                  // Where an influence would go: the picker if one is set,
+                  // otherwise the faction this egg is already committed to.
+                  // Never a guess — a fresh egg with no pick gets no button.
+                  const targetId = influenceTarget(plan.fateCurrent, fateTarget);
+                  const target = FACTION_DUSTS.find((d) => d.factionId === targetId);
+                  const cost = targetId != null ? plan.fateStatus?.nextCost[targetId] : undefined;
+                  const held = cost ? (giga.itemBalances[String(cost.itemId)] ?? 0) : 0;
+                  const affordable = !!cost && held >= cost.amount;
+                  const used = Object.values(plan.fateCurrent).reduce((a, b) => a + b, 0);
+                  const capped = !!plan.fateStatus && used >= plan.fateStatus.max;
+                  const gated =
+                    !!plan.fateStatus &&
+                    (!plan.fateStatus.canInfluenceToday || !plan.fateStatus.meetsTemperatureRequirement);
+                  return (
+                  <div className="space-y-2">
+                    {target && (
+                      <div className="p-3 rounded-lg" style={{ background: "var(--bg-inset)" }}>
+                        <div className="flex items-baseline justify-between gap-2">
+                          <span className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
+                            Influence
+                          </span>
+                          <span className="text-[12px] tabular-nums" style={{ color: "var(--text-faint)" }}>
+                            {used}/{plan.fateStatus?.max ?? MAX_INFLUENCES}
+                          </span>
+                        </div>
+                        <p className="text-[11px] mt-1" style={{ color: "var(--text-faint)" }}>
+                          {capped
+                            ? "Fully influenced — every remaining point is already committed."
+                            : cost
+                              ? `Next costs ${cost.amount}x ${target.faction} Dust · you hold ${held}`
+                              : "The game quoted no price for the next influence."}
+                          {fateTarget === "any" && !capped && " · following this egg's lead"}
+                        </p>
+                        <button
+                          onClick={() => influenceOnce(plan, target.factionId, target.faction)}
+                          disabled={!!busy || !affordable || capped || gated}
+                          className="btn-press text-[12px] font-bold px-2.5 py-1.5 rounded-lg mt-2 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                          style={{ background: "var(--bg-raised)", border: "1px solid var(--purple)", color: "var(--purple)" }}
+                        >
+                          {capped
+                            ? "At the cap"
+                            : gated
+                              ? "Not available today"
+                              : affordable
+                                ? `Influence toward ${target.faction}`
+                                : `Need ${cost ? cost.amount - held : 0} more ${target.faction} Dust`}
+                        </button>
+                      </div>
+                    )}
+                    <SectionLabel>Raise a stat by hand</SectionLabel>
+                    <ManualFeed
+                      label="Temperature"
+                      stat="temperature"
+                      current={plan.temperature}
+                      bounds={config.temperature}
+                      quote={plan.nextIncrement.temperature}
+                      balances={giga.itemBalances}
+                      busy={!!busy}
+                      onStep={(steps) => raiseStat(plan, "temperature", steps, "Temperature")}
+                    />
+                    <ManualFeed
+                      label="Comfort"
+                      stat="comfort"
+                      current={plan.comfort}
+                      bounds={config.comfort}
+                      quote={plan.nextIncrement.comfort}
+                      balances={giga.itemBalances}
+                      busy={!!busy}
+                      onStep={(steps) => raiseStat(plan, "comfort", steps, "Comfort")}
+                    />
+                  </div>
+                  );
+                })()}
 
                 {plan.alerts.map((a, i) => (
                   <p key={i} className="text-[13px] font-medium" style={{ color: accent }}>{a}</p>

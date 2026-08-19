@@ -100,7 +100,17 @@ export interface HatcheryMaterial {
   stat: EggStat;
   /** 0 = base grade. Higher grades are assumed to be worth more per feed. */
   tier: number;
-  /** Vilhelm's trade that mints it, runnable through /api/offchain/recipes/start */
+  /**
+   * Vilhelm's trade that mints it, as `/api/offchain/recipes/start` wants it.
+   *
+   * This is the recipe's `docId`, NOT its `ID_CID`. The two differ by a prefix
+   * that is not derivable — `ID_CID: "500001"` belongs to
+   * `docId: "Recipe#Hatchery#500001"`, where the pots and chests are plain
+   * `Recipe#700001`. Holding the bare number here made every Vilhelm trade a
+   * no-op: the endpoint found no such recipe, and the button reported success
+   * anyway. Read the docId off `/api/offchain/static` -> recipes; never
+   * assemble it.
+   */
   recipeId: string;
   input: { itemId: number; name: string; amount: number };
   /** Units minted per completion of that recipe */
@@ -120,7 +130,7 @@ export const HATCHERY_MATERIALS: HatcheryMaterial[] = [
     name: "Biofuel",
     stat: "temperature",
     tier: 0,
-    recipeId: "500001",
+    recipeId: "Recipe#Hatchery#500001",
     input: { itemId: 21, name: "Wood", amount: 3 },
     output: 3,
   },
@@ -129,7 +139,7 @@ export const HATCHERY_MATERIALS: HatcheryMaterial[] = [
     name: "Biofuel+",
     stat: "temperature",
     tier: 1,
-    recipeId: "500002",
+    recipeId: "Recipe#Hatchery#500002",
     input: { itemId: 61, name: "Coal", amount: 3 },
     output: 3,
   },
@@ -138,7 +148,7 @@ export const HATCHERY_MATERIALS: HatcheryMaterial[] = [
     name: "Incube",
     stat: "comfort",
     tier: 0,
-    recipeId: "500003",
+    recipeId: "Recipe#Hatchery#500003",
     input: { itemId: 23, name: "Bone", amount: 2 },
     output: 1,
   },
@@ -147,7 +157,7 @@ export const HATCHERY_MATERIALS: HatcheryMaterial[] = [
     name: "Incube+",
     stat: "comfort",
     tier: 1,
-    recipeId: "500004",
+    recipeId: "Recipe#Hatchery#500004",
     input: { itemId: 22, name: "Fiber", amount: 2 },
     output: 1,
   },
@@ -156,7 +166,7 @@ export const HATCHERY_MATERIALS: HatcheryMaterial[] = [
     name: "Incube++",
     stat: "comfort",
     tier: 2,
-    recipeId: "500005",
+    recipeId: "Recipe#Hatchery#500005",
     input: { itemId: 25, name: "Stone", amount: 5 },
     output: 1,
   },
@@ -215,6 +225,42 @@ export const FACTION_DUSTS: FactionDust[] = [
   { factionId: 6, faction: "Summoner", itemId: 78 },
   { factionId: 7, faction: "Chobo", itemId: 79 },
 ];
+
+/**
+ * Which faction this egg is already committed to, or null if none.
+ *
+ * The one with the most influences banked, because that is the only slice
+ * worth extending: influences convert the "no faction" share at 4.75% each and
+ * the cost climbs per faction, so a second faction starts cheap and finishes
+ * with two middling odds instead of one strong one. Ties resolve to the lowest
+ * faction id purely so the answer is stable between reads.
+ */
+export function dominantFaction(fate: Record<number, number>): number | null {
+  let best: number | null = null;
+  for (const [id, count] of Object.entries(fate)) {
+    if (count <= 0) continue;
+    const factionId = Number(id);
+    if (best === null || count > fate[best] || (count === fate[best] && factionId < best)) {
+      best = factionId;
+    }
+  }
+  return best;
+}
+
+/**
+ * The faction an influence should go to: the player's pick, else the one the
+ * egg is already committed to.
+ *
+ * Returns null when neither exists — a fresh egg with no choice made has no
+ * defensible target, and picking one for them would spend dust on a direction
+ * nobody chose.
+ */
+export function influenceTarget(
+  fate: Record<number, number>,
+  picked: number | "any"
+): number | null {
+  return picked === "any" ? dominantFaction(fate) : picked;
+}
 
 /** Influences that together guarantee a faction trait (20 x 4.75% + 20 x 0.25%). */
 export const MAX_INFLUENCES = 20;

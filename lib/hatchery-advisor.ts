@@ -55,7 +55,18 @@ export interface EggPlan {
   progressPerDay: number | null;
   qualityPerDay: number | null;
   feeds: Feed[];
+  /**
+   * The game's quote for the next increment of each stat.
+   *
+   * The plan spends it, but the manual controls need it too: a hand-driven feed
+   * has to name the same item and quantity the game asked for.
+   */
+  nextIncrement: EggState["nextIncrement"];
   fate: FatePlan | null;
+  /** Influences already banked, by faction id — what the next one extends. */
+  fateCurrent: Record<number, number>;
+  /** The game's own quote for the next influence, per faction. */
+  fateStatus: EggState["fateStatus"];
   status: "ready" | "incubating" | "stalled" | "unreadable" | "idle";
   alerts: string[];
   notes: string[];
@@ -212,7 +223,10 @@ export function buildHatcheryAdvice(input: HatcheryAdvisorInput): HatcheryAdvice
       progressPerDay: egg.progressPerDay,
       qualityPerDay: egg.qualityPerDay,
       feeds: [],
+      nextIncrement: egg.nextIncrement,
       fate: null,
+      fateCurrent: egg.fate,
+      fateStatus: egg.fateStatus,
       status: "incubating",
       alerts: [],
       notes: [],

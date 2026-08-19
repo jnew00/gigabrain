@@ -307,7 +307,8 @@ describe("shortfalls point at a Vilhelm trade", () => {
     });
     const craft = advice.craft.find((c) => c.itemId === 578);
     expect(craft).toBeDefined();
-    expect(craft!.recipeId).toBe("500003");
+    // The docId the trade endpoint wants, not the bare ID_CID.
+    expect(craft!.recipeId).toBe("Recipe#Hatchery#500003");
     expect(craft!.runs).toBe(5);
     expect(craft!.inputTotal).toBe(10);
     expect(craft!.reason).toContain("already hold");

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   HATCHERY_FALLBACK_CONFIG,
+  HATCHERY_MATERIALS,
+  dominantFaction,
+  influenceTarget,
   MAX_INFLUENCES,
   collectEggs,
   findFate,
@@ -422,7 +425,58 @@ describe("material catalogue", () => {
 
   it("carries the Vilhelm trade that mints each one", () => {
     const incube = materialsFor("comfort")[0];
-    expect(incube.recipeId).toBe("500003");
+    expect(incube.recipeId).toBe("Recipe#Hatchery#500003");
     expect(incube.input).toEqual({ itemId: 23, name: "Bone", amount: 2 });
+  });
+
+  // The id the trade endpoint wants is the recipe's docId, and the hatchery
+  // ones carry a "#Hatchery#" segment that no amount of reasoning produces
+  // from the number. Holding the bare ID_CID here made every Vilhelm trade a
+  // silent no-op, so the shape is pinned rather than left to the next edit.
+  it("uses the docId form, not the bare ID_CID", () => {
+    for (const m of HATCHERY_MATERIALS) {
+      expect(m.recipeId).toMatch(/^Recipe#Hatchery#\d+$/);
+    }
+  });
+
+  it("keeps one trade per material", () => {
+    const ids = HATCHERY_MATERIALS.map((m) => m.recipeId);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe("choosing where an influence goes", () => {
+  it("names the faction with the most influences banked", () => {
+    expect(dominantFaction({ 3: 12, 4: 2 })).toBe(3);
+  });
+
+  it("has no answer for an egg nobody has committed", () => {
+    expect(dominantFaction({})).toBeNull();
+    expect(dominantFaction({ 3: 0 })).toBeNull();
+  });
+
+  it("breaks ties on the lowest id so the answer does not wander", () => {
+    expect(dominantFaction({ 5: 4, 2: 4 })).toBe(2);
+  });
+
+  // Jason's egg: 12 influences on Athena, and Athena dust is the only stock he
+  // holds. Left alone the button extends the 57% rather than starting a second
+  // faction from scratch.
+  it("defaults to the committed faction", () => {
+    expect(influenceTarget({ 3: 12 }, "any")).toBe(3);
+  });
+
+  it("lets an explicit pick win over the default", () => {
+    expect(influenceTarget({ 3: 12 }, 5)).toBe(5);
+  });
+
+  // A fresh egg with no pick has no defensible target: choosing one would
+  // spend dust on a direction nobody asked for.
+  it("refuses to invent a target for a fresh egg", () => {
+    expect(influenceTarget({}, "any")).toBeNull();
+  });
+
+  it("still honours a pick on a fresh egg", () => {
+    expect(influenceTarget({}, 1)).toBe(1);
   });
 });

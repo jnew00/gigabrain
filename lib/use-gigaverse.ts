@@ -29,13 +29,6 @@ import { normalizeFishingState, normalizeActionResponse, pendingCatchCards } fro
 import { pondById } from "./ponds";
 import { HATCHERY_FALLBACK_CONFIG, readHatcheryConfig, type HatcheryConfig } from "./hatchery";
 import { indexGearDefs, type GearItemDef } from "./gear";
-import {
-  FEED_PAYLOAD_SHAPES,
-  isRequestShapeComplaint,
-  loadKnownShapeIndex,
-  saveKnownShapeIndex,
-  shapeOrder,
-} from "./hatchery-feed";
 const STORAGE_KEY = "giga-auth";
 
 interface StoredAuth {
@@ -753,71 +746,67 @@ export function useGigaverse() {
   }, [token, address]);
 
   /**
-   * Feed one unit of one material to one egg.
+   * Add one increment of temperature or comfort to an incubating egg.
    *
-   * Deliberately one unit per call, and deliberately not batched. How much a
-   * single Biofuel or Incube moves its stat is not published anywhere and could
-   * not be observed without an authenticated session, so a batched call could
-   * overshoot and burn materials on a stat that was already full. One unit at a
-   * time is correct whatever the real delta turns out to be, and re-reading the
-   * egg between feeds is what will eventually measure it.
+   * `POST /api/pets/hatchery/<action>` with `{ petId }`, and nothing else: the
+   * server decides which material to burn and how much, from the same
+   * `itemsForNextIncrement` it publishes on the egg. Sending an item id has no
+   * effect — every shape tried against it reached the same balance check — so
+   * the caller names the stat and the game prices it.
    *
-   * The request body could never be observed — the endpoint is authenticated —
-   * so the shape is discovered against the server instead of guessed at. The
-   * ladder in hatchery-feed.ts explains why that is safe here and, more
-   * importantly, when it refuses to climb: only a complaint about the request
-   * advances it, so a real refusal ("not enough Incube") is reported once
-   * rather than re-asked in four spellings.
+   * Verified against the live endpoint on 2026-08-18:
+   *   fuel      -> {"success":true}, temperature +1 step
+   *   comfort   -> {"success":true,"message":"Comfort added successfully"}
+   *   anything else, including nonsense -> 400 {"error":"Invalid action"}
+   *   empty body -> {"error":"petId is required"}
+   *   unknown petId -> {"success":false,"error":"Hatchery doc not found"}
    *
-   * The winning shape is remembered, so this costs a few round trips once and
-   * nothing afterwards.
+   * This replaces a ladder of guessed payloads against `/api/pets/feed`, which
+   * was the wrong endpoint outright: it answers "Pet is not hatched" for an egg
+   * that is demonstrably incubating, because it feeds a HATCHED pet. No payload
+   * could ever have made that path work, and none of the buttons built on it
+   * ever moved a stat.
+   *
+   * One increment per call, because that is the unit the endpoint deals in.
    */
-  const feedEgg = useCallback(
-    async (petId: string, itemId: number) => {
+  const hatcheryStep = useCallback(
+    async (petId: string, stat: "temperature" | "comfort") => {
       if (!token) return null;
+      const action = stat === "temperature" ? "fuel" : "comfort";
+      return proxy<{ success?: boolean; message?: string; error?: string }>(
+        `/api/pets/hatchery/${action}`,
+        token,
+        "POST",
+        { petId }
+      );
+    },
+    [token]
+  );
 
-      type FeedResponse = {
-        success?: boolean;
-        message?: string;
-        error?: string;
-        gameItemBalanceChanges?: { id: number; amount: number }[];
-      };
-
-      let lastResult: FeedResponse | null = null;
-      let lastError: Error | null = null;
-
-      for (const index of shapeOrder(loadKnownShapeIndex())) {
-        const shape = FEED_PAYLOAD_SHAPES[index];
-        try {
-          const res = await proxy<FeedResponse>(
-            "/api/pets/feed",
-            token,
-            "POST",
-            shape.build(petId, itemId)
-          );
-          if (res?.success !== false) {
-            saveKnownShapeIndex(index);
-            return res;
-          }
-          lastResult = res;
-          if (!isRequestShapeComplaint(res.error ?? res.message)) return res;
-        } catch (e) {
-          lastError = e instanceof Error ? e : new Error(String(e));
-          // A proxy-level throw carries the upstream body, which is where the
-          // validation message lives on a 400.
-          const body = (lastError as Error & { responseData?: FeedResponse }).responseData;
-          const message = body?.error ?? body?.message ?? lastError.message;
-          if (!isRequestShapeComplaint(message)) throw lastError;
-          lastResult = body ?? null;
-        }
-      }
-
-      // Every candidate was rejected as malformed. Surfacing the last message
-      // beats inventing one: it is the only description of what the endpoint
-      // actually wants.
-      if (lastResult) return lastResult;
-      if (lastError) throw lastError;
-      return null;
+  /**
+   * Spend one influence on an egg's fate, toward one faction.
+   *
+   * `POST /api/pets/hatchery/fate` with `{ petId, factionId }`. Same route as
+   * fuel and comfort, but this one takes a direction, and it validates
+   * `factionId` before it even looks the pet up.
+   *
+   * Verified against the live endpoint on 2026-08-18:
+   *   missing factionId -> {"error":"factionId is required"}
+   *   unknown action    -> {"error":"Invalid action"}
+   *
+   * Not verified end to end, deliberately: a successful influence spends the
+   * player's faction dust and moves odds that cannot be moved back, so it is
+   * not something to fire to satisfy a test.
+   */
+  const hatcheryInfluence = useCallback(
+    async (petId: string, factionId: number) => {
+      if (!token) return null;
+      return proxy<{ success?: boolean; message?: string; error?: string }>(
+        "/api/pets/hatchery/fate",
+        token,
+        "POST",
+        { petId, factionId }
+      );
     },
     [token]
   );
@@ -1178,7 +1167,8 @@ export function useGigaverse() {
     fishingAction,
     sellFish,
     fetchHatchery,
-    feedEgg,
+    hatcheryStep,
+    hatcheryInfluence,
     levelUpSkill,
     refreshSkills,
     repairGear,
